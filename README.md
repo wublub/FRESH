@@ -314,5 +314,3 @@ python -m PyInstaller --noconfirm FRESH.spec
 - **Issue** — 欢迎提交 bug 报告、功能建议、使用问题。
 - **Pull Request** — 欢迎修复 bug、补充文档、新增小功能。提交前请先 `python -m py_compile` 确认语法没问题。
 - **讨论** — 也可以到 [Linux.do](https://linux.do) 社区交流。
-#   F R E S H  
- 
