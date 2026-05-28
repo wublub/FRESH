@@ -1,0 +1,52 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ===== PyInstaller =====
+# build/ 是中间产物（98M），dist/ 是最终 exe（48M）
+# 想发布 exe 时用 GitHub Releases 上传，不要塞到仓库里
+build/
+dist/
+*.manifest
+
+# ===== FRESH 本地数据（绝对不要上传！） =====
+# 用户运行后才会产生，含个人便签、附件、加密密钥
+*.fkey
+data.json
+data.json.tmp
+accounts.json
+accounts.json.tmp
+attachments/
+trash/
+scan_settings.json
+ui_text.json
+custom.qss
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== Claude Code 本地设置 =====
+.claude/
+
+# ===== 系统垃圾 =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ===== 临时文件 =====
+*.log
+*.tmp
+*.bak
+*.old
