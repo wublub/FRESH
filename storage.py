@@ -3,6 +3,7 @@ import atexit
 import json
 import os
 import shutil
+import sys
 import tempfile
 import uuid
 from datetime import datetime
@@ -21,10 +22,27 @@ DEFAULT_SCAN_SETTINGS = {
 }
 
 
+def is_attachment_image(attachment):
+    if not attachment or attachment.get('type') == 'folder':
+        return False
+    return Path(attachment.get('original_name', '')).suffix.lower() in IMAGE_EXTS
+
+
+def default_app_root() -> Path:
+    configured = os.getenv('FRESH_APP_ROOT')
+    if configured:
+        return Path(configured)
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return base_dir / 'FRESH_Data'
+
+
 class Storage:
     def __init__(self, app_dir=None, crypter=None, migrate_apple=True):
         appdata = os.getenv('APPDATA') or str(Path.home())
-        self.app_dir = Path(app_dir) if app_dir else Path(appdata) / 'FRESH'
+        self.app_dir = Path(app_dir) if app_dir else default_app_root()
         self.attachments_dir = self.app_dir / 'attachments'
         self.trash_dir = self.app_dir / 'trash'
         self.data_file = self.app_dir / 'data.json'
@@ -42,6 +60,8 @@ class Storage:
         self.notes = self._load()
         self.scan_settings = self._load_scan_settings()
         # 历史遗留：把现存明文文件加密；已软删除的本地文件移入 trash/
+        self._migrate_orphan_screenshot_board_attachments()
+        self._ensure_folder_tracking_markers()
         self._migrate_plain_attachments()
         self.secure_image_references()
         self._sweep_deleted_files_to_trash()
@@ -113,7 +133,7 @@ class Storage:
                     note['archived_at'] = note.get('updated_at') or note.get('created_at') or ''
                 if note.get('deleted') and not note.get('deleted_at'):
                     note['deleted_at'] = note.get('updated_at') or note.get('created_at') or ''
-                for att in note.get('attachments', []) or []:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att.get('deleted') and not att.get('deleted_at'):
                         att['deleted_at'] = att.get('added_at') or note.get('updated_at') or note.get('created_at') or ''
             self.notes = data
@@ -197,6 +217,91 @@ class Storage:
         self.save()
         return note
 
+    def _migrate_orphan_screenshot_board_attachments(self):
+        """Move legacy non-image full-screenshot items under a real screenshot.
+
+        A previous build allowed files/folders to be added directly to the
+        screenshot board. The current model treats those as child attachments of
+        a selected screenshot, so keep old data usable instead of letting it
+        behave like an independent board item.
+        """
+        board = None
+        for note in self.notes:
+            if note.get('id') == SCREENSHOT_BOARD_ID:
+                board = note
+                break
+        if not board:
+            return False
+
+        attachments = board.get('attachments', []) or []
+        orphans = [
+            att for att in attachments
+            if not att.get('deleted') and not is_attachment_image(att)
+        ]
+        if not orphans:
+            return False
+
+        candidates = [
+            att for att in attachments
+            if not att.get('deleted') and is_attachment_image(att)
+        ]
+        if not candidates:
+            return False
+
+        def timestamp(att):
+            value = att.get('added_at') or ''
+            try:
+                return datetime.fromisoformat(value).timestamp()
+            except Exception:
+                return 0
+
+        changed = False
+        for orphan in list(orphans):
+            before = timestamp(orphan)
+            older = [
+                candidate for candidate in candidates
+                if candidate is not orphan and timestamp(candidate) <= before
+            ]
+            parent = max(older, key=timestamp) if older else max(
+                [candidate for candidate in candidates if candidate is not orphan],
+                key=timestamp,
+                default=None,
+            )
+            if not parent:
+                continue
+            try:
+                attachments.remove(orphan)
+            except ValueError:
+                continue
+            parent.setdefault('attachments', []).append(orphan)
+            changed = True
+
+        if changed:
+            board['updated_at'] = datetime.now().isoformat()
+            self.save()
+        return changed
+
+    def _ensure_folder_tracking_markers(self):
+        """Make folder attachments recoverable on exFAT/FAT by adding markers."""
+        changed = False
+        for _note, att, _parent, _container in self.iter_attachments(include_deleted=False):
+            if att.get('type') != 'folder':
+                continue
+            p = Path(att.get('original_path', ''))
+            if not p.exists() or not p.is_dir():
+                continue
+            tracking = att.get('tracking') or {}
+            tag = tracking.get('tracking_id')
+            if not tag:
+                if self.ensure_tracking(att):
+                    changed = True
+                continue
+            if ftrack.write_tracking_tag(str(p), tag):
+                changed = True
+        if changed:
+            self.save()
+        return changed
+
     def update_note(self, note_id, **kwargs):
         for note in self.notes:
             if note['id'] == note_id:
@@ -237,7 +342,7 @@ class Storage:
                 note['deleted_at'] = now
                 note['updated_at'] = now
                 # 把笔记下属本地文件附件移入 trash/
-                for att in note.get('attachments', []) or []:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att.get('type', 'file') == 'file' and not att.get('deleted'):
                         self._move_to_trash(att.get('stored_name'))
                 self.sort_notes()
@@ -252,7 +357,7 @@ class Storage:
                 note['deleted_at'] = ''
                 note['updated_at'] = datetime.now().isoformat()
                 # 还原笔记时，把仍在 trash/ 的附件移回（未被单独标记 deleted 的）
-                for att in note.get('attachments', []) or []:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att.get('type', 'file') == 'file' and not att.get('deleted'):
                         self._restore_from_trash(att.get('stored_name'))
                 self.sort_notes()
@@ -263,7 +368,7 @@ class Storage:
     def hard_delete_note(self, note_id):
         for note in self.notes[:]:
             if note['id'] == note_id:
-                for att in note.get('attachments', []) or []:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att.get('type', 'file') == 'file':
                         self._remove_attachment_file(att.get('stored_name'))
                         self._remove_trash_file(att.get('stored_name'))
@@ -339,11 +444,58 @@ class Storage:
         board = self.get_screenshot_board()
         return self.add_attachment(board['id'], source_path, copy=True)
 
+    def add_child_attachment(self, parent_attachment_id, source_path, copy=False):
+        source = Path(source_path)
+        if not source.exists():
+            return None
+
+        note, parent = self.find_attachment(parent_attachment_id)
+        if not note or not parent or parent.get('deleted'):
+            return None
+        if note.get('id') != SCREENSHOT_BOARD_ID:
+            return None
+        if not is_attachment_image(parent):
+            return None
+
+        if source.is_dir():
+            attachment = {
+                'id': uuid.uuid4().hex,
+                'original_name': source.name or str(source),
+                'type': 'folder',
+                'original_path': str(source.resolve()),
+                'added_at': datetime.now().isoformat(),
+            }
+            attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+        elif source.is_file():
+            try:
+                size = source.stat().st_size
+            except Exception:
+                size = 0
+            attachment = {
+                'id': uuid.uuid4().hex,
+                'original_name': source.name,
+                'type': 'file_ref',
+                'original_path': str(source.resolve()),
+                'size': size,
+                'added_at': datetime.now().isoformat(),
+            }
+            attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+        else:
+            return None
+
+        parent.setdefault('attachments', []).append(attachment)
+        note['updated_at'] = datetime.now().isoformat()
+        self.sort_notes()
+        self.save()
+        return attachment
+
     def secure_image_references(self):
         """把仍能访问到的图片引用转成账户内加密副本；普通文件继续引用。"""
         changed = False
         for note in self.notes:
-            for att in note.get('attachments', []) or []:
+            for _note, att, parent, _container in self._iter_note_attachments(note, include_deleted=False):
+                if parent is not None:
+                    continue
                 if att.get('type') != 'file_ref':
                     continue
                 name = att.get('original_name') or att.get('original_path') or ''
@@ -380,11 +532,31 @@ class Storage:
                 return note
         return None
 
+    def _iter_note_attachments(self, note, include_deleted=True, parent=None, container=None):
+        attachments = container if container is not None else note.get('attachments', []) or []
+        for att in attachments:
+            is_deleted = bool(att.get('deleted'))
+            if include_deleted or not is_deleted:
+                yield note, att, parent, attachments
+            if is_deleted and not include_deleted:
+                continue
+            yield from self._iter_note_attachments(
+                note,
+                include_deleted=include_deleted,
+                parent=att,
+                container=att.get('attachments', []) or [],
+            )
+
+    def iter_attachments(self, include_deleted=True):
+        for note in self.notes:
+            for item in self._iter_note_attachments(note, include_deleted=include_deleted):
+                yield item
+
     def update_attachment(self, note_id, attachment_id, **kwargs):
         for note in self.notes:
             if note['id'] != note_id:
                 continue
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note):
                 if att.get('id') != attachment_id:
                     continue
                 changed = False
@@ -400,11 +572,16 @@ class Storage:
         return None
 
     def find_attachment(self, attachment_id):
-        for note in self.notes:
-            for att in note.get('attachments', []) or []:
-                if att.get('id') == attachment_id:
-                    return note, att
+        for note, att, _parent, _container in self.iter_attachments():
+            if att.get('id') == attachment_id:
+                return note, att
         return None, None
+
+    def parent_attachment_id(self, attachment_id):
+        for _note, att, parent, _container in self.iter_attachments():
+            if att.get('id') == attachment_id:
+                return parent.get('id') if parent else ''
+        return ''
 
     def update_screenshot(self, attachment_id, **kwargs):
         note, att = self.find_attachment(attachment_id)
@@ -418,33 +595,39 @@ class Storage:
             return False
         return self.remove_attachment(note['id'], attachment_id)
 
-    def all_image_attachments(self):
+    def all_screenshot_attachments(self):
         result = []
-        for note in self.notes:
-            if note.get('deleted'):
-                continue
-            for att in note.get('attachments', []) or []:
-                if att.get('deleted'):
-                    continue
-                if Path(att.get('original_name', '')).suffix.lower() in IMAGE_EXTS:
-                    result.append(att)
+        board = self.get_screenshot_board()
+        if board.get('deleted'):
+            return result
+        for _note, att, parent, _container in self._iter_note_attachments(board, include_deleted=False):
+            if parent is None and is_attachment_image(att):
+                result.append(att)
         return result
+
+    def all_image_attachments(self):
+        return [
+            att for att in self.all_screenshot_attachments()
+            if Path(att.get('original_name', '')).suffix.lower() in IMAGE_EXTS
+        ]
 
     def screenshot_items(self, view='active', category='', search=''):
         category = (category or '').strip()
         search = (search or '').strip().lower()
         items = []
-        for att in self.all_image_attachments():
+        for att in self.all_screenshot_attachments():
             is_archived = bool(att.get('archived'))
             if view == 'active' and is_archived:
                 continue
             if view == 'archived' and not is_archived:
                 continue
-            if category and (att.get('archive_category') or '') != category:
+            att_category = (att.get('archive_category') or att.get('category') or '').strip()
+            if category and att_category != category:
                 continue
             if search:
                 text = ' '.join([
                     att.get('original_name', ''),
+                    att.get('category', ''),
                     att.get('memo', ''),
                     att.get('archive_content', ''),
                     att.get('archive_category', ''),
@@ -461,7 +644,7 @@ class Storage:
     def screenshot_counts(self):
         active = 0
         archived = 0
-        for att in self.all_image_attachments():
+        for att in self.all_screenshot_attachments():
             if att.get('archived'):
                 archived += 1
             else:
@@ -473,7 +656,7 @@ class Storage:
         for note in self.notes:
             if note.get('deleted'):
                 continue
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note, include_deleted=False):
                 if att.get('archived') and not att.get('deleted'):
                     result.append((note, att))
         result.sort(key=lambda x: x[1].get('archived_at', '') or '', reverse=True)
@@ -504,10 +687,10 @@ class Storage:
                         'time': note.get('archived_at') or note.get('updated_at') or note.get('created_at') or '',
                         'note': note,
                     })
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note, include_deleted=False):
                 if att.get('deleted'):
                     continue
-                att_category = (att.get('archive_category') or '').strip()
+                att_category = (att.get('archive_category') or att.get('category') or '').strip()
                 if att.get('archived') and (not category or att_category == category):
                     items.append({
                         'kind': 'attachment',
@@ -526,10 +709,10 @@ class Storage:
             c = (note.get('archive_category') or note.get('category') or '').strip()
             if c:
                 cats.add(c)
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note, include_deleted=False):
                 if att.get('deleted'):
                     continue
-                c = (att.get('archive_category') or '').strip()
+                c = (att.get('archive_category') or att.get('category') or '').strip()
                 if c:
                     cats.add(c)
         return sorted(cats)
@@ -537,8 +720,7 @@ class Storage:
     def remove_attachment(self, note_id, attachment_id):
         for note in self.notes:
             if note['id'] == note_id:
-                attachments = note.get('attachments', []) or []
-                for att in attachments:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att['id'] == attachment_id:
                         now = datetime.now().isoformat()
                         att['deleted'] = True
@@ -568,8 +750,7 @@ class Storage:
     def hard_remove_attachment(self, note_id, attachment_id):
         for note in self.notes:
             if note['id'] == note_id:
-                attachments = note.get('attachments', []) or []
-                for att in attachments[:]:
+                for _note, att, _parent, attachments in self._iter_note_attachments(note):
                     if att['id'] == attachment_id:
                         if att.get('type', 'file') == 'file':
                             self._remove_attachment_file(att.get('stored_name'))
@@ -593,7 +774,7 @@ class Storage:
                 continue
             if note.get('deleted'):
                 continue
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note):
                 if att.get('deleted'):
                     items.append({
                         'kind': 'attachment',
@@ -608,6 +789,8 @@ class Storage:
         t = attachment.get('type', 'file')
         if t in ('folder', 'file_ref'):
             return Path(attachment.get('original_path', ''))
+        if t == 'screenshot_child':
+            return Path('')
         stored_name = attachment.get('stored_name', '')
         attached = self.attachments_dir / stored_name
         enc_path = attached
@@ -693,7 +876,7 @@ class Storage:
             return False
 
         tag = tracking.get('tracking_id')
-        if tag and ftrack.read_tag(str(p)) == tag:
+        if tag and ftrack.read_tracking_tag(str(p)) == tag:
             return True
 
         current = ftrack.get_file_info(str(p))
@@ -798,6 +981,10 @@ class Storage:
         if not tracking:
             return original, False
 
+        recovered = self._recover_external_in_original_parent(attachment, tracking)
+        if recovered:
+            return self.adopt_external_path(attachment, recovered), True
+
         quick = self._quick_external_match(attachment, tracking)
         if quick:
             return self.adopt_external_path(attachment, quick), True
@@ -839,11 +1026,11 @@ class Storage:
 
         old = attachment.get('tracking') or {}
         old_uuid = old.get('tracking_id', '')
-        new_tr = ftrack.build_tracking(str(p.resolve()))
+        new_tr = ftrack.build_tracking(str(p.resolve()), tracking_id=old_uuid or None)
         if not new_tr:
             return False
         if old_uuid:
-            if ftrack.write_tag(str(p), old_uuid):
+            if ftrack.write_tracking_tag(str(p), old_uuid):
                 new_tr['tracking_id'] = old_uuid
             elif 'tracking_id' not in new_tr:
                 new_tr['tracking_id'] = old_uuid
@@ -868,6 +1055,10 @@ class Storage:
             return False
         p = Path(attachment.get('original_path', ''))
         if not p.exists():
+            recovered = self._recover_external_in_original_parent(attachment, old)
+            if recovered:
+                self.adopt_external_path(attachment, recovered)
+                return True
             return False
         name_changed = self.sync_external_attachment_name(attachment, p)
         current = ftrack.get_file_info(str(p))
@@ -883,12 +1074,12 @@ class Storage:
 
         if same_id:
             # File ID 没变，但 ADS 可能被覆盖（部分编辑器会清掉 ADS）
-            if old_uuid and ftrack.read_tag(str(p)) != old_uuid:
-                ftrack.write_tag(str(p), old_uuid)
+            if old_uuid and ftrack.read_tracking_tag(str(p)) != old_uuid:
+                ftrack.write_tracking_tag(str(p), old_uuid)
             return name_changed
 
-        if old_uuid and ftrack.read_tag(str(p)) == old_uuid:
-            new_tr = ftrack.build_tracking(str(p.resolve()))
+        if old_uuid and ftrack.read_tracking_tag(str(p)) == old_uuid:
+            new_tr = ftrack.build_tracking(str(p.resolve()), tracking_id=old_uuid or None)
             if not new_tr:
                 return False
             new_tr['tracking_id'] = old_uuid
@@ -911,13 +1102,47 @@ class Storage:
 
         return name_changed
 
+    def _recover_external_in_original_parent(self, attachment, tracking):
+        """Handle same-folder rename without starting a disk scan."""
+        original = Path(attachment.get('original_path', ''))
+        parent = original.parent
+        if not parent.exists() or not parent.is_dir():
+            return None
+        tag = (tracking or {}).get('tracking_id')
+        att_type = attachment.get('type')
+        try:
+            children = list(parent.iterdir())
+        except OSError:
+            return None
+
+        matches = []
+        for child in children:
+            try:
+                if att_type == 'folder':
+                    if not child.is_dir():
+                        continue
+                    if tag and ftrack.read_tracking_tag(str(child)) == tag:
+                        matches.append(child)
+                elif att_type == 'file_ref':
+                    if not child.is_file():
+                        continue
+                    if tag and ftrack.read_tracking_tag(str(child)) == tag:
+                        matches.append(child)
+                    elif ftrack.path_matches_hash(str(child), tracking):
+                        matches.append(child)
+            except OSError:
+                continue
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def all_external_attachments(self):
         """返回所有 file_ref / folder 类型的附件 (note, attachment) 列表。"""
         out = []
         for note in self.notes:
             if note.get('deleted'):
                 continue
-            for att in note.get('attachments', []) or []:
+            for _note, att, _parent, _container in self._iter_note_attachments(note, include_deleted=False):
                 if att.get('deleted'):
                     continue
                 if att.get('type') in ('folder', 'file_ref'):
@@ -985,7 +1210,7 @@ class Storage:
         try:
             for note in self.notes:
                 note_deleted = bool(note.get('deleted'))
-                for att in note.get('attachments', []) or []:
+                for _note, att, _parent, _container in self._iter_note_attachments(note):
                     if att.get('type', 'file') != 'file':
                         continue
                     if not (att.get('deleted') or note_deleted):

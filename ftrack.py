@@ -15,6 +15,8 @@ except Exception:
     everything_ipc = None
 
 ADS_STREAM = 'fresh_id'
+FOLDER_MARKER_NAME = '.fresh_folder_id'
+FOLDER_MARKER_PREFIX = 'FRESH_FOLDER_ID:'
 
 _IS_WIN = sys.platform == 'win32'
 
@@ -83,6 +85,13 @@ if _IS_WIN:
     _kernel32.GetLogicalDrives.restype = wintypes.DWORD
     _kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
     _kernel32.GetDriveTypeW.restype = wintypes.UINT
+    _kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+    _kernel32.GetFileAttributesW.restype = wintypes.DWORD
+    _kernel32.SetFileAttributesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+    _kernel32.SetFileAttributesW.restype = wintypes.BOOL
+
+    INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+    FILE_ATTRIBUTE_HIDDEN = 0x02
 
 
 # ============ NTFS Alternate Data Stream ============
@@ -116,6 +125,83 @@ def remove_tag(path, stream=ADS_STREAM):
         return True
     except OSError:
         return False
+
+
+def _hide_marker_file(path):
+    if not _IS_WIN:
+        return
+    try:
+        attrs = _kernel32.GetFileAttributesW(str(path))
+        if attrs == INVALID_FILE_ATTRIBUTES:
+            return
+        _kernel32.SetFileAttributesW(str(path), attrs | FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
+
+
+def _folder_marker_path(path):
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_dir():
+            return None
+        return p / FOLDER_MARKER_NAME
+    except OSError:
+        return None
+
+
+def write_folder_marker(path, tag):
+    """Write a small hidden marker inside tracked folders.
+
+    Folder ADS and File IDs do not survive a cross-volume cut to exFAT/FAT.
+    A normal child file does, so this gives folders the same recoverability that
+    file attachments get from content hashes.
+    """
+    marker = _folder_marker_path(path)
+    if not marker or not tag:
+        return False
+    try:
+        marker.write_text(f'{FOLDER_MARKER_PREFIX}{tag}\n', encoding='utf-8')
+        _hide_marker_file(marker)
+        return True
+    except OSError:
+        return False
+
+
+def read_folder_marker(path):
+    marker = _folder_marker_path(path)
+    if not marker:
+        return None
+    try:
+        text = marker.read_text(encoding='utf-8', errors='ignore').strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    # 只认带 FRESH 前缀的标记。早期一度兜底接受"首行裸文本"，但那会让任何恰好同名
+    # (.fresh_folder_id) 的普通文件首行碰巧等于某 tracking_id 时被误判为命中，故收紧。
+    # FRESH 写出的 marker 一律带前缀(见 write_folder_marker)，因此不会漏掉真标记。
+    if text.startswith(FOLDER_MARKER_PREFIX):
+        return text[len(FOLDER_MARKER_PREFIX):].strip() or None
+    return None
+
+
+def write_tracking_tag(path, tag, stream=ADS_STREAM):
+    """Write a tracking tag using ADS and, for folders, a portable marker."""
+    ok = write_tag(path, tag, stream=stream)
+    try:
+        if Path(path).is_dir():
+            ok = write_folder_marker(path, tag) or ok
+    except OSError:
+        pass
+    return ok
+
+
+def read_tracking_tag(path, stream=ADS_STREAM):
+    """Read either the NTFS ADS tag or the portable folder marker."""
+    tag = read_tag(path, stream=stream)
+    if tag:
+        return tag
+    return read_folder_marker(path)
 
 
 # ============ NTFS File ID ============
@@ -396,9 +482,9 @@ def _iter_disk(roots=None, drive_hints=None, progress=None, cancel=None, ntfs_on
 
 
 def scan_for_tag(tag, roots=None, progress=None, cancel=None, stream=ADS_STREAM, drive_hints=None):
-    """扫描磁盘查找带指定 ADS 标记的文件/文件夹。"""
-    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=True):
-        if read_tag(path, stream) == tag:
+    """扫描磁盘查找带指定追踪标记的文件/文件夹。"""
+    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
+        if read_tracking_tag(path, stream) == tag:
             return path
     return None
 
@@ -415,10 +501,10 @@ def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None, s
         return {}
     remaining = set(tags)
     found = {}
-    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=True):
+    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
         if not remaining:
             break
-        t = read_tag(path, stream)
+        t = read_tracking_tag(path, stream)
         if t and t in remaining:
             found[t] = path
             remaining.discard(t)
@@ -428,6 +514,49 @@ def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None, s
                 except Exception:
                     pass
     return found
+
+
+def scan_for_folder_markers(tags, roots=None, progress=None, cancel=None, on_found=None, drive_hints=None):
+    """一次遍历磁盘，用固定标记名 .fresh_folder_id 找回被追踪的文件夹——不依赖 Everything。
+
+    这是 scan_for_hash 的文件夹版：复用 _iter_disk 的遍历(自动跳系统/缓存目录、支持
+    cancel/progress、drive_hints 优先)，但**只在遇到名为 .fresh_folder_id 的文件时**才去
+    读它、校验其父目录的 marker，绝不像 scan_for_tag 那样对每个普通文件都开 ADS 句柄，
+    因此快得多。与文件夹现名/内部内容无关——改名、内部文件增删改都不影响 marker。
+
+    每个命中都在当前磁盘重新 read_folder_marker(parent) 校验，Everything 不参与，
+    因此不会因索引滞后误配。返回 {tag: [folder_path, ...]}，列出每个 tag 命中的全部父目录：
+    正常剪切只一个；用户复制过同一文件夹则可能多个——调用方仅在唯一命中时自动采纳，
+    多个应交给用户选择，避免指向错误副本。
+    on_found(tag, path) 仅在某 tag 唯一定位到一个文件夹时回调。
+    """
+    if not tags:
+        return {}
+    remaining = set(tags)
+    groups = {}
+    for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
+        if cancel and cancel():
+            break
+        if is_dir or os.path.basename(path) != FOLDER_MARKER_NAME:
+            continue
+        parent = os.path.dirname(path)
+        if not parent:
+            continue
+        tag = read_folder_marker(parent)
+        if not tag or tag not in remaining:
+            continue
+        lst = groups.setdefault(tag, [])
+        key = os.path.normcase(os.path.normpath(parent))
+        if all(os.path.normcase(os.path.normpath(p)) != key for p in lst):
+            lst.append(parent)
+    if on_found:
+        for tag, found_paths in groups.items():
+            if len(found_paths) == 1:
+                try:
+                    on_found(tag, found_paths[0])
+                except Exception:
+                    pass
+    return groups
 
 
 def scan_for_name(name, roots=None, progress=None, cancel=None, limit=50, drive_hints=None):
@@ -498,8 +627,12 @@ def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, 
                     dirnames[:] = []
                 else:
                     dirnames[:] = [d for d in dirnames if not _should_skip_dir(d)]
-                if name in filenames:
-                    add_candidate(Path(dirpath) / name)
+                for child_name in filenames:
+                    if child_name.lower() == target:
+                        add_candidate(Path(dirpath) / child_name)
+                for child_name in dirnames:
+                    if child_name.lower() == target:
+                        add_candidate(Path(dirpath) / child_name)
         except OSError:
             return
 
@@ -514,9 +647,10 @@ def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, 
     for root in roots or []:
         add_root(root, recursive=True)
 
-    # Drive roots are cheap to check directly and cover cut/paste to F:\name.
+    # Drive roots get a shallow recursive search too, so cross-drive cuts to
+    # F:\sub\dir\name can still be found without falling back to a full scan.
     for root in local_drive_roots(ntfs_only=False):
-        add_root(root, recursive=False)
+        add_root(root, recursive=True)
 
     return matches
 
@@ -818,23 +952,15 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
 
     drive = (drive_hints or [None])[0]
 
-    def query_once(name, drive):
-        # 先按 drive_hint 精确名搜，找不到再放开全盘搜
-        paths = everything_search(name, exact_name=True, drive_hint=drive, limit=500, es_path=es_path)
-        if not paths and drive:
-            paths = everything_search(name, exact_name=True, drive_hint=None, limit=500, es_path=es_path)
-        return paths or []
-
-    for name, tags in list(name_to_tags.items()):
-        if cancel and cancel():
-            break
-        if progress:
-            progress(f'Everything: {name}')
-        paths = query_once(name, drive)
-        for path in paths:
+    def process_paths(paths, tags, seen_paths):
+        for path in paths or []:
             if cancel and cancel():
                 break
-            t = read_tag(path, stream)
+            key = os.path.normcase(os.path.normpath(path))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            t = read_tracking_tag(path, stream)
             if t and t in tags:
                 found[t] = path
                 tags.discard(t)
@@ -845,6 +971,18 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
                         pass
                 if not tags:
                     break
+
+    for name, tags in list(name_to_tags.items()):
+        if cancel and cancel():
+            break
+        if progress:
+            progress(f'Everything: {name}')
+        seen_paths = set()
+        paths = everything_search(name, exact_name=True, drive_hint=drive, limit=500, es_path=es_path)
+        process_paths(paths, tags, seen_paths)
+        if drive and tags and not (cancel and cancel()):
+            paths = everything_search(name, exact_name=True, drive_hint=None, limit=500, es_path=es_path)
+            process_paths(paths, tags, seen_paths)
     return found
 
 
@@ -855,6 +993,14 @@ def find_candidates_by_name(name, drive_hint=None, size_hint=None, es_path=None,
     paths = None
     if everything_mode(es_path):
         paths = everything_search(name, exact_name=True, drive_hint=drive_hint, limit=200, es_path=es_path) or []
+        if drive_hint:
+            extra = everything_search(name, exact_name=True, drive_hint=None, limit=200, es_path=es_path) or []
+            seen = {os.path.normcase(os.path.normpath(p)) for p in paths}
+            for p in extra:
+                key = os.path.normcase(os.path.normpath(p))
+                if key not in seen:
+                    paths.append(p)
+                    seen.add(key)
     if not paths and fallback_walk:
         paths = scan_for_name(
             name,
@@ -873,9 +1019,75 @@ def find_candidates_by_name(name, drive_hint=None, size_hint=None, es_path=None,
     return paths
 
 
+def find_folders_by_marker(tags, drive_hints=None, es_path=None, on_found=None, cancel=None):
+    """用固定标记名 .fresh_folder_id 快速定位被追踪的文件夹。
+
+    文件夹自身的名字和里面的内容都可能变（被改名、内部文件增删改），但标记文件名
+    是固定的，所以一次 Everything 查询就能把所有被追踪文件夹一网打尽，与文件夹当前
+    叫什么、装了什么无关——这相当于文件 content_hash 的文件夹版。
+
+    每个命中都会在**当前磁盘**上重新验证（read_folder_marker(parent) == tag），
+    因此 Everything 索引滞后留下的旧路径、巧合同名的标记、或被导出复制出去的副本
+    都不会造成误匹配。
+
+    返回 {tag: [folder_path, ...]}，列出每个 tag 对应的全部已验证父目录：
+    正常“剪切”只会有一个；如果用户**复制**过同一文件夹则可能有多个——调用方需自行
+    决定如何采纳（只有唯一一个时才可自动采纳，多个应交给用户选择）。
+    on_found(tag, path) 仅在某个 tag 唯一定位到一个文件夹时回调。
+    """
+    if not tags or not everything_mode(es_path):
+        return {}
+    remaining = set(tags)
+    groups = {}
+
+    drive = (drive_hints or [None])[0]
+    searches = [drive]
+    if drive:
+        searches.append(None)
+    seen_markers = set()
+
+    for search_drive in searches:
+        paths = everything_search(
+            FOLDER_MARKER_NAME,
+            exact_name=True,
+            drive_hint=search_drive,
+            limit=5000,
+            es_path=es_path,
+        )
+        for marker_path in paths or []:
+            if cancel and cancel():
+                break
+            marker_key = os.path.normcase(os.path.normpath(marker_path))
+            if marker_key in seen_markers:
+                continue
+            seen_markers.add(marker_key)
+            parent = os.path.dirname(marker_path)
+            if not parent:
+                continue
+            # read_folder_marker 会校验 parent 仍存在且是目录，并读出标记里的 tag。
+            tag = read_folder_marker(parent)
+            if not tag or tag not in remaining:
+                continue
+            lst = groups.setdefault(tag, [])
+            key = os.path.normcase(os.path.normpath(parent))
+            if all(os.path.normcase(os.path.normpath(p)) != key for p in lst):
+                lst.append(parent)
+        if cancel and cancel():
+            break
+
+    if on_found:
+        for tag, found_paths in groups.items():
+            if len(found_paths) == 1:
+                try:
+                    on_found(tag, found_paths[0])
+                except Exception:
+                    pass
+    return groups
+
+
 # ============ 一站式工具 ============
 
-def build_tracking(path):
+def build_tracking(path, tracking_id=None):
     """为新加入的文件/文件夹生成完整的跟踪信息。返回 dict (可能为空)。"""
     info = {}
     p = Path(path)
@@ -883,15 +1095,18 @@ def build_tracking(path):
         return info
 
     import uuid
-    tag = uuid.uuid4().hex
-    if write_tag(str(p), tag):
+    tag = tracking_id or uuid.uuid4().hex
+    if write_tracking_tag(str(p), tag):
         info['tracking_id'] = tag
+    elif tracking_id:
+        info['tracking_id'] = tracking_id
 
     fi = get_file_info(str(p))
     if fi:
         info['volume_serial'] = fi['volume_serial']
         info['file_id_high'] = fi['file_id_high']
         info['file_id_low'] = fi['file_id_low']
+        info['is_dir'] = fi['is_dir']
 
     try:
         info['drive_hint'] = str(p.resolve()).split(':', 1)[0]

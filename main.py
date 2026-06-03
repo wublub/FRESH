@@ -1,4 +1,5 @@
 """FRESH - 苹果风格便签"""
+import ctypes
 import json
 import os
 import re
@@ -6,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 from collections import defaultdict
@@ -17,15 +19,20 @@ try:
 except ImportError:
     winreg = None
 
+try:
+    import win32com.client as win32com_client
+except Exception:
+    win32com_client = None
+
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QRect, QRectF, QUrl, QPoint, QPointF, QThread,
-    QFileSystemWatcher, QEvent, QSettings, QLockFile, QStandardPaths
+    QFileSystemWatcher, QEvent, QSettings, QLockFile, QStandardPaths, QDate
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QPixmap, QImage, QFont, QColor, QPainter, QPolygonF,
     QDesktopServices, QFontMetrics, QKeySequence, QIcon, QShortcut, QGuiApplication,
-    QPen,
+    QPen, QCursor, QPainterPath,
     QTextCharFormat, QTextCursor, QTextListFormat
 )
 from PySide6.QtWidgets import (
@@ -38,7 +45,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QCheckBox, QInputDialog,
     QSystemTrayIcon, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QPlainTextEdit, QKeySequenceEdit, QGraphicsOpacityEffect,
-    QToolTip
+    QToolTip, QDateEdit
 )
 
 from accounts import AccountError, AccountManager
@@ -66,6 +73,77 @@ from shell_notify import (
     SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR, SHCNE_RMDIR,
     SHCNE_UPDATEDIR, SHCNE_UPDATEITEM,
 )
+
+
+DATA_ROOT_ENV = 'FRESH_APP_ROOT'
+DATA_ROOT_SETTINGS = 'data/root_dir'
+
+
+def portable_data_root() -> Path:
+    if getattr(sys, 'frozen', False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return base_dir / 'FRESH_Data'
+
+
+def legacy_appdata_root() -> Path:
+    appdata = os.getenv('APPDATA') or str(Path.home())
+    return Path(appdata) / 'FRESH'
+
+
+def _root_has_fresh_data(root: Path) -> bool:
+    return any((root / name).exists() for name in ('accounts.json', 'accounts', 'data.json', 'ui_text.json', 'custom.qss'))
+
+
+def _copy_initial_data_root(src: Path, dst: Path):
+    if not src.exists() or _root_has_fresh_data(dst):
+        return
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    except Exception:
+        pass
+
+
+def configured_data_root(settings: QSettings | None = None) -> Path:
+    if settings is None:
+        settings = QSettings('FRESH', 'FRESH')
+    configured = ''
+    try:
+        configured = settings.value(DATA_ROOT_SETTINGS, '', str) or ''
+    except Exception:
+        configured = ''
+    root = Path(configured).expanduser() if configured else portable_data_root()
+    if not configured:
+        _copy_initial_data_root(legacy_appdata_root(), root)
+    os.environ[DATA_ROOT_ENV] = str(root)
+    return root
+
+
+def copy_data_root(src: Path, dst: Path):
+    src = Path(src)
+    dst = Path(dst)
+    if not src.exists() or src.resolve() == dst.resolve():
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        target = dst / child.name
+        try:
+            if child.is_dir():
+                shutil.copytree(child, target, dirs_exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, target)
+        except Exception:
+            pass
+
+
+def is_path_inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
 
 
 # ============ 工具函数 ============
@@ -129,11 +207,12 @@ def note_search_text(note: dict) -> str:
         note.get('updated_at', ''),
         note.get('archived_at', ''),
     ]
-    for att in note.get('attachments', []) or []:
+    for att in iter_attachment_tree(note.get('attachments', []) or []):
         if att.get('deleted'):
             continue
         parts.extend([
             att.get('original_name', ''),
+            att.get('category', ''),
             att.get('memo', ''),
             att.get('archive_content', ''),
             att.get('archive_category', ''),
@@ -143,6 +222,19 @@ def note_search_text(note: dict) -> str:
             att.get('archived_at', ''),
         ])
     return ' '.join(str(part) for part in parts if part).lower()
+
+
+def iter_attachment_tree(attachments):
+    for att in attachments or []:
+        yield att
+        yield from iter_attachment_tree(att.get('attachments', []) or [])
+
+
+def note_belongs_to_screenshot_workspace(note):
+    return (
+        (note or {}).get('id') == SCREENSHOT_BOARD_ID
+        or (note or {}).get('mode') == 'screenshot'
+    )
 
 
 def archive_item_key(item: dict) -> str:
@@ -168,6 +260,7 @@ def archive_item_search_text(item: dict) -> str:
         note.get('category', ''),
         note.get('archive_category', ''),
         att.get('original_name', ''),
+        att.get('category', ''),
         att.get('memo', ''),
         att.get('archive_content', ''),
         att.get('archive_category', ''),
@@ -218,25 +311,50 @@ def format_size(size: int) -> str:
     return f"{size / 1024 ** 3:.2f} GB"
 
 
-def reveal_in_file_manager(path):
+def _is_root_path(path):
+    try:
+        p = Path(path)
+        return bool(p.anchor) and p.parent == p
+    except Exception:
+        return False
+
+
+def open_local_path(path):
     p = Path(path)
     if not p.exists():
-        return
+        return False
     try:
         p = p.resolve()
     except Exception:
         pass
     if sys.platform == 'win32':
         try:
-            if p.is_file():
-                subprocess.Popen(f'explorer.exe /select,"{str(p)}"')
-            else:
-                subprocess.Popen(['explorer.exe', str(p)])
-            return
+            os.startfile(str(p))
+            return True
         except Exception:
             pass
-    target = p.parent if p.is_file() else p
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+
+def reveal_in_file_manager(path):
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        p = p.resolve()
+    except Exception:
+        pass
+    if sys.platform == 'win32':
+        try:
+            if not _is_root_path(p):
+                subprocess.Popen(['explorer.exe', f'/select,{str(p)}'])
+            else:
+                subprocess.Popen(['explorer.exe', str(p)])
+            return True
+        except Exception:
+            pass
+    target = p.parent if p.is_file() or (p.is_dir() and not _is_root_path(p)) else p
+    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
 
 def recovery_scan_roots(scan_settings, drive_hints=None):
@@ -292,6 +410,8 @@ AUTOSTART_NAME = 'FRESH'
 
 
 def _autostart_command():
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
     main_path = Path(__file__).resolve()
     python_exe = sys.executable
     pythonw = python_exe
@@ -380,23 +500,23 @@ class NoteListDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#007AFF"))
+            painter.setBrush(QColor("#2F7BFF"))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
             c_title = QColor("#FFFFFF")
             c_time = QColor(255, 255, 255, 220)
             c_preview = QColor(255, 255, 255, 200)
         elif hovered:
-            painter.setBrush(QColor(0, 0, 0, 12))
+            painter.setBrush(QColor(47, 123, 255, 20))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
-            c_title = QColor("#1D1D1F")
-            c_time = QColor("#86868B")
-            c_preview = QColor("#86868B")
+            c_title = QColor("#263548")
+            c_time = QColor("#8B98AA")
+            c_preview = QColor("#8B98AA")
         else:
-            c_title = QColor("#1D1D1F")
-            c_time = QColor("#86868B")
-            c_preview = QColor("#86868B")
+            c_title = QColor("#263548")
+            c_time = QColor("#8B98AA")
+            c_preview = QColor("#8B98AA")
 
         title = note_display_title(note)
         time_str = format_time_short(note.get('updated_at', ''))
@@ -462,7 +582,7 @@ class NoteListDelegate(QStyledItemDelegate):
                 painter.setBrush(QColor("#E5E5E7"))
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(badge_rect, 8, 8)
-                painter.setPen(QColor("#6E6E73"))
+                painter.setPen(QColor("#65758B"))
             painter.drawText(badge_rect, Qt.AlignCenter, str(att_count))
 
         if pinned:
@@ -509,7 +629,7 @@ class NoteListDelegate(QStyledItemDelegate):
 
 
 class ScreenshotListDelegate(QStyledItemDelegate):
-    ITEM_HEIGHT = 62
+    ITEM_HEIGHT = 68
     SIDE_MARGIN = 4
     PADDING = 12
 
@@ -528,33 +648,38 @@ class ScreenshotListDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#007AFF"))
+            painter.setBrush(QColor("#2F7BFF"))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
             title_color = QColor("#FFFFFF")
             sub_color = QColor(255, 255, 255, 210)
         elif hovered:
-            painter.setBrush(QColor(0, 0, 0, 12))
+            painter.setBrush(QColor(47, 123, 255, 20))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#1D1D1F")
-            sub_color = QColor("#86868B")
+            title_color = QColor("#263548")
+            sub_color = QColor("#8B98AA")
         else:
-            title_color = QColor("#1D1D1F")
-            sub_color = QColor("#86868B")
+            title_color = QColor("#263548")
+            sub_color = QColor("#8B98AA")
 
-        title = att.get('archive_content') or att.get('memo') or att.get('original_name') or '截图'
+        title = attachment_display_title(att)
         sub = format_time_short(att.get('archived_at') or att.get('added_at') or '')
-        category = (att.get('archive_category') or '').strip()
+        kind = attachment_kind_label(att)
+        category = (att.get('archive_category') or att.get('category') or '').strip()
         if category:
-            sub = f'#{category}  · {sub}' if sub else f'#{category}'
+            sub = f'{kind} · #{category}  · {sub}' if sub else f'{kind} · #{category}'
+        elif sub:
+            sub = f'{kind} · {sub}'
+        else:
+            sub = kind
 
         title_font = QFont(painter.font())
-        title_font.setPointSize(10)
+        title_font.setPointSize(11)
         title_font.setWeight(QFont.DemiBold)
         painter.setFont(title_font)
         painter.setPen(title_color)
-        title_rect = rect.adjusted(self.PADDING, 9, -self.PADDING, 0)
+        title_rect = rect.adjusted(self.PADDING, 10, -self.PADDING, 0)
         title_rect.setHeight(20)
         painter.drawText(
             title_rect,
@@ -572,7 +697,7 @@ class ScreenshotListDelegate(QStyledItemDelegate):
         painter.drawText(
             sub_rect,
             Qt.AlignLeft | Qt.AlignVCenter,
-            painter.fontMetrics().elidedText(sub or '未归档截图', Qt.ElideRight, sub_rect.width()),
+            painter.fontMetrics().elidedText(sub or tr('未归档'), Qt.ElideRight, sub_rect.width()),
         )
         painter.restore()
 
@@ -597,7 +722,7 @@ class ArchiveListDelegate(QStyledItemDelegate):
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#007AFF"))
+            painter.setBrush(QColor("#2F7BFF"))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
             title_color = QColor("#FFFFFF")
@@ -605,31 +730,31 @@ class ArchiveListDelegate(QStyledItemDelegate):
             badge_bg = QColor(255, 255, 255, 70)
             badge_fg = QColor("#FFFFFF")
         elif hovered:
-            painter.setBrush(QColor(0, 0, 0, 12))
+            painter.setBrush(QColor(47, 123, 255, 20))
             painter.setPen(Qt.NoPen)
             painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#1D1D1F")
-            sub_color = QColor("#86868B")
+            title_color = QColor("#263548")
+            sub_color = QColor("#8B98AA")
             badge_bg = QColor("#E5E5E7")
-            badge_fg = QColor("#6E6E73")
+            badge_fg = QColor("#65758B")
         else:
-            title_color = QColor("#1D1D1F")
-            sub_color = QColor("#86868B")
+            title_color = QColor("#263548")
+            sub_color = QColor("#8B98AA")
             badge_bg = QColor("#E5E5E7")
-            badge_fg = QColor("#6E6E73")
+            badge_fg = QColor("#65758B")
 
         note = data.get('note') or {}
         att = data.get('attachment') or {}
         is_note = data.get('kind') == 'note'
-        kind_label = tr('文字') if is_note else tr('截图')
+        kind_label = tr('文字') if is_note else attachment_kind_label(att)
         if is_note:
             title = note_display_title(note)
             preview = note_content_preview(note) or tr('没有附加文本')
             category = (note.get('archive_category') or note.get('category') or '').strip()
         else:
-            title = att.get('archive_content') or att.get('memo') or att.get('original_name') or tr('截图')
+            title = attachment_display_title(att)
             preview = tr('来自 {title}', title=note_display_title(note))
-            category = (att.get('archive_category') or '').strip()
+            category = (att.get('archive_category') or att.get('category') or '').strip()
         time_str = format_time_short(data.get('time') or '')
         if category:
             preview = f'#{category}  · {preview}'
@@ -694,6 +819,11 @@ class ArchiveListDelegate(QStyledItemDelegate):
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'}
 SHELL_CREATE_MATCH_WINDOW_SECONDS = 180.0
 SHELL_DELETE_RETRY_WINDOW_SECONDS = 180.0
+AUTO_RECOVERY_COOLDOWN_SECONDS = 30.0
+WINDOW_ACTIVATE_COOLDOWN_SECONDS = 8.0
+CLIPBOARD_MOVE_MATCH_WINDOW_SECONDS = 180.0
+DROPEFFECT_COPY = 1
+DROPEFFECT_MOVE = 2
 
 
 def is_image_attachment(att):
@@ -701,6 +831,145 @@ def is_image_attachment(att):
         return False
     name = att.get('original_name', '')
     return Path(name).suffix.lower() in IMAGE_EXTS
+
+
+def attachment_kind_label(att):
+    if is_image_attachment(att):
+        return tr('图片')
+    if att.get('type') == 'folder':
+        return tr('文件夹')
+    return tr('文件')
+
+
+def attachment_display_title(att):
+    if att.get('type') in ('folder', 'file_ref'):
+        return att.get('original_name') or att.get('archive_content') or att.get('memo') or attachment_kind_label(att)
+    return att.get('archive_content') or att.get('memo') or att.get('original_name') or attachment_kind_label(att)
+
+
+def build_folder_icon(size=36):
+    height = max(size, int(size * 44 / 36))
+    pix = QPixmap(size, height)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    back_color = QColor("#3F8FE0")
+    front_color = QColor("#5AC8FA")
+    sx = size / 36
+    sy = height / 44
+
+    painter.setBrush(back_color)
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(QRectF(2 * sx, 12 * sy, 32 * sx, 28 * sy), 3 * sx, 3 * sy)
+    painter.drawRoundedRect(QRectF(2 * sx, 8 * sy, 16 * sx, 8 * sy), 2 * sx, 2 * sy)
+
+    painter.setBrush(front_color)
+    painter.drawRoundedRect(QRectF(2 * sx, 16 * sy, 32 * sx, 24 * sy), 3 * sx, 3 * sy)
+
+    painter.setBrush(QColor(255, 255, 255, 50))
+    painter.drawRoundedRect(QRectF(2 * sx, 16 * sy, 32 * sx, 5 * sy), 3 * sx, 3 * sy)
+    painter.end()
+    return pix
+
+
+def build_file_icon(path, size=36, colors=None):
+    height = max(size, int(size * 44 / 36))
+    ext = Path(path).suffix.lower()
+    color = QColor((colors or {}).get(ext, '#8E8E93'))
+
+    pix = QPixmap(size, height)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    sx = size / 36
+    sy = height / 44
+    painter.setBrush(color)
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(QRectF(0, 0, size, height), 6 * sx, 6 * sy)
+
+    painter.setBrush(QColor(255, 255, 255, 60))
+    poly = QPolygonF([QPointF(size - 10 * sx, 0), QPointF(size, 10 * sy), QPointF(size - 10 * sx, 10 * sy)])
+    painter.drawPolygon(poly)
+
+    label = ext.lstrip('.').upper() if ext else 'FILE'
+    if len(label) > 4:
+        label = label[:4]
+    painter.setPen(QColor("#FFFFFF"))
+    font = QFont(painter.font())
+    font.setPointSize(max(8, int(size * 0.22)))
+    font.setWeight(QFont.Bold)
+    painter.setFont(font)
+    painter.drawText(QRectF(0, 8 * sy, size, height - 8 * sy), Qt.AlignCenter, label)
+    painter.end()
+    return pix
+
+
+def clipboard_drop_effect(mime):
+    """Return Windows DROPEFFECT flags from Explorer clipboard data when present."""
+    try:
+        formats = mime.formats()
+    except Exception:
+        return 0
+    for fmt in formats:
+        if 'Preferred DropEffect' not in fmt:
+            continue
+        try:
+            data = bytes(mime.data(fmt))
+        except Exception:
+            continue
+        if len(data) >= 4:
+            return int.from_bytes(data[:4], byteorder='little', signed=False)
+    return 0
+
+
+def explorer_open_folders():
+    """Best-effort list of open File Explorer folders, foreground window first."""
+    if sys.platform != 'win32' or win32com_client is None:
+        return []
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    try:
+        foreground = int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        foreground = 0
+    out = []
+    seen = set()
+    try:
+        shell = win32com_client.Dispatch('Shell.Application')
+        windows = shell.Windows()
+    except Exception:
+        return []
+    try:
+        count = int(windows.Count)
+    except Exception:
+        count = 0
+    for i in range(count):
+        try:
+            window = windows.Item(i)
+            hwnd = int(getattr(window, 'HWND', 0) or 0)
+            path = window.Document.Folder.Self.Path
+        except Exception:
+            continue
+        if not path:
+            continue
+        try:
+            p = Path(path)
+            if not p.exists() or not p.is_dir():
+                continue
+            key = os.path.normcase(os.path.normpath(str(p)))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((0 if hwnd and hwnd == foreground else 1, str(p)))
+    out.sort(key=lambda item: item[0])
+    return [path for _priority, path in out]
 
 
 def grab_clipboard_image_path():
@@ -909,8 +1178,8 @@ class ModeSwitch(QWidget):
         self.shot_btn.setCursor(Qt.PointingHandCursor)
         self.shot_btn.setFocusPolicy(Qt.NoFocus)
 
-        layout.addWidget(self.text_btn)
-        layout.addWidget(self.shot_btn)
+        layout.addWidget(self.text_btn, 1)
+        layout.addWidget(self.shot_btn, 1)
 
         self.text_btn.clicked.connect(lambda: self._click('text'))
         self.shot_btn.clicked.connect(lambda: self._click('screenshot'))
@@ -1029,26 +1298,70 @@ class TextFormatSwitch(QWidget):
         return 'markdown' if self.markdown_btn.isChecked() else 'rich'
 
 
+class DropHintCard(QFrame):
+    def __init__(self, title='', subtitle=''):
+        super().__init__()
+        self.setObjectName('drop_hint_card')
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setMinimumSize(246, 204)
+        self.setMaximumSize(246, 204)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 26, 18, 22)
+        layout.setSpacing(10)
+        layout.addStretch()
+
+        icon = QLabel('▤')
+        icon.setObjectName('drop_hint_icon')
+        icon.setAlignment(Qt.AlignCenter)
+
+        title_label = QLabel(title or '点击“新建”或拖拽文件到此处')
+        title_label.setObjectName('drop_hint_title')
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setWordWrap(True)
+
+        subtitle_label = QLabel(subtitle or '支持 .txt .md 等文本文件')
+        subtitle_label.setObjectName('drop_hint_subtitle')
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        subtitle_label.setWordWrap(True)
+
+        layout.addWidget(icon, 0, Qt.AlignCenter)
+        layout.addWidget(title_label)
+        layout.addWidget(subtitle_label)
+        layout.addStretch()
+
+
 class ScreenshotThumbnail(QFrame):
+    selected_requested = Signal(str)
     delete_requested = Signal(str)
     open_requested = Signal(str)
     archive_toggled = Signal(str)
     memo_changed = Signal(str, str)
+    child_delete_requested = Signal(str)
+    child_open_requested = Signal(str)
+    child_category_change_requested = Signal(str)
+    child_file_dropped = Signal(str, str)
+    add_child_requested = Signal(str)
 
     THUMB_W = 220
     THUMB_H = 150
-    CARD_H = THUMB_H + 38
+    CHILD_ROW_H = 42
+    CARD_H = THUMB_H + CHILD_ROW_H + 38
 
-    def __init__(self, attachment, file_path):
+    def __init__(self, attachment, file_path, path_resolver=None):
         super().__init__()
         self.attachment = attachment
         self.file_path = Path(file_path)
+        self.path_resolver = path_resolver
         self.is_archived = bool(attachment.get('archived', False))
+        self.is_image = is_image_attachment(attachment)
         self.setObjectName('screenshot_thumb')
         self.setProperty('archived', self.is_archived)
+        self.setProperty('selected', False)
         self.setFixedSize(self.THUMB_W, self.CARD_H)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip(tr('{name}\n双击查看大图 · 右键更多', name=attachment['original_name']))
+        self.setAcceptDrops(True)
+        self.setToolTip(tr('{name}\n双击打开 · 右键更多', name=attachment['original_name']))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1069,8 +1382,18 @@ class ScreenshotThumbnail(QFrame):
         self.check_btn.setCursor(Qt.PointingHandCursor)
         self.check_btn.setFocusPolicy(Qt.NoFocus)
         self.check_btn.setAttribute(Qt.WA_NoMousePropagation, True)
-        self.check_btn.setToolTip('已归档 · 点击取消' if self.is_archived else '归档这张照片')
+        self.check_btn.setToolTip('已归档 · 点击取消' if self.is_archived else '归档这个项目')
         self.check_btn.clicked.connect(lambda: self.archive_toggled.emit(self.attachment['id']))
+
+        self.add_child_btn = QPushButton('+', self.image_label)
+        self.add_child_btn.setObjectName('thumb_add_attachment')
+        self.add_child_btn.setFixedSize(24, 24)
+        self.add_child_btn.move(self.THUMB_W - 66, 10)
+        self.add_child_btn.setCursor(Qt.PointingHandCursor)
+        self.add_child_btn.setFocusPolicy(Qt.NoFocus)
+        self.add_child_btn.setAttribute(Qt.WA_NoMousePropagation, True)
+        self.add_child_btn.setToolTip('给这张截图添加文件或文件夹')
+        self.add_child_btn.clicked.connect(lambda: self.add_child_requested.emit(self.attachment['id']))
 
         self.memo_input = QLineEdit()
         self.memo_input.setObjectName('thumb_memo')
@@ -1079,14 +1402,58 @@ class ScreenshotThumbnail(QFrame):
         self.memo_input.editingFinished.connect(self._on_memo_committed)
 
         layout.addWidget(self.image_label)
+        layout.addLayout(self._build_child_row())
         layout.addWidget(self.memo_input)
 
+    def set_selected(self, selected):
+        self.setProperty('selected', bool(selected))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _active_child_attachments(self):
+        return [
+            child for child in (self.attachment.get('attachments', []) or [])
+            if not child.get('deleted')
+        ]
+
+    def _build_child_row(self):
+        row = QHBoxLayout()
+        row.setContentsMargins(12, 5, 12, 5)
+        row.setSpacing(6)
+        children = self._active_child_attachments()
+        if not children:
+            empty = QLabel('附件')
+            empty.setObjectName('thumb_attachment_empty')
+            row.addWidget(empty)
+            row.addStretch()
+            return row
+        for child in children[:3]:
+            chip = ScreenshotChildAttachmentChip(child, self._child_path(child))
+            chip.open_requested.connect(self.child_open_requested.emit)
+            chip.delete_requested.connect(self.child_delete_requested.emit)
+            chip.category_change_requested.connect(self.child_category_change_requested.emit)
+            row.addWidget(chip)
+        if len(children) > 3:
+            more = QLabel(f'+{len(children) - 3}')
+            more.setObjectName('thumb_attachment_more')
+            row.addWidget(more)
+        row.addStretch()
+        return row
+
+    def _child_path(self, child):
+        if self.path_resolver:
+            return self.path_resolver(child)
+        return Path(child.get('original_path', ''))
+
     def _build_thumbnail(self):
+        if not self.is_image:
+            return self._build_attachment_thumbnail()
         if not self.file_path.exists():
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
             painter = QPainter(pix)
-            painter.setPen(QColor("#86868B"))
+            painter.setPen(QColor("#8B98AA"))
             painter.drawText(pix.rect(), Qt.AlignCenter, tr('图片不存在'))
             painter.end()
             return pix
@@ -1095,7 +1462,7 @@ class ScreenshotThumbnail(QFrame):
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
             painter = QPainter(pix)
-            painter.setPen(QColor("#86868B"))
+            painter.setPen(QColor("#8B98AA"))
             painter.drawText(pix.rect(), Qt.AlignCenter, tr('无法加载'))
             painter.end()
             return pix
@@ -1103,6 +1470,44 @@ class ScreenshotThumbnail(QFrame):
             self.THUMB_W, self.THUMB_H,
             Qt.KeepAspectRatio, Qt.FastTransformation
         )
+
+    def _build_attachment_thumbnail(self):
+        pix = QPixmap(self.THUMB_W, self.THUMB_H)
+        pix.fill(QColor("#F5F5F7"))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if self.attachment.get('type') == 'folder':
+            icon = build_folder_icon(46)
+        else:
+            icon = build_file_icon(self.file_path, 46, AttachmentCard.EXT_COLORS)
+        icon_rect = QRect((self.THUMB_W - icon.width()) // 2, 36, icon.width(), icon.height())
+        painter.drawPixmap(icon_rect, icon)
+
+        name = self.attachment.get('original_name', '') or attachment_kind_label(self.attachment)
+        font = QFont(painter.font())
+        font.setPointSize(10)
+        font.setWeight(QFont.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QColor("#263548"))
+        text_rect = QRect(18, 98, self.THUMB_W - 36, 20)
+        painter.drawText(
+            text_rect,
+            Qt.AlignCenter,
+            painter.fontMetrics().elidedText(name, Qt.ElideMiddle, text_rect.width()),
+        )
+
+        sub_font = QFont(painter.font())
+        sub_font.setPointSize(9)
+        sub_font.setWeight(QFont.Normal)
+        painter.setFont(sub_font)
+        painter.setPen(QColor("#8B98AA"))
+        sub = attachment_kind_label(self.attachment)
+        if self.attachment.get('type') == 'file_ref':
+            sub = format_size(self.attachment.get('size', 0))
+        painter.drawText(QRect(18, 120, self.THUMB_W - 36, 18), Qt.AlignCenter, sub)
+        painter.end()
+        return pix
 
     def _on_memo_committed(self):
         text = self.memo_input.text().strip()
@@ -1115,21 +1520,29 @@ class ScreenshotThumbnail(QFrame):
         self.open_requested.emit(self.attachment['id'])
         super().mouseDoubleClickEvent(event)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.selected_requested.emit(self.attachment['id'])
+        super().mousePressEvent(event)
+
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        view = menu.addAction('查看大图')
-        toggle = menu.addAction('取消归档照片' if self.is_archived else '归档照片')
+        view = menu.addAction('查看大图' if self.is_image else '打开')
+        add_child = menu.addAction('给这张截图添加文件或文件夹...')
+        toggle = menu.addAction('取消归档' if self.is_archived else '归档')
         menu.addSeparator()
-        save = menu.addAction('保存为...')
+        save = menu.addAction('保存为...') if self.is_image else None
         reveal = menu.addAction('在文件夹中显示')
         menu.addSeparator()
         delete = menu.addAction('从备忘录中移除')
         action = menu.exec(event.globalPos())
         if action == view:
             self.open_requested.emit(self.attachment['id'])
+        elif action == add_child:
+            self.add_child_requested.emit(self.attachment['id'])
         elif action == toggle:
             self.archive_toggled.emit(self.attachment['id'])
-        elif action == save:
+        elif save is not None and action == save:
             self._save_as()
         elif action == reveal:
             self._reveal()
@@ -1153,12 +1566,143 @@ class ScreenshotThumbnail(QFrame):
             return
         reveal_in_file_manager(self.file_path)
 
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    self.child_file_dropped.emit(self.attachment['id'], url.toLocalFile())
+            event.acceptProposedAction()
+
+
+class ScreenshotChildAttachmentChip(QFrame):
+    open_requested = Signal(str)
+    delete_requested = Signal(str)
+    category_change_requested = Signal(str)
+
+    def __init__(self, attachment, file_path):
+        super().__init__()
+        self.attachment = attachment
+        self.file_path = Path(file_path)
+        self.setObjectName('thumb_attachment_chip')
+        self.setProperty('categorized', bool((attachment.get('archive_category') or attachment.get('category') or '').strip()))
+        self.setFixedSize(60, 30)
+        self.setCursor(Qt.PointingHandCursor)
+        category = (attachment.get('archive_category') or attachment.get('category') or '').strip()
+        tooltip = tr('{name}\n双击打开 · 右键更多', name=attachment.get('original_name', ''))
+        if category:
+            tooltip = f'{tooltip}\n#{category}'
+        self.setToolTip(tooltip)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
+
+        icon = QLabel()
+        icon.setObjectName('thumb_attachment_icon')
+        icon.setFixedSize(16, 16)
+        if is_image_attachment(attachment) and self.file_path.exists():
+            pixmap = QPixmap(str(self.file_path))
+            icon.setPixmap(pixmap.scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+        elif attachment.get('type') == 'folder':
+            icon.setPixmap(build_folder_icon(16).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+        else:
+            icon.setPixmap(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+
+        name_text = f'#{category}' if category else (attachment.get('original_name', '') or attachment_kind_label(attachment))
+        name = QLabel()
+        name.setObjectName('thumb_attachment_name')
+        name.setFixedWidth(30)
+        name.setText(QFontMetrics(name.font()).elidedText(name_text, Qt.ElideRight, 30))
+
+        layout.addWidget(icon)
+        layout.addWidget(name, 1)
+
+    def mouseDoubleClickEvent(self, event):
+        self.open_requested.emit(self.attachment.get('id', ''))
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        open_action = menu.addAction('打开')
+        category_action = menu.addAction(tr('修改分类'))
+        delete_action = menu.addAction('从当前截图中移除')
+        action = menu.exec(event.globalPos())
+        if action == open_action:
+            self.open_requested.emit(self.attachment.get('id', ''))
+        elif action == category_action:
+            self.category_change_requested.emit(self.attachment.get('id', ''))
+        elif action == delete_action:
+            self.delete_requested.emit(self.attachment.get('id', ''))
+
+
+class ScreenshotGridCanvas(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName('screenshot_grid_inner')
+        self._empty_art = True
+
+    def set_empty_art(self, empty):
+        empty = bool(empty)
+        if self._empty_art != empty:
+            self._empty_art = empty
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        rect = self.rect()
+        path = QPainterPath()
+        path.moveTo(rect.left(), rect.bottom() - 52)
+        path.cubicTo(
+            rect.left() + rect.width() * 0.35,
+            rect.bottom() + 10,
+            rect.left() + rect.width() * 0.66,
+            rect.bottom() - 76,
+            rect.right(),
+            rect.top() + rect.height() * 0.58,
+        )
+        path.lineTo(rect.right(), rect.bottom())
+        path.lineTo(rect.left(), rect.bottom())
+        path.closeSubpath()
+        painter.fillPath(path, QColor(235, 242, 255, 132))
+
+        if self._empty_art:
+            painter.setPen(QPen(QColor(205, 218, 242, 90), 4))
+            painter.setBrush(Qt.NoBrush)
+            paper = QRectF(rect.right() - 132, rect.bottom() - 110, 58, 72)
+            painter.drawRoundedRect(paper, 8, 8)
+            painter.setPen(QPen(QColor(205, 218, 242, 84), 3))
+            for i in range(3):
+                y = paper.top() + 20 + i * 14
+                painter.drawLine(QPointF(paper.left() + 16, y), QPointF(paper.right() - 12, y))
+            painter.setPen(QPen(QColor(205, 218, 242, 100), 6))
+            painter.drawLine(QPointF(paper.right() - 2, paper.bottom() - 8), QPointF(paper.right() + 24, paper.bottom() - 38))
+        painter.end()
+
 
 class ScreenshotGrid(QScrollArea):
+    selected_requested = Signal(str)
     file_dropped = Signal(str)
     image_pasted = Signal(str)
+    child_file_dropped = Signal(str, str)
+    add_child_requested = Signal(str)
     delete_requested = Signal(str)
     open_requested = Signal(str)
+    category_change_requested = Signal(str)
     archive_toggled = Signal(str)
     memo_changed = Signal(str, str)
 
@@ -1174,16 +1718,16 @@ class ScreenshotGrid(QScrollArea):
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.StrongFocus)
 
-        self.container = QWidget()
-        self.container.setObjectName('screenshot_grid_inner')
+        self.container = ScreenshotGridCanvas()
         self.grid = QGridLayout(self.container)
         self.grid.setContentsMargins(self.PADDING, self.PADDING, self.PADDING, self.PADDING)
         self.grid.setSpacing(self.THUMB_SPACING)
         self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
-        self.empty_label = QLabel('粘贴 (Ctrl+V) 或拖入图片到此处')
-        self.empty_label.setObjectName('grid_empty')
-        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label = DropHintCard(
+            '点击“新建记事”或拖拽文件到此处',
+            '支持图片、文件和文件夹'
+        )
 
         self.setWidget(self.container)
 
@@ -1191,13 +1735,24 @@ class ScreenshotGrid(QScrollArea):
         self._current_images = []
         self._current_resolver = None
         self._current_cols = 0
+        self._selected_id = ''
 
-    def set_attachments(self, attachments, path_resolver):
-        images = [att for att in (attachments or []) if is_image_attachment(att)]
-        self._current_images = images
+    def set_attachments(self, attachments, path_resolver, selected_id=''):
+        self._current_images = [att for att in (attachments or []) if is_image_attachment(att)]
         self._current_resolver = path_resolver
         self._current_cols = 0
+        self._selected_id = selected_id or ''
+        if self._selected_id and not any(att.get('id') == self._selected_id for att in self._current_images):
+            self._selected_id = ''
         self._render()
+
+    def current_attachment_id(self):
+        return self._selected_id
+
+    def set_selected_attachment(self, attachment_id):
+        self._selected_id = attachment_id or ''
+        for thumb in self._thumbnails:
+            thumb.set_selected(thumb.attachment.get('id') == self._selected_id)
 
     def _cols(self):
         avail = max(1, self.viewport().width() - 2 * self.PADDING)
@@ -1205,35 +1760,55 @@ class ScreenshotGrid(QScrollArea):
         return max(1, (avail + self.THUMB_SPACING) // cell)
 
     def _render(self):
+        # 注意：对“当前可见”的子 widget 调用 setParent(None) 会让它瞬间变成
+        # 一个可见的顶层窗口（标题回退为应用名），直到 deleteLater 在下一轮事件
+        # 循环真正销毁它——表现为屏幕上不停闪窗。所以 reparent 前必须先 hide()。
         for w in self._thumbnails:
+            w.hide()
             w.setParent(None)
             w.deleteLater()
         self._thumbnails = []
+        self.empty_label.hide()
         self.empty_label.setParent(None)
 
         while self.grid.count() > 0:
             item = self.grid.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().setParent(None)
 
         if not self._current_images:
+            self._selected_id = ''
+            self.container.set_empty_art(True)
             self.grid.addWidget(self.empty_label, 0, 0, 1, 1)
             self.empty_label.show()
             self._current_cols = 1
             return
 
+        self.container.set_empty_art(False)
         cols = self._cols()
         self._current_cols = cols
         for i, att in enumerate(self._current_images):
             row, col = divmod(i, cols)
             path = self._current_resolver(att) if self._current_resolver else Path('')
-            thumb = ScreenshotThumbnail(att, path)
+            thumb = ScreenshotThumbnail(att, path, self._current_resolver)
+            thumb.set_selected(att.get('id') == self._selected_id)
+            thumb.selected_requested.connect(self._on_thumb_selected)
             thumb.delete_requested.connect(self.delete_requested.emit)
             thumb.open_requested.connect(self.open_requested.emit)
             thumb.archive_toggled.connect(self.archive_toggled.emit)
             thumb.memo_changed.connect(self.memo_changed.emit)
+            thumb.child_delete_requested.connect(self.delete_requested.emit)
+            thumb.child_open_requested.connect(self.open_requested.emit)
+            thumb.child_category_change_requested.connect(self.category_change_requested.emit)
+            thumb.child_file_dropped.connect(self.child_file_dropped.emit)
+            thumb.add_child_requested.connect(self.add_child_requested.emit)
             self.grid.addWidget(thumb, row, col, Qt.AlignTop | Qt.AlignLeft)
             self._thumbnails.append(thumb)
+
+    def _on_thumb_selected(self, attachment_id):
+        self.set_selected_attachment(attachment_id)
+        self.selected_requested.emit(attachment_id)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1384,7 +1959,8 @@ class ImageViewerDialog(QDialog):
 class ArchivePhotoDialog(QDialog):
     def __init__(self, attachment, file_path, categories=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('归档照片')
+        is_image = is_image_attachment(attachment)
+        self.setWindowTitle('归档附件')
         self.setModal(True)
         self.resize(460, 480)
         self.setObjectName('archive_photo_dialog')
@@ -1396,7 +1972,7 @@ class ArchivePhotoDialog(QDialog):
         header = QLabel('完成了什么内容？')
         header.setObjectName('archive_dialog_title')
 
-        subtitle = QLabel('这段内容会保存到照片归档记录，并显示在时间线里。')
+        subtitle = QLabel('这段内容会保存到附件归档记录，并显示在时间线里。')
         subtitle.setObjectName('archive_dialog_subtitle')
         subtitle.setWordWrap(True)
 
@@ -1408,7 +1984,10 @@ class ArchivePhotoDialog(QDialog):
         thumb.setObjectName('archive_dialog_thumb')
         thumb.setFixedSize(120, 82)
         thumb.setAlignment(Qt.AlignCenter)
-        pixmap = QPixmap(str(file_path))
+        if is_image:
+            pixmap = QPixmap(str(file_path))
+        else:
+            pixmap = build_folder_icon(58) if attachment.get('type') == 'folder' else build_file_icon(file_path, 58, AttachmentCard.EXT_COLORS)
         if pixmap.isNull():
             thumb.setText('无法预览')
         else:
@@ -1417,10 +1996,10 @@ class ArchivePhotoDialog(QDialog):
         name_box = QVBoxLayout()
         name_box.setContentsMargins(0, 0, 0, 0)
         name_box.setSpacing(4)
-        filename = QLabel(attachment.get('original_name', '') or '截图')
+        filename = QLabel(attachment.get('original_name', '') or attachment_kind_label(attachment))
         filename.setObjectName('archive_dialog_filename')
         filename.setWordWrap(True)
-        hint = QLabel('填写后点击“归档照片”。')
+        hint = QLabel('填写后点击“归档附件”。')
         hint.setObjectName('archive_dialog_hint')
         name_box.addWidget(filename)
         name_box.addWidget(hint)
@@ -1440,7 +2019,9 @@ class ArchivePhotoDialog(QDialog):
         self.category_combo.setInsertPolicy(QComboBox.NoInsert)
         self.category_combo.lineEdit().setPlaceholderText('选择或输入分类')
         self.category_combo.addItems(categories or [])
-        self.category_combo.lineEdit().setText(attachment.get('archive_category', '') or '')
+        self.category_combo.lineEdit().setText(
+            attachment.get('archive_category', '') or attachment.get('category', '') or ''
+        )
         self.category_combo.currentTextChanged.connect(self._sync_ok_enabled)
         self.category_combo.lineEdit().textChanged.connect(self._sync_ok_enabled)
         category_row.addWidget(category_label)
@@ -1448,7 +2029,7 @@ class ArchivePhotoDialog(QDialog):
 
         self.content_edit = QTextEdit()
         self.content_edit.setObjectName('archive_dialog_content')
-        self.content_edit.setPlaceholderText('例如：整理完登录页错误状态、标注了按钮位置、确认这张图的问题已经处理...')
+        self.content_edit.setPlaceholderText('例如：整理完资料、确认这个文件的问题已经处理、记录文件夹里这批内容的状态...')
         self.content_edit.setPlainText(attachment.get('archive_content') or attachment.get('memo', '') or '')
         self.content_edit.setMinimumHeight(120)
         self.content_edit.textChanged.connect(self._sync_ok_enabled)
@@ -1461,7 +2042,7 @@ class ArchivePhotoDialog(QDialog):
         self.cancel_btn.setCursor(Qt.PointingHandCursor)
         self.cancel_btn.setFocusPolicy(Qt.NoFocus)
         self.cancel_btn.clicked.connect(self.reject)
-        self.ok_btn = QPushButton('归档照片')
+        self.ok_btn = QPushButton('归档附件')
         self.ok_btn.setObjectName('archive_dialog_ok')
         self.ok_btn.setCursor(Qt.PointingHandCursor)
         self.ok_btn.setFocusPolicy(Qt.NoFocus)
@@ -1487,7 +2068,89 @@ class ArchivePhotoDialog(QDialog):
         return self.category_combo.currentText().strip()
 
     def _sync_ok_enabled(self):
-        self.ok_btn.setEnabled(bool(self.content()) and bool(self.category()))
+        self.ok_btn.setEnabled(bool(self.content()))
+
+
+def choose_archive_category(parent, storage, current='', required=True):
+    current = (current or '').strip()
+    categories = list(storage.all_categories() if storage else [])
+    categories = [category for category in categories if category]
+    if current and current not in categories:
+        categories.append(current)
+        categories.sort()
+    if not required and '' not in categories:
+        categories.insert(0, '')
+
+    if categories:
+        index = categories.index(current) if current in categories else 0
+        category, ok = QInputDialog.getItem(
+            parent,
+            tr('归档分类'),
+            tr('选择或输入分类:'),
+            categories,
+            index,
+            True,
+        )
+    else:
+        category, ok = QInputDialog.getText(
+            parent,
+            tr('归档分类'),
+            tr('输入分类:'),
+            QLineEdit.Normal,
+            current,
+        )
+    if not ok:
+        return None
+    category = (category or '').strip()
+    if required and not category:
+        QMessageBox.information(parent, tr('需要分类'), tr('请填写归档分类。'))
+        return None
+    return category
+
+
+def attachment_category_candidates(storage):
+    categories = set()
+    if not storage:
+        return []
+    for _note, att, _parent, _container in storage.iter_attachments(include_deleted=False):
+        category = (att.get('archive_category') or att.get('category') or '').strip()
+        if category:
+            categories.add(category)
+    return sorted(categories)
+
+
+def choose_attachment_category(parent, storage, current=''):
+    current = (current or '').strip()
+    # 与归档分类共用同一套候选（笔记 + 附件的全部分类），名字互通。
+    categories = list(storage.all_categories() if storage else [])
+    categories = [category for category in categories if category]
+    if current and current not in categories:
+        categories.append(current)
+        categories.sort()
+    if '' not in categories:
+        categories.insert(0, '')
+
+    if categories:
+        index = categories.index(current) if current in categories else 0
+        category, ok = QInputDialog.getItem(
+            parent,
+            tr('附件分类'),
+            tr('选择或输入附件分类:'),
+            categories,
+            index,
+            True,
+        )
+    else:
+        category, ok = QInputDialog.getText(
+            parent,
+            tr('附件分类'),
+            tr('输入附件分类:'),
+            QLineEdit.Normal,
+            current,
+        )
+    if not ok:
+        return None
+    return (category or '').strip()
 
 
 class EmptyState(QWidget):
@@ -1499,18 +2162,19 @@ class EmptyState(QWidget):
         self.setObjectName('empty_state')
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(44, 44, 44, 44)
+        outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(0)
-        outer.addStretch(1)
 
         panel = QFrame()
         panel.setObjectName('empty_panel')
-        panel.setMaximumWidth(420)
+        panel.setMinimumSize(246, 204)
+        panel.setMaximumWidth(320)
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(28, 26, 28, 28)
+        panel_layout.setContentsMargins(24, 24, 24, 24)
         panel_layout.setSpacing(12)
+        panel_layout.addStretch()
 
-        self.icon = QLabel('⌘')
+        self.icon = QLabel('▤')
         self.icon.setObjectName('empty_icon')
         self.icon.setAlignment(Qt.AlignCenter)
 
@@ -1525,7 +2189,7 @@ class EmptyState(QWidget):
         self.message.setWordWrap(True)
 
         actions = QHBoxLayout()
-        actions.setContentsMargins(0, 10, 0, 0)
+        actions.setContentsMargins(0, 4, 0, 0)
         actions.setSpacing(10)
         self.secondary_btn = QPushButton('')
         self.secondary_btn.setObjectName('empty_secondary_btn')
@@ -1537,20 +2201,20 @@ class EmptyState(QWidget):
         self.primary_btn.setCursor(Qt.PointingHandCursor)
         self.primary_btn.setFocusPolicy(Qt.NoFocus)
         self.primary_btn.clicked.connect(self.primary_action.emit)
-        actions.addWidget(self.secondary_btn)
-        actions.addWidget(self.primary_btn)
+        actions.addWidget(self.secondary_btn, 1)
+        actions.addWidget(self.primary_btn, 1)
 
         panel_layout.addWidget(self.icon, 0, Qt.AlignCenter)
         panel_layout.addWidget(self.title)
         panel_layout.addWidget(self.message)
         panel_layout.addLayout(actions)
+        panel_layout.addStretch()
 
         outer.addWidget(panel, 0, Qt.AlignCenter)
-        outer.addStretch(2)
 
     def configure(self, view='active', filtered=False, search='', category='', has_rows=False):
         if has_rows:
-            self.icon.setText('✎')
+            self.icon.setText('▤')
             self.title.setText('选择一条备忘录')
             self.message.setText('从左侧列表打开一条备忘录。')
             self.secondary_btn.hide()
@@ -1577,16 +2241,16 @@ class EmptyState(QWidget):
         if view == 'archived':
             self.icon.setText('✓')
             self.title.setText('归档里还没有内容')
-            self.message.setText('截图归档后会出现在这里，也会按分类进入时间线。')
+            self.message.setText('附件或备忘录归档后会出现在这里，也会按分类进入时间线。')
             self.secondary_btn.setText('查看时间线')
             self.primary_btn.setText('回到活跃')
             self.secondary_btn.show()
             self.primary_btn.show()
             return
 
-        self.icon.setText('✎')
-        self.title.setText('还没有备忘录')
-        self.message.setText('新建一条文字备忘录，或拖入文件作为附件。')
+        self.icon.setText('▤')
+        self.title.setText('点击“新建记事”或拖拽文件到此处')
+        self.message.setText('支持 .txt .md 等文本文件')
         self.secondary_btn.hide()
         self.primary_btn.setText('新建备忘录')
         self.primary_btn.show()
@@ -1663,7 +2327,7 @@ class TimelineReviewChart(QWidget):
         self._rank_regions = []
         self.setObjectName('timeline_chart')
         self.setMouseTracking(True)
-        self.setMinimumHeight(172)
+        self.setMinimumHeight(140)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def set_records(self, records, selected_category='', granularity='month', rank_order='slow'):
@@ -1688,7 +2352,7 @@ class TimelineReviewChart(QWidget):
         title_font.setPointSize(11)
         title_font.setWeight(QFont.DemiBold)
         painter.setFont(title_font)
-        painter.setPen(QColor('#1D1D1F'))
+        painter.setPen(QColor('#263548'))
         painter.drawText(rect.adjusted(16, 12, -16, 0), Qt.AlignLeft | Qt.AlignTop, self.title)
 
         plot = rect.adjusted(16, 40, -16, -16)
@@ -1705,7 +2369,7 @@ class TimelineReviewChart(QWidget):
         painter.end()
 
     def _draw_empty(self, painter, rect):
-        painter.setPen(QColor('#AEAEB2'))
+        painter.setPen(QColor('#9AA8BA'))
         painter.drawText(rect, Qt.AlignCenter, '暂无完成记录')
 
     def _draw_trend(self, painter, rect):
@@ -1740,19 +2404,19 @@ class TimelineReviewChart(QWidget):
             created_h = chart_h * buckets[key]['created'] / max_count
             done_h = chart_h * buckets[key]['done'] / max_count
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor('#C7C7CC') if self.selected_category else QColor('#007AFF'))
+            painter.setBrush(QColor('#C7C7CC') if self.selected_category else QColor('#2F7BFF'))
             painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - created_h, bar_w, created_h), 3, 3)
             painter.setBrush(QColor('#C7C7CC') if self.selected_category else QColor('#34C759'))
             painter.drawRoundedRect(QRectF(x + 1, base_y - done_h, bar_w, done_h), 3, 3)
             if self.selected_category:
                 selected_created_h = chart_h * buckets[key]['selected_created'] / max_count
                 selected_done_h = chart_h * buckets[key]['selected_done'] / max_count
-                painter.setBrush(QColor('#007AFF'))
+                painter.setBrush(QColor('#2F7BFF'))
                 painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - selected_created_h, bar_w, selected_created_h), 3, 3)
                 painter.setBrush(QColor('#34C759'))
                 painter.drawRoundedRect(QRectF(x + 1, base_y - selected_done_h, bar_w, selected_done_h), 3, 3)
 
-        painter.setPen(QColor('#86868B'))
+        painter.setPen(QColor('#8B98AA'))
         label_font = QFont(painter.font())
         label_font.setPointSize(8)
         painter.setFont(label_font)
@@ -1766,8 +2430,8 @@ class TimelineReviewChart(QWidget):
         legend_font = QFont(painter.font())
         legend_font.setPointSize(8)
         painter.setFont(legend_font)
-        painter.setPen(QColor('#6E6E73'))
-        painter.fillRect(QRectF(rect.right() - 96, rect.top(), 8, 8), QColor('#007AFF'))
+        painter.setPen(QColor('#65758B'))
+        painter.fillRect(QRectF(rect.right() - 96, rect.top(), 8, 8), QColor('#2F7BFF'))
         painter.drawText(QRectF(rect.right() - 84, rect.top() - 3, 38, 16), Qt.AlignLeft | Qt.AlignVCenter, '创建')
         painter.fillRect(QRectF(rect.right() - 44, rect.top(), 8, 8), QColor('#34C759'))
         painter.drawText(QRectF(rect.right() - 32, rect.top() - 3, 38, 16), Qt.AlignLeft | Qt.AlignVCenter, '完成')
@@ -1797,8 +2461,8 @@ class TimelineReviewChart(QWidget):
         for idx, (category, data) in enumerate(items):
             y = rect.top() + idx * row_h
             dim = bool(self.selected_category and category != self.selected_category)
-            color = QColor('#8E8E93' if dim else '#007AFF')
-            text_color = QColor('#AEAEB2' if dim else '#1D1D1F')
+            color = QColor('#8E8E93' if dim else '#2F7BFF')
+            text_color = QColor('#9AA8BA' if dim else '#263548')
             bar_rect = QRectF(rect.left() + label_w, y + 4, max(2, (rect.width() - label_w - 70) * data['total'] / max_total), row_h - 8)
             painter.setPen(text_color)
             painter.drawText(
@@ -1809,7 +2473,7 @@ class TimelineReviewChart(QWidget):
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(bar_rect, 5, 5)
-            painter.setPen(QColor('#AEAEB2' if dim else '#6E6E73'))
+            painter.setPen(QColor('#9AA8BA' if dim else '#65758B'))
             painter.drawText(
                 QRectF(bar_rect.right() + 8, y, 62, row_h),
                 Qt.AlignLeft | Qt.AlignVCenter,
@@ -1844,7 +2508,7 @@ class TimelineReviewChart(QWidget):
             duration = record.get('duration_seconds') or 0
             dim = bool(self.selected_category and record.get('category') != self.selected_category)
             color = QColor('#C7C7CC' if dim else '#34C759')
-            text_color = QColor('#AEAEB2' if dim else '#1D1D1F')
+            text_color = QColor('#9AA8BA' if dim else '#263548')
             painter.setPen(text_color)
             title = record.get('title') or '未命名'
             painter.drawText(
@@ -1856,7 +2520,7 @@ class TimelineReviewChart(QWidget):
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(bar_rect, 5, 5)
-            painter.setPen(QColor('#AEAEB2' if dim else '#6E6E73'))
+            painter.setPen(QColor('#9AA8BA' if dim else '#65758B'))
             painter.drawText(QRectF(bar_rect.right() + 8, y, 68, row_h), Qt.AlignLeft | Qt.AlignVCenter, duration_text(duration))
             self._rank_regions.append((QRectF(rect.left(), y, rect.width(), row_h), record))
 
@@ -1908,10 +2572,11 @@ class TimelineItem(QFrame):
     open_requested = Signal(str)
     unarchive_requested = Signal(str, str)
     note_requested = Signal(str)
+    category_change_requested = Signal(str, str)
 
     THUMB_W = 110
     THUMB_H = 74
-    HEIGHT = 92
+    HEIGHT = 96
 
     def __init__(self, note, attachment, file_path):
         super().__init__()
@@ -1923,7 +2588,7 @@ class TimelineItem(QFrame):
         self.setCursor(Qt.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 8, 16, 8)
+        layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(14)
 
         self.image_label = QLabel()
@@ -1945,7 +2610,7 @@ class TimelineItem(QFrame):
         memo_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         note_title = note_display_title(note)
-        category = (attachment.get('archive_category') or '').strip()
+        category = (attachment.get('archive_category') or attachment.get('category') or '').strip()
         meta_text = f'· {note_title}'
         if category:
             meta_text = f'#{category}  · {note_title}'
@@ -1966,7 +2631,7 @@ class TimelineItem(QFrame):
             pass
         time_label = QLabel(time_str)
         time_label.setObjectName('timeline_time')
-        time_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         time_label.setFixedWidth(60)
 
         layout.addWidget(self.image_label)
@@ -1974,6 +2639,10 @@ class TimelineItem(QFrame):
         layout.addWidget(time_label)
 
     def _build_thumb(self):
+        if not is_image_attachment(self.attachment):
+            if self.attachment.get('type') == 'folder':
+                return build_folder_icon(58)
+            return build_file_icon(self.file_path, 58, AttachmentCard.EXT_COLORS)
         if not self.file_path.exists():
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
@@ -1994,14 +2663,18 @@ class TimelineItem(QFrame):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        view = menu.addAction('查看大图')
+        is_image = is_image_attachment(self.attachment)
+        view = menu.addAction('查看大图' if is_image else '打开')
         open_note = menu.addAction('打开所属备忘录')
-        unarchive = menu.addAction('取消归档照片')
+        change_category = menu.addAction(tr('修改分类'))
+        unarchive = menu.addAction('取消归档')
         action = menu.exec(event.globalPos())
         if action == view:
             self.open_requested.emit(self.attachment['id'])
         elif action == open_note:
             self.note_requested.emit(self.note['id'])
+        elif action == change_category:
+            self.category_change_requested.emit(self.note['id'], self.attachment['id'])
         elif action == unarchive:
             self.unarchive_requested.emit(self.note['id'], self.attachment['id'])
 
@@ -2009,8 +2682,9 @@ class TimelineItem(QFrame):
 class TimelineNoteItem(QFrame):
     open_requested = Signal(str)
     unarchive_requested = Signal(str)
+    category_change_requested = Signal(str)
 
-    HEIGHT = 100
+    HEIGHT = 96
 
     def __init__(self, note):
         super().__init__()
@@ -2020,7 +2694,7 @@ class TimelineNoteItem(QFrame):
         self.setCursor(Qt.PointingHandCursor)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(14)
 
         icon = QLabel('✓')
@@ -2068,7 +2742,7 @@ class TimelineNoteItem(QFrame):
             pass
         time_label = QLabel(time_str)
         time_label.setObjectName('timeline_time')
-        time_label.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         time_label.setFixedWidth(60)
 
         layout.addWidget(icon)
@@ -2082,10 +2756,13 @@ class TimelineNoteItem(QFrame):
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         open_note = menu.addAction('打开备忘录')
+        change_category = menu.addAction(tr('修改分类'))
         unarchive = menu.addAction('取消归档')
         action = menu.exec(event.globalPos())
         if action == open_note:
             self.open_requested.emit(self.note['id'])
+        elif action == change_category:
+            self.category_change_requested.emit(self.note['id'])
         elif action == unarchive:
             self.unarchive_requested.emit(self.note['id'])
 
@@ -2094,11 +2771,22 @@ class TimelineDialog(QDialog):
     state_changed = Signal()
     note_requested = Signal(str)
 
-    def __init__(self, storage, parent=None):
+    def __init__(self, storage, parent=None, workspace_mode='text'):
         super().__init__(parent)
         self.storage = storage
+        self.workspace_mode = workspace_mode if workspace_mode in ('text', 'screenshot') else 'text'
         self.setWindowTitle('时间线回顾')
-        self.resize(980, 820)
+        self.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
+        self.setMinimumSize(720, 520)
+        self.resize(860, 640)
+        self._updating_category_filter = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -2141,8 +2829,38 @@ class TimelineDialog(QDialog):
         self.range_filter.addItem('近 90 天', '90')
         self.range_filter.addItem('本月', 'month')
         self.range_filter.addItem('今年', 'year')
+        self.range_filter.addItem(tr('自定义日期'), 'custom')
         self.range_filter.setCurrentIndex(0)
-        self.range_filter.currentIndexChanged.connect(lambda _: self._populate())
+        self.range_filter.currentIndexChanged.connect(lambda _: self._on_range_changed())
+
+        self.custom_range_widget = QWidget()
+        self.custom_range_widget.setObjectName('timeline_custom_range')
+        custom_range_layout = QHBoxLayout(self.custom_range_widget)
+        custom_range_layout.setContentsMargins(0, 0, 0, 0)
+        custom_range_layout.setSpacing(6)
+        today = QDate.currentDate()
+        self.start_date_edit = QDateEdit(today.addDays(-30))
+        self.start_date_edit.setObjectName('timeline_date_edit')
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat('yyyy-MM-dd')
+        self.start_date_edit.setMinimumDate(QDate(1900, 1, 1))
+        self.start_date_edit.setMaximumDate(today.addYears(20))
+        self.start_date_edit.dateChanged.connect(lambda _: self._populate())
+        self.end_date_edit = QDateEdit(today)
+        self.end_date_edit.setObjectName('timeline_date_edit')
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat('yyyy-MM-dd')
+        self.end_date_edit.setMinimumDate(QDate(1900, 1, 1))
+        self.end_date_edit.setMaximumDate(today.addYears(20))
+        self.end_date_edit.dateChanged.connect(lambda _: self._populate())
+        from_label = QLabel(tr('从'))
+        from_label.setObjectName('timeline_date_label')
+        to_label = QLabel(tr('到'))
+        to_label.setObjectName('timeline_date_label')
+        custom_range_layout.addWidget(from_label)
+        custom_range_layout.addWidget(self.start_date_edit)
+        custom_range_layout.addWidget(to_label)
+        custom_range_layout.addWidget(self.end_date_edit)
 
         self.granularity_filter = QComboBox()
         self.granularity_filter.setObjectName('timeline_filter_combo')
@@ -2154,8 +2872,12 @@ class TimelineDialog(QDialog):
 
         self.category_filter = QComboBox()
         self.category_filter.setObjectName('timeline_filter_combo')
+        self.category_filter.setEditable(True)
+        self.category_filter.setInsertPolicy(QComboBox.NoInsert)
         self.category_filter.addItem('全部分类', '')
+        self.category_filter.lineEdit().setPlaceholderText(tr('搜索分类'))
         self.category_filter.currentIndexChanged.connect(lambda _: self._populate())
+        self.category_filter.lineEdit().textChanged.connect(lambda _: self._on_category_search_changed())
 
         self.rank_filter = QComboBox()
         self.rank_filter.setObjectName('timeline_filter_combo')
@@ -2164,11 +2886,13 @@ class TimelineDialog(QDialog):
         self.rank_filter.currentIndexChanged.connect(lambda _: self._populate())
 
         filter_row.addWidget(self.range_filter)
+        filter_row.addWidget(self.custom_range_widget)
         filter_row.addWidget(self.granularity_filter)
         filter_row.addWidget(self.category_filter)
         filter_row.addWidget(self.rank_filter)
         filter_row.addStretch()
         header_layout.addLayout(filter_row)
+        self._sync_custom_range_visibility()
 
         review_box = QWidget()
         review_box.setObjectName('timeline_review_box')
@@ -2231,25 +2955,72 @@ class TimelineDialog(QDialog):
         layout.addWidget(label_widget)
         return value_label, card
 
+    def _sync_custom_range_visibility(self):
+        self.custom_range_widget.setVisible((self.range_filter.currentData() or 'all') == 'custom')
+
+    def _on_range_changed(self):
+        self._sync_custom_range_visibility()
+        self._populate()
+
+    def _on_category_search_changed(self):
+        if self._updating_category_filter:
+            return
+        self._populate()
+
+    def _category_query(self):
+        editor = self.category_filter.lineEdit()
+        text = (editor.text() if editor else self.category_filter.currentText()).strip()
+        if not text or text == tr('全部分类'):
+            return ''
+        return text
+
+    def _category_matches(self, category, query):
+        query = (query or '').strip()
+        if not query:
+            return True
+        return query.casefold() in (category or '未分类').casefold()
+
+    def _exact_category(self, records, query=None):
+        query = self._category_query() if query is None else (query or '').strip()
+        if not query:
+            return ''
+        for record in records:
+            category = record.get('category') or '未分类'
+            if category == query:
+                return category
+        return ''
+
     def _refresh_category_filter(self, records):
-        current = self.category_filter.currentData() or ''
+        query = self._category_query()
         categories = sorted({record.get('category') or '未分类' for record in records})
+        visible_categories = [category for category in categories if self._category_matches(category, query)]
+        exact_index = 0 if not query else -1
+        self._updating_category_filter = True
         self.category_filter.blockSignals(True)
+        editor = self.category_filter.lineEdit()
+        if editor:
+            editor.blockSignals(True)
         self.category_filter.clear()
-        self.category_filter.addItem('全部分类', '')
-        for category in categories:
+        self.category_filter.addItem(tr('全部分类'), '')
+        for category in visible_categories:
             self.category_filter.addItem(category, category)
-        index = 0
-        for i in range(self.category_filter.count()):
-            if self.category_filter.itemData(i) == current:
-                index = i
-                break
-        self.category_filter.setCurrentIndex(index)
+        if query:
+            for i in range(self.category_filter.count()):
+                if self.category_filter.itemData(i) == query:
+                    exact_index = i
+                    break
+        self.category_filter.setCurrentIndex(exact_index)
+        if editor:
+            editor.setText(query)
+            editor.blockSignals(False)
         self.category_filter.blockSignals(False)
+        self._updating_category_filter = False
 
     def _review_records(self):
         records = []
         for item in self.storage.all_timeline_items():
+            if not self._timeline_item_matches_workspace(item):
+                continue
             note = item.get('note') or {}
             if item.get('kind') == 'note':
                 created_at = note.get('created_at') or note.get('updated_at') or item.get('time') or ''
@@ -2260,8 +3031,8 @@ class TimelineDialog(QDialog):
                 att = item.get('attachment') or {}
                 created_at = att.get('added_at') or note.get('created_at') or item.get('time') or ''
                 completed_at = item.get('time') or att.get('archived_at') or note.get('updated_at') or ''
-                category = (att.get('archive_category') or note.get('archive_category') or note.get('category') or '未分类').strip() or '未分类'
-                title = att.get('archive_content') or att.get('memo') or att.get('original_name') or '截图'
+                category = (att.get('archive_category') or att.get('category') or '未分类').strip() or '未分类'
+                title = attachment_display_title(att)
             created_dt = parse_iso_datetime(created_at)
             completed_dt = parse_iso_datetime(completed_at) or created_dt
             if not completed_dt:
@@ -2281,47 +3052,80 @@ class TimelineDialog(QDialog):
         records.sort(key=lambda record: record.get('completed_dt') or datetime.min, reverse=True)
         return records
 
-    def _range_start(self):
+    def _timeline_item_matches_workspace(self, item):
+        return True
+
+    def _date_start(self, qdate):
+        return datetime(qdate.year(), qdate.month(), qdate.day())
+
+    def _range_bounds(self):
         value = self.range_filter.currentData() or 'all'
         now = datetime.now()
         if value == 'all':
-            return None
+            return None, None
+        if value == 'custom':
+            start_date = self.start_date_edit.date()
+            end_date = self.end_date_edit.date()
+            if start_date.toJulianDay() > end_date.toJulianDay():
+                start_date, end_date = end_date, start_date
+            start = self._date_start(start_date)
+            end_exclusive = self._date_start(end_date) + timedelta(days=1)
+            return start, end_exclusive
         if value == 'month':
-            return datetime(now.year, now.month, 1)
+            return datetime(now.year, now.month, 1), None
         if value == 'year':
-            return datetime(now.year, 1, 1)
+            return datetime(now.year, 1, 1), None
         try:
-            return now - timedelta(days=int(value))
+            return now - timedelta(days=int(value)), None
         except Exception:
-            return None
+            return None, None
 
     def _records_in_range(self, records):
-        start = self._range_start()
-        if not start:
+        start, end_exclusive = self._range_bounds()
+        if not start and not end_exclusive:
             return records
-        return [record for record in records if record.get('completed_dt') and record['completed_dt'] >= start]
+        filtered = []
+        for record in records:
+            completed_dt = record.get('completed_dt')
+            if not completed_dt:
+                continue
+            if start and completed_dt < start:
+                continue
+            if end_exclusive and completed_dt >= end_exclusive:
+                continue
+            filtered.append(record)
+        return filtered
 
-    def _active_records(self, records):
-        category = self.category_filter.currentData() or ''
-        if not category:
+    def _active_records(self, records, category_query=None):
+        category_query = self._category_query() if category_query is None else (category_query or '').strip()
+        if not category_query:
             return records
-        return [record for record in records if record.get('category') == category]
+        return [record for record in records if self._category_matches(record.get('category'), category_query)]
 
     def _timeline_records_for_list(self, records, active_records):
-        selected_category = self.category_filter.currentData() or ''
+        category_query = self._category_query()
+        selected_category = self._exact_category(records, category_query)
         return records if selected_category else active_records
 
+    def _chart_records(self, records, active_records, selected_category, category_query):
+        return records if selected_category or not category_query else active_records
+
     def _select_category_from_chart(self, category):
-        current = self.category_filter.currentData() or ''
+        current = self._category_query()
         target = '' if current == category else category
         for i in range(self.category_filter.count()):
             if self.category_filter.itemData(i) == target:
                 self.category_filter.setCurrentIndex(i)
                 return
+        editor = self.category_filter.lineEdit()
+        if editor:
+            editor.setText(target)
+        else:
+            self._populate()
 
     def _update_summary(self, records, active_records):
-        selected_category = self.category_filter.currentData() or ''
-        summary_records = active_records if selected_category else records
+        category_query = self._category_query()
+        summary_records = active_records if category_query else records
         count = len(summary_records)
         total = sum(record.get('duration_seconds') or 0 for record in summary_records)
         avg = total / count if count else 0
@@ -2341,32 +3145,40 @@ class TimelineDialog(QDialog):
         all_records = self._review_records()
         records = self._records_in_range(all_records)
         self._refresh_category_filter(records)
-        active_records = self._active_records(records)
-        selected_category = self.category_filter.currentData() or ''
+        category_query = self._category_query()
+        active_records = self._active_records(records, category_query)
+        selected_category = self._exact_category(records, category_query)
         granularity = self.granularity_filter.currentData() or 'month'
         rank_order = self.rank_filter.currentData() or 'slow'
+        chart_records = self._chart_records(records, active_records, selected_category, category_query)
 
-        self.trend_chart.set_records(records, selected_category, granularity, rank_order)
-        self.category_chart.set_records(records, selected_category, granularity, rank_order)
-        self.ranking_chart.set_records(records, selected_category, granularity, rank_order)
+        self.trend_chart.set_records(chart_records, selected_category, granularity, rank_order)
+        self.category_chart.set_records(chart_records, selected_category, granularity, rank_order)
+        self.ranking_chart.set_records(chart_records, selected_category, granularity, rank_order)
         self._update_summary(records, active_records)
 
         list_records = self._timeline_records_for_list(records, active_records)
         count_items = [record.get('item') for record in active_records if record.get('item')]
         shot_count = sum(1 for item in count_items if item.get('kind') == 'attachment')
         note_count = sum(1 for item in count_items if item.get('kind') == 'note')
-        prefix = f'#{selected_category} · ' if selected_category else ''
+        prefix = ''
+        if selected_category:
+            prefix = f'#{selected_category} · '
+        elif category_query:
+            prefix = tr('分类搜索“{category}” · ', category=category_query)
         parts = []
         if shot_count:
-            parts.append(tr('{count} 张归档照片', count=shot_count))
+            parts.append(tr('{count} 个归档附件', count=shot_count))
         if note_count:
             parts.append(tr('{count} 条归档备忘录', count=note_count))
         self.subtitle.setText(prefix + (' · '.join(parts) if parts else tr('暂无归档内容')))
 
         if not list_records:
-            empty_text = tr('还没有归档内容\n\n归档照片或备忘录后会出现在这里')
+            empty_text = tr('还没有归档内容\n\n归档附件或备忘录后会出现在这里')
             if selected_category:
                 empty_text = tr('#{category} 下还没有归档内容', category=selected_category)
+            elif category_query:
+                empty_text = tr('没有匹配“{category}”的分类内容', category=category_query)
             empty = QLabel(empty_text)
             empty.setObjectName('timeline_empty')
             empty.setAlignment(Qt.AlignCenter)
@@ -2402,6 +3214,7 @@ class TimelineDialog(QDialog):
             if item.get('kind') == 'note':
                 tw = TimelineNoteItem(note)
                 tw.open_requested.connect(self._open_note)
+                tw.category_change_requested.connect(self._change_note_category)
                 tw.unarchive_requested.connect(self._unarchive_note)
                 item_height = TimelineNoteItem.HEIGHT
             else:
@@ -2409,8 +3222,9 @@ class TimelineDialog(QDialog):
                 if not att:
                     continue
                 tw = TimelineItem(note, att, self.storage.path_for(att))
-                tw.open_requested.connect(self._open_image)
+                tw.open_requested.connect(self._open_attachment)
                 tw.note_requested.connect(self._open_note)
+                tw.category_change_requested.connect(self._change_attachment_category)
                 tw.unarchive_requested.connect(self._unarchive_attachment)
                 item_height = TimelineItem.HEIGHT
             if selected_category and record.get('category') != selected_category:
@@ -2423,15 +3237,47 @@ class TimelineDialog(QDialog):
             self.list.addItem(it)
             self.list.setItemWidget(it, tw)
 
-    def _open_image(self, attachment_id):
+    def _open_attachment(self, attachment_id):
         parent = self.parent()
-        if parent is not None and hasattr(parent, '_open_image_viewer'):
-            parent._open_image_viewer(attachment_id)
+        if parent is not None and hasattr(parent, '_open_attachment'):
+            parent._open_attachment(attachment_id)
             return
 
     def _open_note(self, note_id):
         self.note_requested.emit(note_id)
         self.accept()
+
+    def _change_attachment_category(self, note_id, attachment_id):
+        note, att = self.storage.find_attachment(attachment_id)
+        if not note or not att or att.get('deleted'):
+            return
+        category = choose_archive_category(
+            self,
+            self.storage,
+            att.get('archive_category') or att.get('category') or '',
+            required=False,
+        )
+        if category is None:
+            return
+        self.storage.update_attachment(note.get('id'), attachment_id, category=category, archive_category=category)
+        self._populate()
+        self.state_changed.emit()
+
+    def _change_note_category(self, note_id):
+        note = self.storage.get_note(note_id)
+        if not note or note.get('deleted'):
+            return
+        category = choose_archive_category(
+            self,
+            self.storage,
+            note.get('archive_category') or note.get('category') or '',
+            required=True,
+        )
+        if category is None:
+            return
+        self.storage.update_note(note_id, archive_category=category)
+        self._populate()
+        self.state_changed.emit()
 
     def _unarchive_attachment(self, note_id, attachment_id):
         self.storage.update_attachment(
@@ -2640,11 +3486,12 @@ class FtrackScanWorker(QThread):
     phase_changed = Signal(str)
     finished_with_result = Signal(object)
 
-    def __init__(self, tracking, name_fallback=None, scan_settings=None, parent=None):
+    def __init__(self, tracking, name_fallback=None, scan_settings=None, is_folder=False, parent=None):
         super().__init__(parent)
         self.tracking = tracking
         self.name_fallback = name_fallback
         self.scan_settings = scan_settings or {}
+        self.is_folder = bool(is_folder)
         self._cancel = False
 
     def cancel(self):
@@ -2668,6 +3515,44 @@ class FtrackScanWorker(QThread):
                 result['path'] = quick
                 self.finished_with_result.emit(result)
                 return
+
+            # 1b. 文件夹：用固定标记名 .fresh_folder_id 快速定位。
+            # 文件夹改名 / 内部文件增删改都不影响这个标记，所以与"现在叫什么"无关地把它找回。
+            # 有 Everything 时一次查询秒级命中；没装/没开 Everything 时退化到只读目录 marker
+            # 的全盘扫描（scan_for_folder_markers，文件夹版 scan_for_hash），仍不必逐文件读 ADS，
+            # 比最后兜底的 scan_for_tag 快得多。
+            if self.is_folder and tag and not self._cancel:
+                paths = []
+                if self.scan_settings.get('use_everything', True) and ftrack.everything_mode(es_path):
+                    self.phase_changed.emit('按文件夹标记定位')
+                    groups = ftrack.find_folders_by_marker(
+                        {tag},
+                        drive_hints=[hint] if hint else None,
+                        es_path=es_path,
+                        cancel=self._is_cancelled,
+                    )
+                    paths = groups.get(tag) or []
+                if not paths and not self._cancel:
+                    self.phase_changed.emit('按文件夹标记扫描')
+                    marker_roots = recovery_scan_roots(self.scan_settings, [hint] if hint else None)
+                    groups = ftrack.scan_for_folder_markers(
+                        {tag},
+                        roots=marker_roots,
+                        drive_hints=[hint] if hint else None,
+                        progress=lambda d: self.progress.emit(d),
+                        cancel=self._is_cancelled,
+                    )
+                    paths = groups.get(tag) or []
+                if len(paths) == 1:
+                    result['path'] = paths[0]
+                    self.finished_with_result.emit(result)
+                    return
+                if len(paths) > 1:
+                    # 用户复制过同一文件夹（多个副本都带同一标记）——交给用户选择，
+                    # 不自动采纳，避免指向错误的副本。
+                    result['candidates'] = paths
+                    self.finished_with_result.emit(result)
+                    return
 
             # 2. Everything（如果可用）按 tag + name 定位
             if tag and name and ftrack.everything_mode(es_path) and self.scan_settings.get('use_everything', True):
@@ -2703,8 +3588,9 @@ class FtrackScanWorker(QThread):
                     self.finished_with_result.emit(result)
                     return
 
-            # 4. 按名兜底 (Everything 优先 / os.walk)
-            if name and not self._cancel:
+            # 4. 按名兜底 (Everything 优先 / os.walk)。
+            # 文件夹有 .fresh_folder_id 时不能再按旧名兜底，否则改名后会扫旧目录名。
+            if name and not self._cancel and not (self.is_folder and tag):
                 self.phase_changed.emit('按文件名查找候选')
                 size_hint = self.tracking.get('size_snapshot')
                 cands = ftrack.find_candidates_by_name(
@@ -2756,10 +3642,11 @@ class AutoRecoveryWorker(QThread):
     found_one = Signal(str, str)  # (tracking_id, path)
     finished_clean = Signal(int)  # 已扫目录数
 
-    def __init__(self, tag_to_name, tag_to_tracking=None, drive_hints=None, scan_settings=None, parent=None):
+    def __init__(self, tag_to_name, tag_to_tracking=None, drive_hints=None, scan_settings=None, tag_to_is_folder=None, parent=None):
         super().__init__(parent)
         self.tag_to_name = dict(tag_to_name)
         self.tag_to_tracking = dict(tag_to_tracking or {})
+        self.tag_to_is_folder = dict(tag_to_is_folder or {})
         self.drive_hints = list(drive_hints or [])
         self.scan_settings = scan_settings or {}
         self._cancel = False
@@ -2787,6 +3674,50 @@ class AutoRecoveryWorker(QThread):
 
             found = {}
             remaining = set(self.tag_to_tracking.keys())
+
+            # 0. 文件夹：用固定标记名 .fresh_folder_id 一次性把改名/移动过的文件夹找回。
+            # 与文件夹当前名无关，所以一条 Everything 查询就能批量定位；没装/没开 Everything
+            # 时退化到只读目录 marker 的全盘扫描（scan_for_folder_markers，不依赖 Everything）。
+            # 只有唯一命中才自动采纳，复制出多个副本（同一标记）的情况留给用户手动选择。
+            folder_tags = {t for t in remaining if self.tag_to_is_folder.get(t)}
+            if folder_tags and not self._cancel:
+                groups = {}
+                if self.scan_settings.get('use_everything', True) and ftrack.everything_mode(es_path):
+                    on_phase('用文件夹标记定位已移动的文件夹')
+                    groups = ftrack.find_folders_by_marker(
+                        folder_tags,
+                        drive_hints=self.drive_hints,
+                        es_path=es_path,
+                        cancel=lambda: self._cancel,
+                    ) or {}
+                # Everything 没命中的（或没装 Everything）继续用不依赖 Everything 的
+                # 只读目录 marker 全盘扫描兜底。
+                still = {t for t in folder_tags if not groups.get(t)}
+                if still and not self._cancel:
+                    on_phase('按文件夹标记扫描已移动的文件夹')
+                    scan_groups = ftrack.scan_for_folder_markers(
+                        still,
+                        roots=scan_roots,
+                        drive_hints=self.drive_hints,
+                        progress=on_progress,
+                        cancel=lambda: self._cancel,
+                    )
+                    for t, paths in (scan_groups or {}).items():
+                        if paths:
+                            groups[t] = paths
+                for tag, paths in (groups or {}).items():
+                    if tag not in folder_tags:
+                        continue
+                    if len(paths) == 1:
+                        found[tag] = paths[0]
+                        remaining.discard(tag)
+                        on_found(tag, paths[0])
+                    elif len(paths) > 1:
+                        # 多个副本带同一标记（用户复制过同一文件夹）——不自动认，
+                        # 也从 remaining 移除以免后面的全盘扫描”先到先得”乱指；
+                        # 留给用户在”重点查找”里手动选择正确的那个。
+                        remaining.discard(tag)
+
             if remaining and not self._cancel:
                 on_phase('按文件名快速验证剩余文件')
                 for tag in list(remaining):
@@ -2820,10 +3751,15 @@ class AutoRecoveryWorker(QThread):
                     if self._cancel:
                         break
 
-            if remaining and not self._cancel and ftrack.everything_mode(es_path):
+            everything_name_targets = {
+                tag: self.tag_to_name.get(tag, '')
+                for tag in remaining
+                if not self.tag_to_is_folder.get(tag)
+            }
+            if everything_name_targets and not self._cancel and ftrack.everything_mode(es_path):
                 on_phase(f'用 Everything ({ftrack.everything_mode(es_path)}) 加速查找')
                 found_by_tag = ftrack._scan_via_everything(
-                    {tag: self.tag_to_name.get(tag, '') for tag in remaining},
+                    everything_name_targets,
                     drive_hints=self.drive_hints,
                     on_found=on_found,
                     cancel=lambda: self._cancel,
@@ -3404,6 +4340,7 @@ def make_scan_dialog(parent, name):
 
 class AttachmentCard(QFrame):
     delete_requested = Signal(str)
+    category_change_requested = Signal(str)
 
     EXT_COLORS = {
         '.png': '#FF9500', '.jpg': '#FF9500', '.jpeg': '#FF9500',
@@ -3428,10 +4365,15 @@ class AttachmentCard(QFrame):
         self.is_folder = (attachment.get('type') == 'folder')
         self.setObjectName('attachment_card')
         self.setFixedSize(174, 64)
+        self.setProperty('categorized', bool((attachment.get('archive_category') or attachment.get('category') or '').strip()))
         self.setCursor(Qt.PointingHandCursor)
         self.setMouseTracking(True)
         kind = '文件夹' if self.is_folder else '文件'
-        self.setToolTip(f"{attachment['original_name']} ({kind})\n双击打开 · 右键更多")
+        category = (attachment.get('archive_category') or attachment.get('category') or '').strip()
+        tooltip = f"{attachment['original_name']} ({kind})\n双击打开 · 右键更多"
+        if category:
+            tooltip = f'{tooltip}\n#{category}'
+        self.setToolTip(tooltip)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -3443,7 +4385,7 @@ class AttachmentCard(QFrame):
         icon_label.setAlignment(Qt.AlignCenter)
 
         text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 2, 0, 2)
+        text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(2)
 
         name_label = QLabel()
@@ -3458,9 +4400,26 @@ class AttachmentCard(QFrame):
             sub_text = format_size(attachment.get('size', 0))
         size_label = QLabel(sub_text)
         size_label.setObjectName('att_size')
+        size_label.setText(QFontMetrics(size_label.font()).elidedText(sub_text, Qt.ElideRight, 46 if category else 104))
 
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(5)
+        meta_row.addWidget(size_label)
+        if category:
+            badge = QLabel()
+            badge.setObjectName('att_category_badge')
+            badge_text = f'#{category}'
+            badge.setText(QFontMetrics(badge.font()).elidedText(badge_text, Qt.ElideRight, 54))
+            badge.setToolTip(badge_text)
+            badge.setFixedHeight(17)
+            badge.setMaximumWidth(62)
+            meta_row.addWidget(badge)
+        meta_row.addStretch()
+
+        text_layout.addStretch()
         text_layout.addWidget(name_label)
-        text_layout.addWidget(size_label)
+        text_layout.addLayout(meta_row)
         text_layout.addStretch()
 
         layout.addWidget(icon_label)
@@ -3483,57 +4442,10 @@ class AttachmentCard(QFrame):
         return self._build_file_icon()
 
     def _build_folder_icon(self):
-        pix = QPixmap(36, 44)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        back_color = QColor("#3F8FE0")
-        front_color = QColor("#5AC8FA")
-
-        painter.setBrush(back_color)
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(2, 12, 32, 28, 3, 3)
-        painter.drawRoundedRect(2, 8, 16, 8, 2, 2)
-
-        painter.setBrush(front_color)
-        painter.drawRoundedRect(2, 16, 32, 24, 3, 3)
-
-        painter.setBrush(QColor(255, 255, 255, 50))
-        painter.drawRoundedRect(2, 16, 32, 5, 3, 3)
-
-        painter.end()
-        return pix
+        return build_folder_icon()
 
     def _build_file_icon(self):
-        ext = self.file_path.suffix.lower()
-        color = QColor(self.EXT_COLORS.get(ext, '#8E8E93'))
-
-        pix = QPixmap(36, 44)
-        pix.fill(Qt.transparent)
-        painter = QPainter(pix)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-
-        painter.setBrush(color)
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(0, 0, 36, 44, 6, 6)
-
-        painter.setBrush(QColor(255, 255, 255, 60))
-        poly = QPolygonF([QPointF(36 - 10, 0), QPointF(36, 10), QPointF(36 - 10, 10)])
-        painter.drawPolygon(poly)
-
-        label = ext.lstrip('.').upper() if ext else 'FILE'
-        if len(label) > 4:
-            label = label[:4]
-        painter.setPen(QColor("#FFFFFF"))
-        font = QFont(painter.font())
-        font.setPointSize(8)
-        font.setWeight(QFont.Bold)
-        painter.setFont(font)
-        painter.drawText(pix.rect().adjusted(0, 8, 0, 0), Qt.AlignCenter, label)
-        painter.end()
-
-        return pix
+        return build_file_icon(self.file_path, colors=self.EXT_COLORS)
 
     def mouseDoubleClickEvent(self, event):
         self._open_file()
@@ -3551,6 +4463,7 @@ class AttachmentCard(QFrame):
         menu = QMenu(self)
         open_action = menu.addAction('打开')
         reveal_action = menu.addAction('在文件夹中显示')
+        category_action = menu.addAction(tr('修改分类'))
         find_action = None
         if self.attachment.get('tracking'):
             menu.addSeparator()
@@ -3564,6 +4477,8 @@ class AttachmentCard(QFrame):
             self._open_file()
         elif action == reveal_action:
             self._reveal_in_folder()
+        elif action == category_action:
+            self.category_change_requested.emit(self.attachment['id'])
         elif find_action is not None and action == find_action:
             self._scan_recover()
         elif action == delete_action:
@@ -3575,6 +4490,12 @@ class AttachmentCard(QFrame):
             return
         # 委托给 MainWindow 去启动后台扫描；不阻塞当前 UI
         self.recover_resolver(self.attachment, request_scan=True)
+
+    def _request_recovery_scan(self):
+        if not self.recover_resolver or not self.attachment.get('tracking'):
+            return False
+        self.recover_resolver(self.attachment, request_scan=True)
+        return True
 
     def _ensure_path(self):
         """路径若失效，尝试通过 recover_resolver 找回新位置。返回是否可访问。"""
@@ -3596,18 +4517,23 @@ class AttachmentCard(QFrame):
 
     def _open_file(self):
         if not self._ensure_path():
-            if self.attachment.get('tracking') and self.recover_resolver:
-                self._scan_recover()
-                return
             msg = '该文件夹已被移动或删除。' if self.is_folder else '该附件文件已被移动或删除。'
+            if self._request_recovery_scan():
+                self.setToolTip(tr('{msg}\n正在查找当前位置。', msg=msg))
+                return
             QMessageBox.warning(self, '路径不存在', msg)
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.file_path)))
+        if not open_local_path(self.file_path):
+            QMessageBox.warning(self, '打开失败', f'无法打开:\n{self.file_path}')
 
     def _reveal_in_folder(self):
         if not self._ensure_path():
+            if self._request_recovery_scan():
+                return
+            QMessageBox.warning(self, '路径不存在', '该附件已被移动或删除。')
             return
-        reveal_in_file_manager(self.file_path)
+        if not reveal_in_file_manager(self.file_path):
+            QMessageBox.warning(self, '定位失败', f'无法定位:\n{self.file_path}')
 
 
 # ============ 附件栏 ============
@@ -3618,17 +4544,21 @@ class AttachmentBar(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName('attachment_bar')
-        self.setFixedHeight(108)
+        self.setFixedHeight(120)
         self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 10, 36, 14)
+        layout.setContentsMargins(40, 10, 40, 14)
         layout.setSpacing(6)
 
         header = QHBoxLayout()
         header.setSpacing(8)
         title = QLabel('附件')
         title.setObjectName('att_section_title')
+        self.category_filter = QComboBox()
+        self.category_filter.setObjectName('att_category_filter')
+        self.category_filter.addItem(tr('全部附件'), '')
+        self.category_filter.currentIndexChanged.connect(lambda _: self._render_attachments())
         self.hint = QLabel('拖入文件或文件夹')
         self.hint.setObjectName('att_hint')
         self.add_btn = QPushButton('+')
@@ -3637,6 +4567,7 @@ class AttachmentBar(QWidget):
         self.add_btn.setCursor(Qt.PointingHandCursor)
         self.add_btn.clicked.connect(self.browse_file)
         header.addWidget(title)
+        header.addWidget(self.category_filter)
         header.addStretch()
         header.addWidget(self.hint)
         header.addWidget(self.add_btn)
@@ -3663,23 +4594,88 @@ class AttachmentBar(QWidget):
         layout.addLayout(header)
         layout.addWidget(self.scroll)
 
-    def set_attachments(self, attachments, path_resolver, on_delete, recover_resolver=None):
+        self._attachments = []
+        self._path_resolver = None
+        self._on_delete = None
+        self._recover_resolver = None
+        self._on_category_change = None
+        self._attachment_signature = ()
+
+    def set_attachments(self, attachments, path_resolver, on_delete, recover_resolver=None, on_category_change=None):
+        self._attachments = list(attachments or [])
+        signature = tuple(att.get('id', '') for att in self._attachments)
+        reset_filter = signature != self._attachment_signature
+        self._attachment_signature = signature
+        self._path_resolver = path_resolver
+        self._on_delete = on_delete
+        self._recover_resolver = recover_resolver
+        self._on_category_change = on_category_change
+        self._refresh_category_filter(reset=reset_filter)
+        self._render_attachments()
+
+    def _attachment_category(self, attachment):
+        return (attachment.get('archive_category') or attachment.get('category') or '').strip()
+
+    def _selected_category(self):
+        return self.category_filter.currentData() or ''
+
+    def _refresh_category_filter(self, reset=False):
+        current = '' if reset else self._selected_category()
+        categories = sorted({
+            self._attachment_category(att)
+            for att in self._attachments
+            if self._attachment_category(att)
+        })
+        if current and current not in categories:
+            current = ''
+        self.category_filter.blockSignals(True)
+        self.category_filter.clear()
+        self.category_filter.addItem(tr('全部附件'), '')
+        for category in categories:
+            self.category_filter.addItem(category, category)
+        index = 0
+        if current:
+            for i in range(self.category_filter.count()):
+                if self.category_filter.itemData(i) == current:
+                    index = i
+                    break
+        self.category_filter.setCurrentIndex(index)
+        self.category_filter.setVisible(bool(categories))
+        self.category_filter.blockSignals(False)
+
+    def _clear_cards(self):
         while self.scroll_layout.count() > 0:
             item = self.scroll_layout.takeAt(0)
             widget = item.widget()
             if widget is self.empty_label:
+                widget.hide()
                 widget.setParent(None)
             elif widget:
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
 
+    def _render_attachments(self):
+        self._clear_cards()
+        category = self._selected_category()
+        attachments = [
+            att for att in self._attachments
+            if not category or self._attachment_category(att) == category
+        ]
         if attachments:
             for att in attachments:
                 try:
-                    card = AttachmentCard(att, path_resolver(att), recover_resolver=recover_resolver)
-                    card.delete_requested.connect(on_delete)
+                    card = AttachmentCard(att, self._path_resolver(att), recover_resolver=self._recover_resolver)
+                    if self._on_delete is not None:
+                        card.delete_requested.connect(self._on_delete)
+                    if self._on_category_change is not None:
+                        card.category_change_requested.connect(self._on_category_change)
                     self.scroll_layout.addWidget(card)
                 except Exception:
                     pass
+        elif self._attachments:
+            self.empty_label.setText(tr('这个分类下没有附件'))
+            self.scroll_layout.addWidget(self.empty_label)
         self.scroll_layout.addStretch()
 
     def browse_file(self):
@@ -3775,7 +4771,7 @@ class NoteEditor(QWidget):
         self._content_format = 'rich'
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 28, 40, 12)
+        layout.setContentsMargins(40, 28, 40, 24)
         layout.setSpacing(6)
 
         title_row = QHBoxLayout()
@@ -3800,7 +4796,7 @@ class NoteEditor(QWidget):
         time_row = QHBoxLayout()
         time_row.setContentsMargins(0, 0, 0, 0)
         time_row.setSpacing(10)
-        time_row.addWidget(self.time_label)
+        time_row.addWidget(self.time_label, 0, Qt.AlignVCenter)
         time_row.addStretch()
 
         self.category_combo = QComboBox()
@@ -3813,8 +4809,8 @@ class NoteEditor(QWidget):
         self.category_combo.lineEdit().textChanged.connect(self._on_category_changed)
         self.format_switch = TextFormatSwitch()
         self.format_switch.changed.connect(self._on_content_format_changed)
-        time_row.addWidget(self.format_switch, 0, Qt.AlignRight)
-        time_row.addWidget(self.category_combo, 0, Qt.AlignRight)
+        time_row.addWidget(self.format_switch, 0, Qt.AlignRight | Qt.AlignVCenter)
+        time_row.addWidget(self.category_combo, 0, Qt.AlignRight | Qt.AlignVCenter)
 
         self.divider = QFrame()
         self.divider.setObjectName('divider')
@@ -3856,7 +4852,7 @@ class NoteEditor(QWidget):
     def _build_format_toolbar(self):
         toolbar = QHBoxLayout()
         toolbar.setObjectName('format_toolbar')
-        toolbar.setContentsMargins(0, 2, 0, 0)
+        toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.setSpacing(6)
 
         self.bold_btn = self._format_button('B', '加粗')
@@ -3887,7 +4883,7 @@ class NoteEditor(QWidget):
     def _format_button(self, text, tooltip):
         btn = QPushButton(text)
         btn.setObjectName('format_btn')
-        btn.setFixedSize(30, 28)
+        btn.setFixedSize(30, 30)
         btn.setCursor(Qt.PointingHandCursor)
         btn.setFocusPolicy(Qt.NoFocus)
         btn.setToolTip(tooltip)
@@ -4142,6 +5138,7 @@ class MainWindow(QMainWindow):
         self.current_note_id = self.screenshot_board['id']
         self.workspace_mode = 'screenshot'
         self._suppress_auto_select = False
+        self._updating_archive_category_filter = False
         self._capture_in_progress = False
         self._settings = QSettings('FRESH', 'FRESH')
 
@@ -4170,10 +5167,14 @@ class MainWindow(QMainWindow):
         self._refresh_dirs_timer.setSingleShot(True)
         self._refresh_dirs_timer.timeout.connect(self._flush_refresh_pending_dirs)
 
-        # 剪贴板监听：用户剪切/复制了追踪文件 → 短延后跑一次恢复
+        # 剪贴板监听只做状态提示，避免自动扫描窗口打扰。
         self._clipboard_trigger_timer = QTimer(self)
         self._clipboard_trigger_timer.setSingleShot(True)
         self._clipboard_trigger_timer.timeout.connect(self._on_clipboard_settled)
+        self._clipboard_move_candidates = []
+        self._clipboard_probe_timer = QTimer(self)
+        self._clipboard_probe_timer.setSingleShot(True)
+        self._clipboard_probe_timer.timeout.connect(self._probe_clipboard_move_targets)
         try:
             QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
         except Exception:
@@ -4182,17 +5183,18 @@ class MainWindow(QMainWindow):
         self._recent_create_match_timer.setSingleShot(True)
         self._recent_create_match_timer.timeout.connect(self._retry_recent_shell_creates)
 
-        # 焦点监听：回到 FRESH 时跑一次恢复
+        # 焦点监听只刷新仍在原位的追踪信息，不自动扫描。
         self._focus_trigger_timer = QTimer(self)
         self._focus_trigger_timer.setSingleShot(True)
         self._focus_trigger_timer.timeout.connect(self._on_focus_settled)
         self._last_focus_recovery = 0  # 上次基于焦点触发恢复的时间戳
+        self._last_auto_recovery_start = 0.0
+        self._last_window_activation = 0.0
 
-        # 周期性轮询：每 20 秒检查一次是否有跟踪文件失踪，有就启动后台恢复
-        # 兼容 QFileSystemWatcher 漏报、U 盘热插拔、跨盘剪切等场景
+        # 周期性轮询只维护 watcher，不自动扫描，避免反复弹窗。
         self._recovery_poll_timer = QTimer(self)
         self._recovery_poll_timer.timeout.connect(self._poll_missing_attachments)
-        self._recovery_poll_timer.start(20000)
+        self._recovery_poll_timer.start(60000)
 
         # 启动时立即挂上 watcher（不再等后台打标完成）
         QTimer.singleShot(50, self._setup_tracking_watchers)
@@ -4207,6 +5209,7 @@ class MainWindow(QMainWindow):
 
     def _start_background_tagging(self):
         self._tagging_queue = list(self.storage.all_external_attachments())
+        self._tagging_changed = False
         self._tag_next_batch()
 
     def _tag_next_batch(self):
@@ -4214,10 +5217,11 @@ class MainWindow(QMainWindow):
         if queue is None:
             return
         if not queue:
+            if getattr(self, '_tagging_changed', False):
+                self._tagging_changed = False
+                self._refresh_external_attachment_views()
             self._setup_tracking_watchers()
             self._tagging_queue = None
-            # 打标完成后启动一次自动扫描，找回所有失踪文件
-            QTimer.singleShot(500, self._start_auto_recovery)
             return
         batch = queue[:5]
         self._tagging_queue = queue[5:]
@@ -4226,7 +5230,8 @@ class MainWindow(QMainWindow):
                 if not att.get('tracking'):
                     self.storage.ensure_tracking(att)
                 else:
-                    self.storage.refresh_tracking_if_changed(att)
+                    if self.storage.refresh_tracking_if_changed(att):
+                        self._tagging_changed = True
             except Exception:
                 pass
         QTimer.singleShot(80, self._tag_next_batch)
@@ -4241,7 +5246,11 @@ class MainWindow(QMainWindow):
                 continue
             p = Path(att.get('original_path', ''))
             if p.exists():
-                dirs.add(str(p.parent))
+                if p.is_dir():
+                    dirs.add(str(p))
+                parent = str(p.parent)
+                if parent:
+                    dirs.add(parent)
                 if p.is_file():
                     files.add(str(p))
         current_dirs = set(self._tracked_watcher.directories())
@@ -4278,7 +5287,8 @@ class MainWindow(QMainWindow):
         self._refresh_pending_dirs = set()
         if not dirs:
             return
-        affected = False
+        affected = False   # 被跟踪文件所在目录有事件（可能只是同目录别的文件在写）
+        changed = False    # 被跟踪文件本身确实变了（移动 / 改名 / atomic save）
         for _note, att in self.storage.all_external_attachments():
             if not att.get('tracking'):
                 continue
@@ -4286,38 +5296,56 @@ class MainWindow(QMainWindow):
             if str(p.parent) in dirs or str(p) in dirs:
                 affected = True
                 try:
-                    self.storage.refresh_tracking_if_changed(att)
+                    if self.storage.refresh_tracking_if_changed(att):
+                        changed = True
                 except Exception:
                     pass
+        # watcher 在 atomic save 后会失效，只要目录有事件就补挂回来（开销小，不重建 UI）
         if affected:
-            # 自动同步：重建当前视图的预览/缩略图，无需用户手动重新搜索
-            try:
-                self._refresh_current_workspace()
-            except Exception:
-                pass
-            # 重新挂监听（atomic save 后 watcher 会失效）
             self._setup_tracking_watchers()
-        # 不管路径比较是否命中，都跑一次 recovery —— 它内部会跳过仍在原位的，
-        # 跨盘剪切（如 D: → F:）唯一靠它兜底
-        try:
-            self._start_auto_recovery()
-        except Exception:
-            pass
+        # 只有被跟踪文件“确实”变化时才重建视图。否则同目录里别的文件频繁写入
+        # （如外部程序刷日志）会让截图板每隔几百毫秒整体重建，导致右键菜单闪退、
+        # 缩略图窗口闪烁以及无谓的 CPU 占用。
+        if changed:
+            self._refresh_external_attachment_views()
+            self.statusBar().showMessage(tr('附件路径信息已刷新'), 2500)
 
     def _poll_missing_attachments(self):
         """周期性兜底：watcher 漏报 / 关 FRESH 之外操作时也能找回。"""
         try:
-            # 先看看有没有失踪的，没的话连 worker 都不启动
+            changed = False
+            missing_folder = False
+            missing_other = False
             for _note, att in self.storage.all_external_attachments():
-                tr = att.get('tracking') or {}
-                if not tr.get('tracking_id'):
+                trk = att.get('tracking') or {}
+                if not trk.get('tracking_id'):
+                    continue
+                old_name = att.get('original_name', '')
+                if self.storage.refresh_tracking_if_changed(att):
+                    changed = True
                     continue
                 if self.storage.attachment_path_matches_tracking(att):
+                    if att.get('original_name', '') != old_name:
+                        changed = True
                     continue
                 p = Path(att.get('original_path', ''))
                 if not p.exists():
-                    self._start_auto_recovery()
-                    return
+                    if att.get('type') == 'folder':
+                        missing_folder = True
+                    else:
+                        missing_other = True
+            if changed:
+                self._refresh_external_attachment_views()
+                if hasattr(self, '_tracked_watcher'):
+                    self._setup_tracking_watchers()
+                self.statusBar().showMessage(tr('附件路径信息已刷新'), 2500)
+            # 文件夹被改名/移动找不到时，在后台静默用 .fresh_folder_id 标记自动找回，
+            # 不弹窗、不阻塞 UI。受 30s 冷却 + 单项 180s 抑制保护，不会反复扫盘。
+            # 这样"改名后需要手动重新扫描"变成"后台自动识别"，与文件的自愈体验一致。
+            if missing_folder:
+                self._start_auto_recovery(reason='auto')
+            elif missing_other:
+                self.statusBar().showMessage(tr('有附件路径失效，可在更多菜单手动查找'), 5000)
         except Exception:
             pass
 
@@ -4367,6 +5395,8 @@ class MainWindow(QMainWindow):
         # 等源路径删除时再用 hash / 类型验证并采纳。
         if event_code in (SHCNE_CREATE, SHCNE_MKDIR) and old_norm:
             self._note_shell_create(old_norm)
+            if self._try_match_clipboard_target_dirs([old_norm, os.path.dirname(old_norm)]):
+                return
             if self._adopt_shell_created_path(old_norm):
                 return
             self._try_match_pending_delete(old_norm)
@@ -4378,9 +5408,228 @@ class MainWindow(QMainWindow):
             self._note_shell_delete(old_norm)
             return
 
+        # 目标文件夹被更新：跨盘剪切时有时只收到目标父目录更新，
+        # 用 pending delete 里的原名拼出新位置。
+        if event_code == SHCNE_UPDATEDIR and old_norm:
+            if self._try_match_clipboard_target_dirs([old_norm]):
+                return
+            if self._try_match_pending_paste_target(old_norm):
+                return
+
         # 文件被原地编辑（atomic save 等）→ 立刻刷新当前视图
         if event_code in (SHCNE_UPDATEITEM, SHCNE_UPDATEDIR) and old_norm:
+            if self._try_match_clipboard_target_dirs([old_norm, os.path.dirname(old_norm)]):
+                return
             self._maybe_refresh_for_path(old_norm)
+
+    def _remember_clipboard_move_candidates(self, mime):
+        try:
+            urls = mime.urls()
+        except Exception:
+            return []
+        effect = clipboard_drop_effect(mime)
+        is_cut = bool(effect & DROPEFFECT_MOVE)
+        tracked_by_norm = {}
+        for _note, att in self.storage.all_external_attachments():
+            if not att.get('tracking'):
+                continue
+            path = att.get('original_path', '')
+            if not path:
+                continue
+            try:
+                norm = os.path.normcase(os.path.normpath(path))
+            except Exception:
+                continue
+            tracked_by_norm[norm] = att
+
+        now = time.time()
+        fresh = [
+            item for item in getattr(self, '_clipboard_move_candidates', [])
+            if now - item.get('ts', 0) <= CLIPBOARD_MOVE_MATCH_WINDOW_SECONDS
+        ]
+        seen = {(item.get('att_id'), item.get('source_norm')) for item in fresh}
+        hit_names = []
+        for url in urls:
+            path = url.toLocalFile()
+            if not path:
+                continue
+            try:
+                norm = os.path.normcase(os.path.normpath(path))
+            except Exception:
+                continue
+            att = tracked_by_norm.get(norm)
+            if not att:
+                continue
+            name = att.get('original_name') or os.path.basename(path)
+            key = (att.get('id'), norm)
+            if key not in seen:
+                fresh.append({
+                    'att_id': att.get('id'),
+                    'source_norm': norm,
+                    'name': name,
+                    'is_cut': is_cut,
+                    'ts': now,
+                })
+                seen.add(key)
+            hit_names.append(name)
+        self._clipboard_move_candidates = fresh[-100:]
+        if hit_names and hasattr(self, '_clipboard_probe_timer'):
+            self._clipboard_probe_timer.start(900)
+        return hit_names
+
+    def _active_clipboard_move_candidates(self):
+        now = time.time()
+        fresh = [
+            item for item in getattr(self, '_clipboard_move_candidates', [])
+            if now - item.get('ts', 0) <= CLIPBOARD_MOVE_MATCH_WINDOW_SECONDS
+        ]
+        self._clipboard_move_candidates = fresh
+        return list(fresh)
+
+    def _candidate_paths_from_target_hint(self, name, hint):
+        if not name or not hint:
+            return []
+        try:
+            p = Path(hint)
+        except Exception:
+            return []
+        target = name.lower()
+        out = []
+        try:
+            if p.name.lower() == target:
+                out.append(p)
+            if p.parent and p.parent.name.lower() == target:
+                out.append(p.parent)
+            if p.exists() and p.is_dir():
+                out.append(p / name)
+        except Exception:
+            pass
+        return out
+
+    def _recent_shell_target_hints(self):
+        hints = []
+        creates = getattr(self, '_recent_shell_creates', None) or []
+        now = time.time()
+        for item in creates:
+            if now - item.get('ts', 0) > SHELL_CREATE_MATCH_WINDOW_SECONDS:
+                continue
+            path = item.get('path', '')
+            if path:
+                hints.append(path)
+                try:
+                    hints.append(str(Path(path).parent))
+                except Exception:
+                    pass
+        return hints
+
+    def _try_match_clipboard_target_dirs(self, target_hints=None):
+        candidates = self._active_clipboard_move_candidates()
+        if not candidates:
+            return False
+        hints = list(target_hints or [])
+        hints.extend(self._recent_shell_target_hints())
+        hints.extend(explorer_open_folders())
+
+        seen_hints = set()
+        unique_hints = []
+        for hint in hints:
+            if not hint:
+                continue
+            try:
+                key = os.path.normcase(os.path.normpath(str(hint)))
+            except Exception:
+                continue
+            if key in seen_hints:
+                continue
+            seen_hints.add(key)
+            unique_hints.append(str(hint))
+
+        adopted = []
+        remaining = []
+        for item in candidates:
+            att_id = item.get('att_id')
+            note, att = self.storage.find_attachment(att_id) if att_id else (None, None)
+            if not att:
+                continue
+            name = item.get('name') or att.get('original_name') or ''
+            source_norm = item.get('source_norm') or ''
+            matched_path = ''
+            for hint in unique_hints:
+                for candidate in self._candidate_paths_from_target_hint(name, hint):
+                    try:
+                        cand_norm = os.path.normcase(os.path.normpath(str(candidate)))
+                    except Exception:
+                        continue
+                    if cand_norm == source_norm or not candidate.exists():
+                        continue
+                    if not item.get('is_cut'):
+                        try:
+                            if self.storage.attachment_path_matches_tracking(att):
+                                continue
+                        except Exception:
+                            pass
+                    if self._clipboard_target_matches(att, item, candidate):
+                        matched_path = str(candidate)
+                        break
+                if matched_path:
+                    break
+            if matched_path:
+                self.storage.adopt_external_path(att, matched_path)
+                adopted.append((att, matched_path, note))
+            else:
+                remaining.append(item)
+
+        self._clipboard_move_candidates = remaining
+        if not adopted:
+            return False
+
+        self._refresh_external_attachment_views()
+        if hasattr(self, '_tracked_watcher'):
+            self._setup_tracking_watchers()
+        shown = adopted[0][1]
+        self.statusBar().showMessage(
+            tr('已按剪切/粘贴位置同步附件：{path}', path=shown),
+            5000,
+        )
+        return True
+
+    def _clipboard_target_matches(self, att, item, candidate):
+        if att.get('type') != 'folder':
+            return self._tracking_identity_matches(att, str(candidate))
+        try:
+            p = Path(candidate)
+        except Exception:
+            return False
+        if not p.exists() or not p.is_dir():
+            return False
+
+        tracking = att.get('tracking') or {}
+        tag = tracking.get('tracking_id')
+        if tag and ftrack.read_tracking_tag(str(p)) == tag:
+            return True
+
+        # 文件夹没有内容 hash。这里仅对“剪贴板记录过这个原始文件夹”的场景放宽：
+        # 目标名已由调用方按 original_name 拼出，且源路径已经失效时，可认为这是剪切目标。
+        source_norm = item.get('source_norm') or ''
+        if not source_norm:
+            return False
+        try:
+            source_exists = Path(source_norm).exists()
+        except Exception:
+            source_exists = False
+        if source_exists:
+            try:
+                if self.storage.attachment_path_matches_tracking(att):
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _probe_clipboard_move_targets(self):
+        if self._try_match_clipboard_target_dirs():
+            return
+        if self._active_clipboard_move_candidates() and hasattr(self, '_clipboard_probe_timer'):
+            self._clipboard_probe_timer.start(1500)
 
     def _tracking_identity_matches(self, att, norm_path):
         """Shell 事件候选是否足够像这个附件。文件优先用 hash，文件夹只做类型兜底。"""
@@ -4402,8 +5651,62 @@ class MainWindow(QMainWindow):
             except Exception:
                 return True
         if att.get('type') == 'folder':
-            return p.is_dir()
+            if not p.is_dir():
+                return False
+            tag = tracking.get('tracking_id')
+            if tag:
+                return ftrack.read_tracking_tag(str(p)) == tag
+            return True
         return False
+
+    def _shell_move_target_matches(self, att, old_norm, candidate_path):
+        if att.get('type') != 'folder':
+            return self._tracking_identity_matches(att, candidate_path)
+        try:
+            p = Path(candidate_path)
+        except Exception:
+            return False
+        if not p.exists() or not p.is_dir():
+            return False
+        tag = (att.get('tracking') or {}).get('tracking_id')
+        if tag and ftrack.read_tracking_tag(str(p)) == tag:
+            return True
+        try:
+            return bool(old_norm) and not Path(old_norm).exists()
+        except Exception:
+            return False
+
+    def _attachment_under_path(self, att, base_norm):
+        """附件是否位于某个目录树下面。"""
+        cur = att.get('original_path', '')
+        if not cur:
+            return False
+        try:
+            cur_norm = os.path.normcase(os.path.normpath(cur))
+        except Exception:
+            return False
+        base_norm = os.path.normcase(os.path.normpath(base_norm))
+        if cur_norm == base_norm:
+            return True
+        prefix = base_norm.rstrip('\\/')
+        return cur_norm.startswith(prefix + os.sep)
+
+    def _path_for_pending_target(self, att, old_norm, new_norm):
+        """根据 Shell 新路径计算附件应采用的位置。
+
+        只采纳附件本身的剪切/移动，避免目录内某个新建文件把文件夹附件
+        错误同步到子文件路径。
+        """
+        cur = att.get('original_path', '')
+        if not cur:
+            return ''
+        try:
+            cur_norm = os.path.normcase(os.path.normpath(cur))
+        except Exception:
+            return ''
+        if cur_norm != old_norm:
+            return ''
+        return new_norm
 
     def _note_shell_create(self, new_norm):
         """记录最近创建的路径，用于处理“先复制到目标盘、后删除源文件”的剪切流程。"""
@@ -4460,10 +5763,7 @@ class MainWindow(QMainWindow):
 
         att = matches[0]
         self.storage.adopt_external_path(att, new_norm)
-        try:
-            self._refresh_current_workspace()
-        except Exception:
-            pass
+        self._refresh_external_attachment_views()
         if hasattr(self, '_tracked_watcher'):
             self._setup_tracking_watchers()
         try:
@@ -4515,7 +5815,10 @@ class MainWindow(QMainWindow):
                 continue
             if item.get('base') != old_base and not tracking.get('content_hash'):
                 continue
-            if self._tracking_identity_matches(att, new_norm):
+            check_path = self._path_for_pending_target(att, old_norm, new_norm)
+            if not check_path:
+                continue
+            if self._shell_move_target_matches(att, old_norm, check_path):
                 candidates.append(new_norm)
         self._recent_shell_creates = fresh
         if len(candidates) == 1:
@@ -4536,10 +5839,7 @@ class MainWindow(QMainWindow):
         if not moved:
             return
         # 即时刷新预览 + 把新父目录挂进 watcher
-        try:
-            self._refresh_current_workspace()
-        except Exception:
-            pass
+        self._refresh_external_attachment_views()
         if hasattr(self, '_tracked_watcher'):
             self._setup_tracking_watchers()
         try:
@@ -4558,7 +5858,7 @@ class MainWindow(QMainWindow):
             self._pending_recovery_timer = QTimer(self)
             self._pending_recovery_timer.setSingleShot(True)
             self._pending_recovery_timer.timeout.connect(self._flush_pending_deletes)
-        # 只关心跟踪过的路径
+        # 只关心跟踪过的附件本身。
         tracked_att = None
         for _note, att in self.storage.all_external_attachments():
             cur = att.get('original_path', '')
@@ -4608,11 +5908,49 @@ class MainWindow(QMainWindow):
             tracking = tracked_att.get('tracking') or {}
             if not base_matches and not tracking.get('content_hash'):
                 continue
-            if not self._tracking_identity_matches(tracked_att, new_norm):
+            check_path = self._path_for_pending_target(tracked_att, old_norm, new_norm)
+            if not check_path:
+                continue
+            if not self._shell_move_target_matches(tracked_att, old_norm, check_path):
                 continue
             pending.pop(old_norm, None)
             self._apply_shell_move(old_norm, new_norm)
             return
+
+    def _try_match_pending_paste_target(self, target_dir_norm):
+        """目标父目录更新时，尝试用目标目录 + 原名补全剪切后的路径。"""
+        pending = getattr(self, '_pending_shell_deletes', None) or {}
+        if not pending:
+            return False
+        try:
+            target_dir = Path(target_dir_norm)
+        except Exception:
+            return False
+        if not target_dir.exists() or not target_dir.is_dir():
+            return False
+
+        import time as _time
+        now = _time.time()
+        for old_norm, state in list(pending.items()):
+            ts = state.get('ts', 0) if isinstance(state, dict) else state
+            if now - ts > SHELL_DELETE_RETRY_WINDOW_SECONDS:
+                pending.pop(old_norm, None)
+                continue
+            candidate = target_dir / os.path.basename(old_norm)
+            if not candidate.exists():
+                continue
+            tracked_att = None
+            for _note, att in self.storage.all_external_attachments():
+                cur = att.get('original_path', '')
+                if cur and os.path.normcase(os.path.normpath(cur)) == old_norm:
+                    tracked_att = att
+                    break
+            if not tracked_att or not self._shell_move_target_matches(tracked_att, old_norm, str(candidate)):
+                continue
+            pending.pop(old_norm, None)
+            self._apply_shell_move(old_norm, str(candidate))
+            return True
+        return False
 
     def _flush_pending_deletes(self):
         """没有等到配对 CREATE 时，重试近期候选并启动 recovery 兜底。"""
@@ -4639,7 +5977,10 @@ class MainWindow(QMainWindow):
             tracked_att = None
             for _note, att in self.storage.all_external_attachments():
                 cur = att.get('original_path', '')
-                if cur and os.path.normcase(os.path.normpath(cur)) == old_norm:
+                if cur and (
+                    os.path.normcase(os.path.normpath(cur)) == old_norm
+                    or self._attachment_under_path(att, old_norm)
+                ):
                     tracked_att = att
                     break
             if not tracked_att:
@@ -4660,14 +6001,17 @@ class MainWindow(QMainWindow):
 
         if should_recover:
             try:
-                self._start_auto_recovery()
+                self.statusBar().showMessage(tr('有附件路径变化，可在更多菜单手动查找'), 5000)
             except Exception:
                 pass
         if keep_waiting:
             self._pending_recovery_timer.start(2500)
 
     def _maybe_refresh_for_path(self, norm_path):
-        """如果某个跟踪附件位于该路径，刷新当前 workspace（缩略图重画）。"""
+        """跟踪附件所在路径有改动时，只有当它“确实”变了（File ID / 名称变化）才
+        重建当前 workspace；否则同目录里别的文件写入也会触发刷新，造成截图板
+        频繁重建（右键菜单闪退 / 缩略图窗口闪烁）。"""
+        changed = False
         for _note, att in self.storage.all_external_attachments():
             cur = att.get('original_path', '')
             if not cur:
@@ -4675,10 +6019,12 @@ class MainWindow(QMainWindow):
             cur_norm = os.path.normcase(os.path.normpath(cur))
             if cur_norm == norm_path or os.path.dirname(cur_norm) == norm_path:
                 try:
-                    self._refresh_current_workspace()
+                    if self.storage.refresh_tracking_if_changed(att):
+                        changed = True
                 except Exception:
                     pass
-                return
+        if changed:
+            self._refresh_external_attachment_views()
 
     # ============ 窗口状态 / 快捷键 ============
 
@@ -4699,8 +6045,8 @@ class MainWindow(QMainWindow):
         if mode == 'text':
             self.workspace_mode = 'text'
             self.workspace_switch.set_mode('text', emit=False)
-            self.new_btn.setText('＋  新建')
-            self.search_input.setPlaceholderText('搜索文字和文件')
+            self.new_btn.setText('+  新建记事')
+            self.search_input.setPlaceholderText('搜索记录')
             self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
             self.current_note_id = None
             self._suppress_auto_select = True
@@ -4718,8 +6064,8 @@ class MainWindow(QMainWindow):
 
         self.workspace_mode = 'screenshot'
         self.workspace_switch.set_mode('screenshot', emit=False)
-        self.new_btn.setText('＋  添加截图')
-        self.search_input.setPlaceholderText('搜索截图')
+        self.new_btn.setText('+  新建记事')
+        self.search_input.setPlaceholderText('搜索记录')
         self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
         self.current_note_id = self.screenshot_board['id']
         self._refresh_screenshot_board()
@@ -4738,7 +6084,7 @@ class MainWindow(QMainWindow):
         return [
             ('new_note',        '新建文字便签',         'Ctrl+N',            self.create_new_note,                None),
             ('capture_region',  '框选截图',             'Ctrl+Shift+N',      self._capture_screenshot_region,     None),
-            ('browse_image',    '选择图片文件',         'Ctrl+Alt+N',        self._browse_screenshot,             None),
+            ('browse_image',    '选择截图图片',         'Ctrl+Alt+N',        self._browse_screenshot,             None),
             ('focus_search',    '聚焦搜索框',           'Ctrl+F',            self._focus_search,                  None),
             ('timeline',        '时间线·归档与完成',    'Ctrl+L',            self._show_timeline,                 None),
             ('recent_deleted',  '最近删除',             'Ctrl+Shift+Delete', self._show_recently_deleted,         None),
@@ -4866,7 +6212,7 @@ class MainWindow(QMainWindow):
         if self.workspace_mode == 'screenshot':
             item = self.list_widget.currentItem()
             att = item.data(Qt.UserRole) if item else None
-            if att:
+            if att and att.get('id'):
                 self._on_attachment_archive_toggled(att['id'])
             return
         if self.current_note_id:
@@ -4890,7 +6236,7 @@ class MainWindow(QMainWindow):
         if self.workspace_mode == 'screenshot':
             item = self.list_widget.currentItem()
             att = item.data(Qt.UserRole) if item else None
-            if att:
+            if att and att.get('id'):
                 self._on_attachment_delete(att['id'])
             return
         if self.current_note_id:
@@ -4945,7 +6291,7 @@ class MainWindow(QMainWindow):
                     elif self.workspace_mode == 'screenshot':
                         att = data if isinstance(data, dict) else None
                         if att and att.get('id'):
-                            self._open_image_viewer(att['id'])
+                            self._open_attachment(att['id'])
                     else:
                         self._focus_body()
                     return True
@@ -4964,21 +6310,12 @@ class MainWindow(QMainWindow):
             return
         if not mime or not mime.hasUrls():
             return
-        # 看剪贴板里的文件有没有命中已追踪
-        tracked_paths = self._tracked_path_set()
-        hit_names = []
-        for url in mime.urls():
-            p = url.toLocalFile()
-            if not p:
-                continue
-            norm = os.path.normcase(os.path.normpath(p))
-            if norm in tracked_paths:
-                hit_names.append(os.path.basename(p))
+        hit_names = self._remember_clipboard_move_candidates(mime)
         if not hit_names:
             return
         names_str = ', '.join(hit_names[:3]) + ('...' if len(hit_names) > 3 else '')
         self.statusBar().showMessage(
-            tr('监听到 {names} 被复制/剪切，3 秒后自动定位新位置...', names=names_str),
+            tr('监听到 {names} 被复制/剪切，正在监测粘贴目标...', names=names_str),
             4000,
         )
         # 2.5s 后查一次（给粘贴留时间），再 8s 后兜底再查一次（用户慢慢操作的情况）
@@ -4986,8 +6323,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(8000, self._on_clipboard_settled)
 
     def _on_clipboard_settled(self):
-        # 跑一次轻量恢复 — 用 Everything 几乎是瞬间
-        self._start_auto_recovery()
+        if self._try_match_clipboard_target_dirs():
+            return
+        self.statusBar().showMessage(tr('还未确认粘贴目标；双击时会继续查找'), 4000)
 
     def _tracked_path_set(self):
         out = set()
@@ -5003,64 +6341,80 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             # 切回 FRESH：30 秒内只触发一次，避免来回切换刷屏
-            import time as _time
-            now = _time.time()
+            now = time.time()
             if now - self._last_focus_recovery > 30:
                 self._last_focus_recovery = now
                 self._focus_trigger_timer.start(400)
 
     def _on_focus_settled(self):
         # 切回 FRESH 时跑：1) 刷新所有路径仍在原位的追踪 (atomic save 检测)
-        #               2) 对失踪的跑一次 Everything 恢复
+        #               2) 对失踪的文件夹在后台静默用标记自动找回（受冷却/抑制保护）
+        changed = False
+        missing_folder = False
         for _note, att in self.storage.all_external_attachments():
             if att.get('tracking'):
                 try:
-                    self.storage.refresh_tracking_if_changed(att)
+                    if self.storage.refresh_tracking_if_changed(att):
+                        changed = True
+                        continue
                 except Exception:
                     pass
-        self._start_auto_recovery()
+            if att.get('type') == 'folder' and (att.get('tracking') or {}).get('tracking_id'):
+                try:
+                    if not self.storage.attachment_path_matches_tracking(att) \
+                            and not Path(att.get('original_path', '')).exists():
+                        missing_folder = True
+                except Exception:
+                    pass
+        self._setup_tracking_watchers()
+        if changed:
+            self._refresh_external_attachment_views()
+            self.statusBar().showMessage(tr('附件路径信息已刷新'), 2500)
+        if missing_folder:
+            self._start_auto_recovery(reason='auto')
 
     def _setup_ui(self):
         central = QWidget()
+        central.setObjectName('app_shell')
         self.setCentralWidget(central)
 
         main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(0)
 
         # 左侧栏
         sidebar = QWidget()
         sidebar.setObjectName('sidebar')
-        sidebar.setFixedWidth(280)
+        sidebar.setFixedWidth(276)
 
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(12, 16, 12, 12)
-        sidebar_layout.setSpacing(10)
+        sidebar_layout.setContentsMargins(18, 18, 18, 18)
+        sidebar_layout.setSpacing(12)
 
         top_row = QHBoxLayout()
-        top_row.setSpacing(6)
-        self.new_btn = QPushButton('＋  添加截图')
+        top_row.setSpacing(8)
+        self.new_btn = QPushButton('+  新建记事')
         self.new_btn.setObjectName('new_button')
         self.new_btn.setCursor(Qt.PointingHandCursor)
         self.new_btn.clicked.connect(self._new_primary_action)
         self.more_btn = QPushButton('⋯')
         self.more_btn.setObjectName('more_button')
         self.more_btn.setCursor(Qt.PointingHandCursor)
-        self.more_btn.setFixedSize(36, 36)
+        self.more_btn.setFixedSize(38, 38)
         self.more_btn.setToolTip('更多')
         self.more_btn.clicked.connect(self._show_more_menu)
         top_row.addWidget(self.new_btn, 1)
         top_row.addWidget(self.more_btn)
 
         self.workspace_switch = ModeSwitch()
-        self.workspace_switch.text_btn.setText('文字文件')
-        self.workspace_switch.shot_btn.setText('全截图')
+        self.workspace_switch.text_btn.setText('文字记事')
+        self.workspace_switch.shot_btn.setText('截图')
         self.workspace_switch.set_mode('screenshot', emit=False)
         self.workspace_switch.changed.connect(self._on_workspace_changed)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName('search_box')
-        self.search_input.setPlaceholderText('搜索截图')
+        self.search_input.setPlaceholderText('搜索记录')
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(lambda _: self._refresh_current_workspace())
         self.search_input.installEventFilter(self)
@@ -5070,8 +6424,12 @@ class MainWindow(QMainWindow):
 
         self.archive_category_filter = QComboBox()
         self.archive_category_filter.setObjectName('timeline_category_filter')
+        self.archive_category_filter.setEditable(True)
+        self.archive_category_filter.setInsertPolicy(QComboBox.NoInsert)
         self.archive_category_filter.addItem('全部分类', '')
+        self.archive_category_filter.lineEdit().setPlaceholderText(tr('搜索分类'))
         self.archive_category_filter.currentIndexChanged.connect(lambda _: self._refresh_current_workspace())
+        self.archive_category_filter.lineEdit().textChanged.connect(lambda _: self._on_archive_category_search_changed())
 
         self.list_widget = QListWidget()
         self.list_widget.setObjectName('note_list')
@@ -5120,15 +6478,19 @@ class MainWindow(QMainWindow):
         self.editor.memo_changed.connect(self._on_attachment_memo_changed)
 
         self.screenshot_grid = ScreenshotGrid()
+        self.screenshot_grid.selected_requested.connect(self._select_attachment_by_id)
         self.screenshot_grid.file_dropped.connect(self._on_file_dropped)
         self.screenshot_grid.image_pasted.connect(self._on_image_pasted)
-        self.screenshot_grid.open_requested.connect(self._open_image_viewer)
+        self.screenshot_grid.child_file_dropped.connect(self._add_child_attachment_to_screenshot)
+        self.screenshot_grid.add_child_requested.connect(self._choose_child_attachment_for_screenshot)
+        self.screenshot_grid.open_requested.connect(self._open_attachment)
         self.screenshot_grid.delete_requested.connect(self._on_attachment_delete)
+        self.screenshot_grid.category_change_requested.connect(self._change_attachment_category)
         self.screenshot_grid.archive_toggled.connect(self._on_attachment_archive_toggled)
         self.screenshot_grid.memo_changed.connect(self._on_attachment_memo_changed)
 
         self.attachment_bar = AttachmentBar()
-        self.attachment_bar.file_dropped.connect(self._on_file_dropped)
+        self.attachment_bar.file_dropped.connect(self._on_attachment_bar_file_dropped)
 
         self.empty_state = EmptyState()
         self.empty_state.primary_action.connect(self._empty_primary_action)
@@ -5152,14 +6514,24 @@ class MainWindow(QMainWindow):
             self._populate_archive_items()
             return
         if self.workspace_mode == 'screenshot':
-            self.search_input.setPlaceholderText('搜索截图')
+            self.search_input.setPlaceholderText('搜索记录')
             self._refresh_screenshot_board()
         else:
-            self.search_input.setPlaceholderText('搜索文字和文件')
+            self.search_input.setPlaceholderText('搜索记录')
             self._populate_list()
             note = self.storage.get_note(self.current_note_id) if self.current_note_id else None
             if note and not note.get('deleted'):
                 self._refresh_attachments_for(note)
+
+    def _safe_refresh_current_workspace(self):
+        try:
+            self._refresh_current_workspace()
+        except Exception:
+            pass
+
+    def _refresh_external_attachment_views(self):
+        self._safe_refresh_current_workspace()
+        QTimer.singleShot(0, self._safe_refresh_current_workspace)
 
     def _on_workspace_changed(self, mode):
         if self.save_timer.isActive():
@@ -5169,23 +6541,23 @@ class MainWindow(QMainWindow):
         self.current_note_id = None
         self.list_widget.clearSelection()
         if self.view_switch.current_view() == 'archived':
-            self.new_btn.setText('＋  添加截图' if mode == 'screenshot' else '＋  新建')
-            self.search_input.setPlaceholderText('搜索归档内容')
+            self.new_btn.setText('+  新建记事')
+            self.search_input.setPlaceholderText('搜索记录')
             self.editor.clear()
             self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
             self.attachment_bar.setVisible(False)
             self._populate_archive_items()
             return
         if mode == 'screenshot':
-            self.new_btn.setText('＋  添加截图')
-            self.search_input.setPlaceholderText('搜索截图')
+            self.new_btn.setText('+  新建记事')
+            self.search_input.setPlaceholderText('搜索记录')
             self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
             self.current_note_id = self.screenshot_board['id']
             self._refresh_screenshot_board()
             return
 
-        self.new_btn.setText('＋  新建')
-        self.search_input.setPlaceholderText('搜索文字和文件')
+        self.new_btn.setText('+  新建记事')
+        self.search_input.setPlaceholderText('搜索记录')
         self.archive_category_filter.setVisible(False)
         self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
         self.editor.clear()
@@ -5199,20 +6571,104 @@ class MainWindow(QMainWindow):
         else:
             self._sync_empty_state()
 
-    def _refresh_archive_category_filter(self):
-        cur = self.archive_category_filter.currentData() or ''
+    def _on_archive_category_search_changed(self):
+        if self._updating_archive_category_filter:
+            return
+        self._refresh_current_workspace()
+
+    def _archive_category_query(self):
+        editor = self.archive_category_filter.lineEdit()
+        text = (editor.text() if editor else self.archive_category_filter.currentText()).strip()
+        if not text or text == tr('全部分类'):
+            return ''
+        return text
+
+    def _archive_item_matches_workspace(self, item):
+        return True
+
+    def _archive_items_for_workspace(self):
+        return [
+            item for item in self.storage.all_timeline_items()
+            if self._archive_item_matches_workspace(item)
+        ]
+
+    def _archive_categories_for_workspace(self):
+        categories = set()
+        for item in self._archive_items_for_workspace():
+            category = self._archive_item_category(item)
+            if category:
+                categories.add(category)
+        return sorted(categories)
+
+    def _archive_item_category(self, item):
+        if not item:
+            return ''
+        note = item.get('note') or {}
+        if item.get('kind') == 'note':
+            return (note.get('archive_category') or note.get('category') or '').strip()
+        att = item.get('attachment') or {}
+        return (att.get('archive_category') or att.get('category') or '').strip()
+
+    def _archive_category_matches(self, category, query):
+        query = (query or '').strip()
+        if not query:
+            return True
+        category = (category or tr('未分类')).strip() or tr('未分类')
+        return query.casefold() in category.casefold()
+
+    def _archive_exact_category(self, query=None):
+        query = self._archive_category_query() if query is None else (query or '').strip()
+        if not query:
+            return ''
+        for category in self._archive_categories_for_workspace():
+            if category == query:
+                return category
+        return ''
+
+    def _clear_archive_category_filter_text(self):
+        if not self._archive_category_query() and self.archive_category_filter.currentIndex() == 0:
+            return False
+        self._updating_archive_category_filter = True
         self.archive_category_filter.blockSignals(True)
-        self.archive_category_filter.clear()
-        self.archive_category_filter.addItem('全部分类', '')
-        for category in self.storage.all_categories():
-            self.archive_category_filter.addItem(category, category)
-        idx = 0
-        for i in range(self.archive_category_filter.count()):
-            if self.archive_category_filter.itemData(i) == cur:
-                idx = i
-                break
-        self.archive_category_filter.setCurrentIndex(idx)
+        editor = self.archive_category_filter.lineEdit()
+        if editor:
+            editor.blockSignals(True)
+        self.archive_category_filter.setCurrentIndex(0)
+        if editor:
+            editor.clear()
+            editor.blockSignals(False)
         self.archive_category_filter.blockSignals(False)
+        self._updating_archive_category_filter = False
+        return True
+
+    def _refresh_archive_category_filter(self):
+        query = self._archive_category_query()
+        visible_categories = [
+            category for category in self._archive_categories_for_workspace()
+            if self._archive_category_matches(category, query)
+        ]
+        exact_index = 0 if not query else -1
+        self._updating_archive_category_filter = True
+        self.archive_category_filter.blockSignals(True)
+        editor = self.archive_category_filter.lineEdit()
+        if editor:
+            editor.blockSignals(True)
+        self.archive_category_filter.clear()
+        self.archive_category_filter.addItem(tr('全部分类'), '')
+        for category in visible_categories:
+            self.archive_category_filter.addItem(category, category)
+        if query:
+            for i in range(self.archive_category_filter.count()):
+                if self.archive_category_filter.itemData(i) == query:
+                    exact_index = i
+                    break
+        self.archive_category_filter.setCurrentIndex(exact_index)
+        if editor:
+            editor.setText(query)
+            editor.setCursorPosition(len(query))
+            editor.blockSignals(False)
+        self.archive_category_filter.blockSignals(False)
+        self._updating_archive_category_filter = False
 
     def _refresh_screenshot_board(self, preferred_attachment_id=None):
         if not hasattr(self, 'screenshot_grid'):
@@ -5221,7 +6677,7 @@ class MainWindow(QMainWindow):
             key = f'attachment:{preferred_attachment_id}' if preferred_attachment_id else ''
             self._populate_archive_items(selected_key=key)
             return
-        self.search_input.setPlaceholderText('搜索截图')
+        self.search_input.setPlaceholderText('搜索记录')
         self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
         selected_id = preferred_attachment_id
         if not selected_id:
@@ -5231,9 +6687,15 @@ class MainWindow(QMainWindow):
         view = self.view_switch.current_view()
         self._refresh_archive_category_filter()
         self.archive_category_filter.setVisible(view == 'archived')
-        category = self.archive_category_filter.currentData() or '' if view == 'archived' else ''
+        category = self._archive_exact_category() if view == 'archived' else ''
         search = self.search_input.text().strip()
         items = self.storage.screenshot_items(view=view, category=category, search=search)
+        if view == 'archived' and self._archive_category_query() and not category:
+            category_query = self._archive_category_query()
+            items = [
+                att for att in items
+                if self._archive_category_matches(att.get('archive_category') or att.get('category') or '', category_query)
+            ]
         active_count, archived_count = self.storage.screenshot_counts()
         self.view_switch.set_counts(active_count, self._archive_total_count())
 
@@ -5241,7 +6703,7 @@ class MainWindow(QMainWindow):
         self.list_widget.clear()
         for att in items:
             item = QListWidgetItem()
-            item.setText(att.get('archive_content') or att.get('memo') or att.get('original_name') or '截图')
+            item.setText(attachment_display_title(att))
             item.setData(Qt.UserRole, att)
             self.list_widget.addItem(item)
         self.list_widget.blockSignals(False)
@@ -5250,19 +6712,57 @@ class MainWindow(QMainWindow):
         elif self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
 
-        self.screenshot_grid.set_attachments(items, self.storage.path_for)
+        selected_id = ''
+        item = self.list_widget.currentItem()
+        current_att = item.data(Qt.UserRole) if item else None
+        if current_att and current_att.get('id'):
+            selected_id = current_att.get('id')
+        self.screenshot_grid.set_attachments(items, self.storage.path_for, selected_id=selected_id)
         self.right_stack.setCurrentWidget(self.screenshot_grid)
-        self.attachment_bar.setVisible(False)
         self.current_note_id = self.screenshot_board['id']
+        self._refresh_screenshot_child_attachments()
+
+    def _current_screenshot_attachment(self):
+        if self.workspace_mode != 'screenshot' or self.view_switch.current_view() == 'archived':
+            return None
+        item = self.list_widget.currentItem()
+        data = item.data(Qt.UserRole) if item else None
+        if data and is_image_attachment(data):
+            return data
+        return None
+
+    def _current_screenshot_attachment_id(self):
+        att = self._current_screenshot_attachment()
+        return att.get('id') if att else ''
+
+    def _refresh_screenshot_child_attachments(self):
+        if self.workspace_mode != 'screenshot' or self.view_switch.current_view() == 'archived':
+            return
+        # 把“当前选中的那张截图”的子附件显示到底部附件栏（与文字模式同一个栏、
+        # 同样位置）。换一张截图就显示那张截图的附件；没选中截图则隐藏。
+        parent = self._current_screenshot_attachment()
+        children = [
+            c for c in ((parent.get('attachments') if parent else []) or [])
+            if not c.get('deleted')
+        ]
+        self.attachment_bar.set_attachments(
+            children,
+            self.storage.path_for,
+            self._on_attachment_delete,
+            recover_resolver=self._resolve_attachment_path,
+            on_category_change=self._change_attachment_category,
+        )
+        # 选中截图时即显示附件栏（即使为空，方便直接拖入 / 点 + 添加）。
+        self.attachment_bar.setVisible(parent is not None)
 
     def _active_note_count(self):
         return sum(
             1 for note in self.storage.notes
-            if not note.get('system') and not note.get('deleted') and not note.get('archived')
+            if not note_belongs_to_screenshot_workspace(note) and not note.get('deleted') and not note.get('archived')
         )
 
     def _archive_total_count(self):
-        return len(self.storage.all_timeline_items())
+        return len(self._archive_items_for_workspace())
 
     def _populate_archive_items(self, selected_key=''):
         if not hasattr(self, 'list_widget'):
@@ -5274,11 +6774,16 @@ class MainWindow(QMainWindow):
         self.list_widget.setItemDelegate(ArchiveListDelegate(self.list_widget))
         self._refresh_archive_category_filter()
         self.archive_category_filter.setVisible(True)
-        self.search_input.setPlaceholderText('搜索归档内容')
+        self.search_input.setPlaceholderText('搜索记录')
 
-        category = self.archive_category_filter.currentData() or ''
+        category_query = self._archive_category_query()
         search = self.search_input.text().strip().lower()
-        items = self.storage.all_timeline_items(category=category)
+        items = self._archive_items_for_workspace()
+        if category_query:
+            items = [
+                item for item in items
+                if self._archive_category_matches(self._archive_item_category(item), category_query)
+            ]
         if search:
             items = [item for item in items if search in archive_item_search_text(item)]
 
@@ -5287,10 +6792,20 @@ class MainWindow(QMainWindow):
 
         image_attachments = [
             item.get('attachment') for item in items
-            if item.get('kind') == 'attachment' and is_image_attachment(item.get('attachment') or {})
+            if item.get('kind') == 'attachment'
         ]
         image_attachments = [att for att in image_attachments if att]
-        self.screenshot_grid.set_attachments(image_attachments, self.storage.path_for)
+        selected_image_id = ''
+        selected_item = self.list_widget.currentItem()
+        if selected_item:
+            selected_data = selected_item.data(Qt.UserRole) or {}
+            if selected_data.get('kind') == 'attachment':
+                selected_image_id = (selected_data.get('attachment') or {}).get('id', '')
+        self.screenshot_grid.set_attachments(
+            image_attachments,
+            self.storage.path_for,
+            selected_id=selected_image_id,
+        )
 
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
@@ -5324,7 +6839,7 @@ class MainWindow(QMainWindow):
         if self.view_switch.current_view() == 'archived':
             self._populate_archive_items()
             return
-        self.search_input.setPlaceholderText('搜索文字和文件')
+        self.search_input.setPlaceholderText('搜索记录')
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
@@ -5332,11 +6847,12 @@ class MainWindow(QMainWindow):
         view = self.view_switch.current_view()
         self._refresh_archive_category_filter()
         self.archive_category_filter.setVisible(view == 'archived')
-        category = self.archive_category_filter.currentData() or '' if view == 'archived' else ''
+        category = self._archive_exact_category() if view == 'archived' else ''
+        category_query = self._archive_category_query() if view == 'archived' else ''
         active_count = 0
         archived_count = 0
         for note in self.storage.notes:
-            if note.get('system'):
+            if note_belongs_to_screenshot_workspace(note):
                 continue
             if note.get('deleted'):
                 continue
@@ -5351,6 +6867,10 @@ class MainWindow(QMainWindow):
                 continue
             if category and (note.get('archive_category') or note.get('category') or '') != category:
                 continue
+            if category_query and not category:
+                note_category = note.get('archive_category') or note.get('category') or ''
+                if not self._archive_category_matches(note_category, category_query):
+                    continue
             if search:
                 if search not in note_search_text(note):
                     continue
@@ -5380,7 +6900,7 @@ class MainWindow(QMainWindow):
         has_search = bool((self.search_input.text() or '').strip())
         has_category = (
             self.view_switch.current_view() == 'archived'
-            and bool(self.archive_category_filter.currentData() or '')
+            and bool(self._archive_category_query())
         )
         return has_search or has_category
 
@@ -5389,8 +6909,9 @@ class MainWindow(QMainWindow):
             return
         if self.view_switch.current_view() != 'archived' and self.workspace_mode == 'screenshot':
             self.right_stack.setCurrentWidget(self.screenshot_grid)
-            self.attachment_bar.setVisible(False)
             self.current_note_id = self.screenshot_board['id']
+            # 附件栏跟随当前选中的截图（选中则显示其附件，未选中则隐藏）。
+            self._refresh_screenshot_child_attachments()
             return
         current_note = self.storage.get_note(self.current_note_id) if self.current_note_id else None
         has_current = bool(current_note and not current_note.get('deleted'))
@@ -5399,7 +6920,7 @@ class MainWindow(QMainWindow):
             return
 
         filtered = self._has_active_filters()
-        category = self.archive_category_filter.currentData() or '' if self.view_switch.current_view() == 'archived' else ''
+        category = self._archive_category_query() if self.view_switch.current_view() == 'archived' else ''
         self.empty_state.configure(
             view=self.view_switch.current_view(),
             filtered=filtered,
@@ -5417,10 +6938,7 @@ class MainWindow(QMainWindow):
             self.search_input.clear()
             self.search_input.blockSignals(False)
             changed = True
-        if self.archive_category_filter.currentIndex() > 0:
-            self.archive_category_filter.blockSignals(True)
-            self.archive_category_filter.setCurrentIndex(0)
-            self.archive_category_filter.blockSignals(False)
+        if self._clear_archive_category_filter_text():
             changed = True
         if changed:
             self._refresh_current_workspace()
@@ -5459,14 +6977,19 @@ class MainWindow(QMainWindow):
         return False
 
     def _select_attachment_by_id(self, attachment_id):
+        found = False
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             data = item.data(Qt.UserRole)
             att = data.get('attachment') if isinstance(data, dict) and data.get('kind') == 'attachment' else data
             if att and att.get('id') == attachment_id:
-                self.list_widget.setCurrentItem(item)
-                return True
-        return False
+                if self.list_widget.currentItem() is not item:
+                    self.list_widget.setCurrentItem(item)
+                found = True
+                break
+        if hasattr(self, 'screenshot_grid'):
+            self.screenshot_grid.set_selected_attachment(attachment_id if found else '')
+        return found
 
     def _select_archive_item_by_key(self, key):
         if not key:
@@ -5484,8 +7007,7 @@ class MainWindow(QMainWindow):
             data = self.list_widget.item(i).data(Qt.UserRole)
             if data and data.get('kind') == 'attachment':
                 att = data.get('attachment') or {}
-                if is_image_attachment(att):
-                    attachments.append(att)
+                attachments.append(att)
         return attachments
 
     def _load_note_by_id(self, note_id):
@@ -5505,7 +7027,7 @@ class MainWindow(QMainWindow):
         if data.get('kind') == 'attachment':
             att = data.get('attachment') or {}
             if att.get('id'):
-                self._open_image_viewer(att['id'])
+                self._open_attachment(att['id'])
             return
         note = data.get('note') or {}
         if note.get('id'):
@@ -5521,7 +7043,7 @@ class MainWindow(QMainWindow):
         if self.workspace_mode == 'screenshot':
             att = data if isinstance(data, dict) else None
             if att and att.get('id'):
-                self._open_image_viewer(att['id'])
+                self._open_attachment(att['id'])
             return
         self._focus_body()
 
@@ -5540,7 +7062,11 @@ class MainWindow(QMainWindow):
                     self.save_timer.stop()
                     self._save_current_now(refresh_list=False)
                 self.current_note_id = None
-                self.screenshot_grid.set_attachments(self._archive_image_attachments_from_list(), self.storage.path_for)
+                self.screenshot_grid.set_attachments(
+                    self._archive_image_attachments_from_list(),
+                    self.storage.path_for,
+                    selected_id=(data.get('attachment') or {}).get('id', ''),
+                )
                 self.right_stack.setCurrentWidget(self.screenshot_grid)
                 self.attachment_bar.setVisible(False)
                 return
@@ -5560,6 +7086,11 @@ class MainWindow(QMainWindow):
             return
 
         if self.workspace_mode == 'screenshot':
+            self._refresh_screenshot_child_attachments()
+            item = self.list_widget.currentItem()
+            data = item.data(Qt.UserRole) if item else None
+            att = data.get('attachment') if isinstance(data, dict) and data.get('kind') == 'attachment' else data
+            self.screenshot_grid.set_selected_attachment(att.get('id') if att else '')
             return
         items = self.list_widget.selectedItems()
         if not items:
@@ -5620,35 +7151,53 @@ class MainWindow(QMainWindow):
         if data.get('kind') == 'attachment':
             note = data.get('note') or {}
             att = data.get('attachment') or {}
-            view = menu.addAction('查看大图')
+            view = menu.addAction('查看大图' if is_image_attachment(att) else '打开')
             open_note = menu.addAction('打开所属备忘录')
-            unarchive = menu.addAction('取消归档照片')
+            change_category = menu.addAction(tr('修改分类'))
+            unarchive = menu.addAction('取消归档')
             menu.addSeparator()
-            delete = menu.addAction(tr('删除截图'))
+            delete = menu.addAction(tr('删除附件'))
             action = menu.exec(global_pos)
             if action == view:
-                self._open_image_viewer(att.get('id'))
+                self._open_attachment(att.get('id'))
             elif action == open_note:
                 self._load_note_by_id(note.get('id'))
+            elif action == change_category:
+                self._change_archive_attachment_category(note.get('id'), att.get('id'))
             elif action == unarchive:
                 self.storage.update_attachment(note.get('id'), att.get('id'), archived=False, archived_at='')
                 self._refresh_current_workspace()
             elif action == delete:
-                self._on_attachment_delete(att.get('id'))
+                self._delete_archived_attachment(att.get('id'))
             return
 
         note = data.get('note') or {}
         open_note = menu.addAction('打开备忘录')
+        change_category = menu.addAction(tr('修改分类'))
         unarchive = menu.addAction('取消归档')
         menu.addSeparator()
         delete = menu.addAction('删除')
         action = menu.exec(global_pos)
         if action == open_note:
             self._load_note_by_id(note.get('id'))
+        elif action == change_category:
+            self._change_archive_note_category(note.get('id'))
         elif action == unarchive:
             self._toggle_archive(note.get('id'))
         elif action == delete:
             self._delete_note(note.get('id'))
+
+    def _delete_archived_attachment(self, attachment_id):
+        if not attachment_id:
+            return False
+        note, att = self.storage.find_attachment(attachment_id)
+        if not note or note.get('deleted') or not att or att.get('deleted'):
+            return False
+        if not self.storage.remove_attachment(note.get('id'), attachment_id):
+            return False
+        self._populate_archive_items(selected_key=f'attachment:{attachment_id}')
+        self.statusBar().showMessage(tr('附件已移到最近删除'), 4000)
+        return True
 
     def _update_item_for_note(self, note):
         for i in range(self.list_widget.count()):
@@ -5664,9 +7213,25 @@ class MainWindow(QMainWindow):
     # ---- 操作 ----
     def _new_primary_action(self):
         if self.workspace_mode == 'screenshot':
-            self._capture_screenshot_region()
+            self._show_screenshot_add_menu()
         else:
             self.create_new_note()
+
+    def _show_screenshot_add_menu(self):
+        menu = QMenu(self)
+        capture_action = menu.addAction('框选截图')
+        image_action = menu.addAction('选择截图图片...')
+        file_action = menu.addAction('给当前截图添加文件...')
+        folder_action = menu.addAction('给当前截图添加文件夹...')
+        action = menu.exec(self.new_btn.mapToGlobal(self.new_btn.rect().bottomLeft()))
+        if action == capture_action:
+            self._capture_screenshot_region()
+        elif action == image_action:
+            self._browse_screenshot()
+        elif action == file_action:
+            self._add_file_to_current_screenshot()
+        elif action == folder_action:
+            self._add_folder_to_current_screenshot()
 
     def _prepare_screenshot_workspace(self, clear_filters=False):
         if self.workspace_mode != 'screenshot' and self.save_timer.isActive():
@@ -5675,8 +7240,8 @@ class MainWindow(QMainWindow):
         if self.workspace_mode != 'screenshot':
             self.workspace_mode = 'screenshot'
             self.workspace_switch.set_mode('screenshot', emit=False)
-            self.new_btn.setText('＋  添加截图')
-            self.search_input.setPlaceholderText('搜索截图')
+            self.new_btn.setText('+  新建记事')
+            self.search_input.setPlaceholderText('搜索记录')
             self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
             self.current_note_id = self.screenshot_board['id']
         if clear_filters:
@@ -5686,10 +7251,7 @@ class MainWindow(QMainWindow):
                 self.search_input.blockSignals(True)
                 self.search_input.clear()
                 self.search_input.blockSignals(False)
-            if self.archive_category_filter.currentIndex() > 0:
-                self.archive_category_filter.blockSignals(True)
-                self.archive_category_filter.setCurrentIndex(0)
-                self.archive_category_filter.blockSignals(False)
+            self._clear_archive_category_filter_text()
         self.archive_category_filter.setVisible(self.view_switch.current_view() == 'archived')
         self.current_note_id = self.screenshot_board['id']
         self._refresh_screenshot_board()
@@ -5744,10 +7306,13 @@ class MainWindow(QMainWindow):
             '图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.ico);;所有文件 (*.*)'
         )
         for file_path in files:
-            self._add_attachment_to_current(file_path, copy=False)
+            self._add_screenshot_from_path(file_path, copy=False)
+
+    def _browse_screenshot_folder(self):
+        self._add_folder_to_current_screenshot()
 
     def _quick_new_text_note(self):
-        self._show_window_from_tray()
+        self._show_window_from_tray(force=True)
         self.create_new_note()
 
     def _quick_capture_region(self):
@@ -5786,13 +7351,13 @@ class MainWindow(QMainWindow):
 
     def _show_screenshot_menu(self, attachment, global_pos):
         menu = QMenu(self)
-        view = menu.addAction('查看大图')
-        archive = menu.addAction('取消归档照片' if attachment.get('archived') else '归档照片')
+        view = menu.addAction('查看大图' if is_image_attachment(attachment) else '打开')
+        archive = menu.addAction('取消归档' if attachment.get('archived') else '归档')
         menu.addSeparator()
-        delete = menu.addAction(tr('删除截图'))
+        delete = menu.addAction(tr('删除附件'))
         action = menu.exec(global_pos)
         if action == view:
-            self._open_image_viewer(attachment['id'])
+            self._open_attachment(attachment['id'])
         elif action == archive:
             self._on_attachment_archive_toggled(attachment['id'])
         elif action == delete:
@@ -5802,8 +7367,8 @@ class MainWindow(QMainWindow):
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
         self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
-        self.new_btn.setText('＋  新建')
-        self.search_input.setPlaceholderText('搜索文字和文件')
+        self.new_btn.setText('+  新建记事')
+        self.search_input.setPlaceholderText('搜索记录')
         self.archive_category_filter.setVisible(False)
         if self.view_switch.current_view() != 'active':
             self.view_switch.set_view('active', emit=False)
@@ -5841,41 +7406,72 @@ class MainWindow(QMainWindow):
             self.attachment_bar.setVisible(False)
 
         self._populate_list()
-        self._select_first_or_create()
+        self._select_first_or_empty()
         self._sync_empty_state()
         self.statusBar().showMessage(tr('已移到最近删除'), 4000)
 
-    def _choose_archive_category(self, current=''):
-        current = (current or '').strip()
-        categories = self.storage.all_categories()
-        if current and current not in categories:
-            categories.append(current)
-            categories.sort()
-        if categories:
-            index = categories.index(current) if current in categories else 0
-            category, ok = QInputDialog.getItem(
-                self,
-                '归档分类',
-                '选择或输入分类:',
-                categories,
-                index,
-                True,
-            )
-        else:
-            category, ok = QInputDialog.getText(
-                self,
-                '归档分类',
-                '输入分类:',
-                QLineEdit.Normal,
-                current,
-            )
-        if not ok:
-            return None
+    def _choose_archive_category(self, current='', required=True):
+        return choose_archive_category(self, self.storage, current, required=required)
+
+    def _archive_category_status(self, category):
         category = (category or '').strip()
-        if not category:
-            QMessageBox.information(self, '需要分类', '请填写归档分类。')
-            return None
-        return category
+        if category:
+            return tr('已修改分类为“{category}”', category=category)
+        return tr('已清除分类')
+
+    def _attachment_category_status(self, category):
+        category = (category or '').strip()
+        if category:
+            return tr('已修改附件分类为“{category}”', category=category)
+        return tr('已清除附件分类')
+
+    def _change_attachment_category(self, attachment_id):
+        note, att = self.storage.find_attachment(attachment_id)
+        if not note or note.get('deleted') or not att or att.get('deleted'):
+            return
+        category = choose_attachment_category(
+            self, self.storage, att.get('archive_category') or att.get('category') or ''
+        )
+        if category is None:
+            return
+        self.storage.update_attachment(note.get('id'), attachment_id, category=category, archive_category=category)
+        self._refresh_current_workspace()
+        self.statusBar().showMessage(self._attachment_category_status(category), 3000)
+
+    def _change_archive_attachment_category(self, note_id, attachment_id):
+        note, att = self.storage.find_attachment(attachment_id)
+        if not note or note.get('deleted') or not att or att.get('deleted'):
+            return
+        category = self._choose_archive_category(
+            att.get('archive_category') or att.get('category') or '',
+            required=False,
+        )
+        if category is None:
+            return
+        self.storage.update_attachment(note.get('id'), attachment_id, category=category, archive_category=category)
+        self._refresh_editor_categories()
+        self._refresh_current_workspace()
+        self.statusBar().showMessage(self._archive_category_status(category), 3000)
+
+    def _change_archive_note_category(self, note_id):
+        note = self.storage.get_note(note_id)
+        if not note or note.get('deleted'):
+            return
+        category = self._choose_archive_category(
+            note.get('archive_category') or note.get('category') or '',
+            required=True,
+        )
+        if category is None:
+            return
+        self.storage.update_note(note_id, archive_category=category)
+        if note_id == self.current_note_id:
+            refreshed = self.storage.get_note(note_id)
+            if refreshed:
+                self.editor.load_note(refreshed)
+                self._refresh_attachments_for(refreshed)
+        self._refresh_editor_categories()
+        self._refresh_current_workspace()
+        self.statusBar().showMessage(self._archive_category_status(category), 3000)
 
     def _toggle_archive(self, note_id):
         target = None
@@ -5943,15 +7539,13 @@ class MainWindow(QMainWindow):
         self._sync_empty_state()
         # 归档视图为空就保持空白(不自动建新note)
 
-    def _select_first_or_create(self):
+    def _select_first_or_empty(self):
         if self.list_widget.count() > 0:
             first = self.list_widget.item(0).data(Qt.UserRole)
             if isinstance(first, dict) and first.get('kind'):
                 self._select_archive_item_by_key(archive_item_key(first))
             elif first and first.get('id'):
                 self._select_note_by_id(first['id'])
-        elif self.view_switch.current_view() == 'active':
-            self.create_new_note()
         else:
             self._sync_empty_state()
 
@@ -6011,6 +7605,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'editor'):
             self.editor.set_categories(self.storage.all_categories())
 
+    def _attachment_archive_categories(self):
+        return sorted(
+            set(self.storage.all_categories())
+            | set(attachment_category_candidates(self.storage))
+        )
+
     def _refresh_attachments_for(self, note):
         attachments = [
             att for att in (note.get('attachments', []) or [])
@@ -6022,6 +7622,7 @@ class MainWindow(QMainWindow):
             self.storage.path_for,
             self._on_attachment_delete,
             recover_resolver=self._resolve_attachment_path,
+            on_category_change=self._change_attachment_category,
         )
         self.editor.update_screenshot_grid(attachments, self.storage.path_for)
         self.attachment_bar.setVisible(mode != 'screenshot' and bool(attachments))
@@ -6040,12 +7641,12 @@ class MainWindow(QMainWindow):
             return None
         if scanned_path:
             self.storage.adopt_external_path(attachment, scanned_path)
-            QTimer.singleShot(0, self._refresh_current_workspace)
+            self._refresh_external_attachment_views()
             return scanned_path
         new_path, changed = self.storage.resolve_external_path(attachment, scan=False)
         if new_path and Path(new_path).exists():
             if changed:
-                QTimer.singleShot(0, self._refresh_current_workspace)
+                self._refresh_external_attachment_views()
             return str(new_path)
         return None
 
@@ -6079,6 +7680,18 @@ class MainWindow(QMainWindow):
         if not tracking:
             QMessageBox.information(self, '无法查找', '该附件加入时未生成追踪标记，无法定位。')
             return
+        if attachment.get('type') == 'folder':
+            new_path, changed = self.storage.resolve_external_path(attachment, scan=False)
+            if new_path and Path(new_path).exists():
+                if changed:
+                    self._refresh_external_attachment_views()
+                    if hasattr(self, '_tracked_watcher'):
+                        self._setup_tracking_watchers()
+                self.statusBar().showMessage(
+                    tr('已同步文件夹位置：{path}', path=str(new_path)),
+                    4000,
+                )
+                return
         att_id = attachment['id']
         for s in self._targeted_scans:
             if s['att_id'] == att_id:
@@ -6087,11 +7700,13 @@ class MainWindow(QMainWindow):
                 return
 
         name = attachment.get('original_name', '')
+        scan_name = '' if attachment.get('type') == 'folder' and tracking.get('tracking_id') else name
         size_hint = tracking.get('size_snapshot') or attachment.get('size')
 
         worker = FtrackScanWorker(
-            tracking, name_fallback=name,
+            tracking, name_fallback=scan_name,
             scan_settings=self.storage.scan_settings,
+            is_folder=(attachment.get('type') == 'folder'),
             parent=self,
         )
         dlg = make_scan_dialog(self, name)
@@ -6146,50 +7761,63 @@ class MainWindow(QMainWindow):
             self._refresh_attachments_for(note)
         QMessageBox.information(self, '已找到', f'文件当前位置:\n{found}')
 
-    def _start_auto_recovery(self):
+    def _start_auto_recovery(self, reason='auto', force=False):
         """启动后扫一遍所有失踪的 tracked 附件，找回所有的。"""
         self._ensure_scan_state()
         if self._auto_recovery_worker and self._auto_recovery_worker.isRunning():
             return
+        now = time.time()
+        if not force and now - getattr(self, '_last_auto_recovery_start', 0.0) < AUTO_RECOVERY_COOLDOWN_SECONDS:
+            return
         tag_to_name = {}
         tag_to_att = {}
         tag_to_tracking = {}
+        tag_to_is_folder = {}
         drive_hints = []
         changed_without_worker = False
         for _note, att in self.storage.all_external_attachments():
-            tr = att.get('tracking') or {}
-            tag = tr.get('tracking_id')
+            trk = att.get('tracking') or {}
+            tag = trk.get('tracking_id')
             if not tag:
                 continue
             old_name = att.get('original_name', '')
             if self.storage.attachment_path_matches_tracking(att):
                 if att.get('original_name', '') != old_name:
                     changed_without_worker = True
+                att.pop('recovery_failed_at', None)
+                continue
+            original = Path(att.get('original_path', ''))
+            if original.exists():
+                continue
+            failed_at = float(att.get('recovery_failed_at') or 0.0)
+            if not force and failed_at and now - failed_at < AUTO_RECOVERY_COOLDOWN_SECONDS * 6:
                 continue
             new_path, changed = self.storage.resolve_external_path(att, scan=False)
             if new_path and Path(new_path).exists():
-                if changed:
-                    changed_without_worker = True
-                continue
+                if self.storage.attachment_path_matches_tracking(att):
+                    if changed:
+                        changed_without_worker = True
+                    att.pop('recovery_failed_at', None)
+                    continue
             tag_to_name[tag] = att.get('original_name', '')
             tag_to_att[tag] = att['id']
-            tag_to_tracking[tag] = tr
-            hint = tr.get('drive_hint')
+            tag_to_tracking[tag] = trk
+            tag_to_is_folder[tag] = (att.get('type') == 'folder')
+            hint = trk.get('drive_hint')
             if hint and hint not in drive_hints:
                 drive_hints.append(hint)
         if not tag_to_name:
             if changed_without_worker:
-                try:
-                    self._refresh_current_workspace()
-                except Exception:
-                    pass
+                self._refresh_external_attachment_views()
                 if hasattr(self, '_tracked_watcher'):
                     self._setup_tracking_watchers()
             return
 
+        self._last_auto_recovery_start = now
         worker = AutoRecoveryWorker(
             tag_to_name, tag_to_tracking=tag_to_tracking, drive_hints=drive_hints,
-            scan_settings=self.storage.scan_settings, parent=self,
+            scan_settings=self.storage.scan_settings, tag_to_is_folder=tag_to_is_folder,
+            parent=self,
         )
         self._auto_recovery_total = len(tag_to_name)
         using_everything = bool(ftrack.everything_mode(self.storage.scan_settings.get('es_path'))) \
@@ -6212,8 +7840,23 @@ class MainWindow(QMainWindow):
 
         def on_done(dirs_scanned):
             count = len(getattr(self, '_auto_recovered_tags', set()))
+            recovered_tags = set(getattr(self, '_auto_recovered_tags', set()))
             self._auto_recovery_worker = None
             self._auto_recovered_tags = set()
+            for tag, att_id in tag_to_att.items():
+                if tag in recovered_tags:
+                    continue
+                note, att = self.storage.find_attachment(att_id)
+                if not att:
+                    continue
+                att['recovery_failed_at'] = time.time()
+                if note:
+                    note['updated_at'] = datetime.now().isoformat()
+            if tag_to_att:
+                try:
+                    self.storage.save()
+                except Exception:
+                    pass
             if count > 0:
                 self.statusBar().showMessage(tr('已自动找回 {count} 个移动过的文件', count=count), 6000)
             else:
@@ -6242,8 +7885,9 @@ class MainWindow(QMainWindow):
         if not att:
             return
         self.storage.adopt_external_path(att, path)
+        att.pop('recovery_failed_at', None)
         if note and note.get('id') == self.current_note_id:
-            self._refresh_attachments_for(note)
+            self._refresh_external_attachment_views()
         else:
             # 即使当前没看着这条笔记，也把新位置的父目录挂上监听，
             # 下次它再被移走也能立即触发自动同步
@@ -6268,11 +7912,36 @@ class MainWindow(QMainWindow):
             return
         if not att or att.get('deleted'):
             return
+        if self.workspace_mode == 'screenshot' and not is_image_attachment(att):
+            archive_content = att.get('memo', '') or ''
+            archive_category = att.get('archive_category') or att.get('category') or ''
+            new_state = not bool(att.get('archived', False))
+            if new_state:
+                dlg = ArchivePhotoDialog(att, self.storage.path_for(att), self._attachment_archive_categories(), self)
+                if dlg.exec() != QDialog.Accepted:
+                    return
+                archive_content = dlg.content()
+                archive_category = dlg.category()
+            updates = {
+                'archived': new_state,
+                'archived_at': datetime.now().isoformat() if new_state else '',
+            }
+            if new_state:
+                updates.update(
+                    archive_content=archive_content,
+                    archive_category=archive_category,
+                    category=archive_category,
+                    memo=archive_content,
+                )
+            self.storage.update_attachment(note['id'], attachment_id, **updates)
+            parent_id = self.storage.parent_attachment_id(attachment_id)
+            self._refresh_screenshot_board(preferred_attachment_id=parent_id or self._current_screenshot_attachment_id())
+            return
         new_state = not bool(att.get('archived', False))
         archive_content = att.get('memo', '') or ''
-        archive_category = att.get('archive_category', '') or ''
+        archive_category = att.get('archive_category') or att.get('category') or ''
         if new_state:
-            dlg = ArchivePhotoDialog(att, self.storage.path_for(att), self.storage.all_categories(), self)
+            dlg = ArchivePhotoDialog(att, self.storage.path_for(att), self._attachment_archive_categories(), self)
             if dlg.exec() != QDialog.Accepted:
                 return
             archive_content = dlg.content()
@@ -6285,6 +7954,7 @@ class MainWindow(QMainWindow):
             updates.update(
                 archive_content=archive_content,
                 archive_category=archive_category,
+                category=archive_category,
                 memo=archive_content,
             )
         self.storage.update_attachment(note['id'], attachment_id, **updates)
@@ -6326,43 +7996,81 @@ class MainWindow(QMainWindow):
         return None
 
     def _open_image_viewer(self, attachment_id):
+        self._open_attachment(attachment_id)
+
+    def _open_attachment(self, attachment_id):
         note, att = self.storage.find_attachment(attachment_id)
         if att and not att.get('deleted') and not (note and note.get('deleted')):
             path = self._path_for_opening_attachment(att)
             if not path:
                 if att.get('tracking'):
+                    self.statusBar().showMessage(tr('该附件已被移动或删除，正在查找当前位置...'), 5000)
                     self._start_targeted_scan(att)
-                QMessageBox.warning(self, '图片不存在', '该图片已被移动或删除。')
+                else:
+                    self.statusBar().showMessage(tr('该附件已被移动或删除。'), 5000)
                 return
-            dlg = ImageViewerDialog(str(path), self)
-            dlg.exec()
+            if is_image_attachment(att):
+                dlg = ImageViewerDialog(str(path), self)
+                dlg.exec()
+            else:
+                if not open_local_path(path):
+                    QMessageBox.warning(self, '打开失败', f'无法打开:\n{path}')
             return
-        if not self.current_note_id:
-            return
-        for note in self.storage.notes:
-            if note.get('deleted'):
-                continue
-            if note['id'] != self.current_note_id:
-                continue
-            for att in note.get('attachments', []) or []:
-                if att.get('deleted'):
-                    continue
-                if att.get('id') == attachment_id:
-                    path = self._path_for_opening_attachment(att)
-                    if not path:
-                        if att.get('tracking'):
-                            self._start_targeted_scan(att)
-                        QMessageBox.warning(self, '图片不存在', '该图片已被移动或删除。')
-                        return
-                    dlg = ImageViewerDialog(str(path), self)
-                    dlg.exec()
-                    return
 
     def _on_file_dropped(self, file_path):
+        if self.workspace_mode == 'screenshot' and self._current_screenshot_attachment():
+            self._add_child_attachment_to_current_screenshot(file_path)
+            return
+        self._add_attachment_to_current(file_path, copy=False)
+
+    def _on_attachment_bar_file_dropped(self, file_path):
+        if self.workspace_mode == 'screenshot':
+            self._add_child_attachment_to_current_screenshot(file_path)
+            return
         self._add_attachment_to_current(file_path, copy=False)
 
     def _on_image_pasted(self, file_path):
         self._add_attachment_to_current(file_path, copy=True)
+
+    def _add_screenshot_from_path(self, file_path, copy=False):
+        attachment = self.storage.add_screenshot(file_path, copy=copy)
+        if not attachment:
+            QMessageBox.warning(self, '添加失败', '只能添加图片截图。')
+            return None
+        self._refresh_screenshot_board(preferred_attachment_id=attachment.get('id'))
+        return attachment
+
+    def _add_child_attachment_to_current_screenshot(self, file_path):
+        if self.workspace_mode != 'screenshot':
+            return self._add_attachment_to_current(file_path, copy=False)
+        parent = self._current_screenshot_attachment()
+        if not parent:
+            QMessageBox.information(self, '先选择截图', '请先选中一张截图，再给这张截图添加文件或文件夹。')
+            return None
+        return self._add_child_attachment_to_screenshot(parent.get('id'), file_path)
+
+    def _add_child_attachment_to_screenshot(self, screenshot_id, file_path):
+        attachment = self.storage.add_child_attachment(screenshot_id, file_path, copy=False)
+        if not attachment:
+            QMessageBox.warning(self, '添加失败', '无法添加该文件或文件夹。')
+            return None
+        self._refresh_screenshot_board(preferred_attachment_id=screenshot_id)
+        self.statusBar().showMessage(tr('已添加到当前截图'), 3000)
+        return attachment
+
+    def _choose_child_attachment_for_screenshot(self, screenshot_id):
+        menu = QMenu(self)
+        file_action = menu.addAction('选择文件...')
+        folder_action = menu.addAction('选择文件夹...')
+        action = menu.exec(QCursor.pos())
+        if action == file_action:
+            files, _ = QFileDialog.getOpenFileNames(self, '选择文件', '', '所有文件 (*.*)')
+            for file_path in files:
+                self._add_child_attachment_to_screenshot(screenshot_id, file_path)
+        elif action == folder_action:
+            folder = QFileDialog.getExistingDirectory(self, '选择文件夹', '')
+            if folder:
+                self._add_child_attachment_to_screenshot(screenshot_id, folder)
 
     def _add_attachment_to_current(self, file_path, copy=False):
         if self.workspace_mode != 'screenshot':
@@ -6383,19 +8091,44 @@ class MainWindow(QMainWindow):
                     break
             return
 
-        attachment = self.storage.add_screenshot(file_path, copy=copy)
-        if not attachment:
-            QMessageBox.warning(self, '添加失败', '只能添加图片截图。')
+        source = Path(file_path)
+        if source.is_file() and source.suffix.lower() in IMAGE_EXTS:
+            self._add_screenshot_from_path(file_path, copy=copy)
             return
-        self._refresh_screenshot_board(preferred_attachment_id=attachment.get('id'))
+
+        self._add_child_attachment_to_current_screenshot(file_path)
+
+    def _add_file_to_current_screenshot(self):
+        self._prepare_screenshot_workspace()
+        parent = self._current_screenshot_attachment()
+        if not parent:
+            QMessageBox.information(self, '先选择截图', '请先选中一张截图，再给这张截图添加文件或文件夹。')
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, '选择文件', '', '所有文件 (*.*)')
+        for file_path in files:
+            self._add_child_attachment_to_current_screenshot(file_path)
+
+    def _add_folder_to_current_screenshot(self):
+        self._prepare_screenshot_workspace()
+        parent = self._current_screenshot_attachment()
+        if not parent:
+            QMessageBox.information(self, '先选择截图', '请先选中一张截图，再给这张截图添加文件或文件夹。')
+            return
+        folder = QFileDialog.getExistingDirectory(self, '选择文件夹', '')
+        if folder:
+            self._add_child_attachment_to_current_screenshot(folder)
 
     def _on_attachment_delete(self, attachment_id):
         if self.view_switch.current_view() == 'archived':
+            self._delete_archived_attachment(attachment_id)
+            return
+        if self.workspace_mode == 'screenshot':
+            preferred_id = self._current_screenshot_attachment_id()
             note, _att = self.storage.find_attachment(attachment_id)
             if note and not note.get('deleted'):
                 self.storage.remove_attachment(note.get('id'), attachment_id)
-                self._refresh_current_workspace()
-                self.statusBar().showMessage(tr('截图已移到最近删除'), 4000)
+                self._refresh_screenshot_board(preferred_attachment_id=preferred_id)
+                self.statusBar().showMessage(tr('附件已移到最近删除'), 4000)
             return
         if self.workspace_mode != 'screenshot':
             if not self.current_note_id:
@@ -6408,10 +8141,6 @@ class MainWindow(QMainWindow):
                     break
             self.statusBar().showMessage(tr('附件已移到最近删除'), 4000)
             return
-
-        self.storage.remove_screenshot(attachment_id)
-        self._refresh_screenshot_board(preferred_attachment_id=attachment_id)
-        self.statusBar().showMessage(tr('截图已移到最近删除'), 4000)
 
     # ---- 全局拖拽 ----
     def dragEnterEvent(self, event):
@@ -6438,7 +8167,9 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
 
         capture_action = menu.addAction('框选截图')
-        browse_screenshot_action = menu.addAction('选择图片文件...')
+        browse_screenshot_action = menu.addAction('选择截图图片...')
+        add_file_to_screenshot_action = menu.addAction('给当前截图添加文件...')
+        add_folder_to_screenshot_action = menu.addAction('给当前截图添加文件夹...')
         recover_action = menu.addAction('立即查找移动过的文件')
         menu.addSeparator()
 
@@ -6463,6 +8194,7 @@ class MainWindow(QMainWindow):
         import_action = menu.addAction('从备份导入...')
         menu.addSeparator()
         open_dir_action = menu.addAction('打开数据文件夹')
+        choose_dir_action = menu.addAction('选择数据文件夹...')
 
         pos = self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft())
         action = menu.exec(pos)
@@ -6475,6 +8207,10 @@ class MainWindow(QMainWindow):
             self._capture_screenshot_region()
         elif action == browse_screenshot_action:
             self._browse_screenshot()
+        elif action == add_file_to_screenshot_action:
+            self._add_file_to_current_screenshot()
+        elif action == add_folder_to_screenshot_action:
+            self._add_folder_to_current_screenshot()
         elif action == recover_action:
             self._manual_recover_now()
         elif action == autostart_action:
@@ -6495,6 +8231,8 @@ class MainWindow(QMainWindow):
             self._import_data()
         elif action == open_dir_action:
             self._open_data_folder()
+        elif action == choose_dir_action:
+            self._choose_data_folder()
 
     def _show_scan_settings(self):
         dlg = ScanSettingsDialog(self.storage, parent=self)
@@ -6567,7 +8305,7 @@ class MainWindow(QMainWindow):
         if self.save_timer.isActive():
             self.save_timer.stop()
             self._save_current_now()
-        dlg = TimelineDialog(self.storage, self)
+        dlg = TimelineDialog(self.storage, self, workspace_mode=self.workspace_mode)
         dlg.state_changed.connect(self._refresh_after_timeline)
         dlg.note_requested.connect(self._open_note_from_timeline)
         dlg.exec()
@@ -6587,8 +8325,8 @@ class MainWindow(QMainWindow):
         """用户主动触发的"立即查找"。统计失踪数量，提示是否启动扫描。"""
         missing = []
         for _note, att in self.storage.all_external_attachments():
-            tr = att.get('tracking') or {}
-            if not tr.get('tracking_id'):
+            trk = att.get('tracking') or {}
+            if not trk.get('tracking_id'):
                 continue
             if self.storage.attachment_path_matches_tracking(att):
                 continue
@@ -6605,7 +8343,7 @@ class MainWindow(QMainWindow):
             f'有 {len(missing)} 个文件已被移动或暂时找不到，'
             f'正在后台扫描所有盘（含 U 盘 / 外接硬盘）寻找。\n\n{preview}{more}'
         )
-        self._start_auto_recovery()
+        self._start_auto_recovery(reason='manual', force=True)
 
     def _refresh_after_deleted(self):
         if self.current_note_id and not self.storage.get_note(self.current_note_id):
@@ -6626,8 +8364,8 @@ class MainWindow(QMainWindow):
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
         self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
-        self.new_btn.setText('＋  新建')
-        self.search_input.setPlaceholderText('搜索文字和文件')
+        self.new_btn.setText('+  新建记事')
+        self.search_input.setPlaceholderText('搜索记录')
         self.view_switch.set_view('archived', emit=False)
         self.archive_category_filter.setVisible(True)
         if self.search_input.text():
@@ -6635,10 +8373,7 @@ class MainWindow(QMainWindow):
             self.search_input.clear()
             self.search_input.blockSignals(False)
         self._refresh_archive_category_filter()
-        if self.archive_category_filter.currentIndex() > 0:
-            self.archive_category_filter.blockSignals(True)
-            self.archive_category_filter.setCurrentIndex(0)
-            self.archive_category_filter.blockSignals(False)
+        self._clear_archive_category_filter_text()
 
         self.current_note_id = None
         self._suppress_auto_select = True
@@ -6701,7 +8436,7 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(30, 28, 30, 24)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         title = QLabel('备份范围')
         title.setObjectName('account_title_small')
@@ -6729,8 +8464,8 @@ class MainWindow(QMainWindow):
         ok_btn.setObjectName('account_primary')
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(dlg.accept)
-        row.addWidget(cancel_btn)
-        row.addWidget(ok_btn)
+        row.addWidget(cancel_btn, 1)
+        row.addWidget(ok_btn, 1)
         layout.addLayout(row)
 
         if dlg.exec() != QDialog.Accepted:
@@ -6793,7 +8528,7 @@ class MainWindow(QMainWindow):
             return None
         names = set()
         for note in self.storage.notes:
-            for att in note.get('attachments', []) or []:
+            for att in iter_attachment_tree(note.get('attachments', []) or []):
                 if att.get('type', 'file') != 'file':
                     continue
                 stored_name = att.get('stored_name') or ''
@@ -6837,7 +8572,7 @@ class MainWindow(QMainWindow):
         missing = []
         count = 0
         for note in self.storage.notes:
-            for att in note.get('attachments', []) or []:
+            for att in iter_attachment_tree(note.get('attachments', []) or []):
                 att_type = att.get('type')
                 if att_type == 'folder':
                     if not include_folders:
@@ -6879,6 +8614,10 @@ class MainWindow(QMainWindow):
                         try:
                             for f in src.rglob('*'):
                                 if not f.is_file():
+                                    continue
+                                # 不要把内部的隐藏追踪标记导出去：它带着本机的 tracking_id，
+                                # 导出/再导入会制造重复标记，干扰按标记的文件夹定位。
+                                if f.name == ftrack.FOLDER_MARKER_NAME:
                                     continue
                                 rel = f.relative_to(src).as_posix()
                                 zf.write(f, f'external/{att_id}/{name}/{rel}')
@@ -7105,7 +8844,7 @@ class MainWindow(QMainWindow):
                 # 把已还原的引用类型附件路径,重定向到本地 imported 目录
                 redirected = 0
                 for note in imported_notes:
-                    for att in note.get('attachments', []) or []:
+                    for att in iter_attachment_tree(note.get('attachments', []) or []):
                         t = att.get('type')
                         if t in ('file_ref', 'folder') and att.get('id') in external_present:
                             new_path = imported_dir / att['id'] / att.get('original_name', '')
@@ -7118,11 +8857,10 @@ class MainWindow(QMainWindow):
                     if note.get('id') == SCREENSHOT_BOARD_ID:
                         existing_att_ids = {
                             att.get('id')
-                            for att in screenshot_board.get('attachments', []) or []
+                            for att in iter_attachment_tree(screenshot_board.get('attachments', []) or [])
                         }
                         for att in note.get('attachments', []) or []:
-                            if att.get('id') in existing_att_ids:
-                                att['id'] = uuid.uuid4().hex
+                            self._dedupe_attachment_tree_ids(att, existing_att_ids)
                             screenshot_board.setdefault('attachments', []).append(att)
                         screenshot_board['updated_at'] = datetime.now().isoformat()
                         continue
@@ -7153,8 +8891,17 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, '导入失败', f'导入过程中出错:\n{e}')
 
+    def _dedupe_attachment_tree_ids(self, attachment, existing_ids):
+        if not attachment:
+            return
+        if attachment.get('id') in existing_ids:
+            attachment['id'] = uuid.uuid4().hex
+        existing_ids.add(attachment.get('id'))
+        for child in attachment.get('attachments', []) or []:
+            self._dedupe_attachment_tree_ids(child, existing_ids)
+
     def _open_data_folder(self):
-        path = self.storage.app_dir
+        path = self.account_manager.app_root if self.account_manager else self.storage.app_dir
         if sys.platform == 'win32':
             try:
                 os.startfile(str(path))
@@ -7162,6 +8909,99 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _choose_data_folder(self):
+        if not self.account_manager:
+            return
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+            self._save_current_now()
+
+        current_root = self.account_manager.app_root
+        folder = QFileDialog.getExistingDirectory(self, '选择数据文件夹', str(current_root))
+        if not folder:
+            return
+        new_root = Path(folder)
+        if new_root.resolve() == current_root.resolve():
+            self.statusBar().showMessage(tr('数据文件夹未改变'), 3000)
+            return
+        if is_path_inside(new_root, current_root):
+            QMessageBox.warning(self, '选择数据文件夹', tr('新的数据文件夹不能放在当前数据文件夹里面。'))
+            return
+
+        reply = QMessageBox.question(
+            self,
+            '选择数据文件夹',
+            tr('是否把当前数据复制到新的数据文件夹？\n\n当前：{current}\n新的：{new}',
+               current=current_root, new=new_root),
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Cancel:
+            return
+
+        try:
+            if reply == QMessageBox.Yes:
+                copy_data_root(current_root, new_root)
+            if not self._reload_data_root(new_root):
+                QMessageBox.information(self, '选择数据文件夹', tr('没有进入新数据文件夹，已保留当前数据文件夹。'))
+                return
+            self._settings.setValue(DATA_ROOT_SETTINGS, str(new_root))
+            self.statusBar().showMessage(tr('数据文件夹已切换到 {path}', path=new_root), 5000)
+        except Exception as exc:
+            QMessageBox.critical(self, '切换失败', tr('切换数据文件夹时出错:\n{error}', error=exc))
+
+    def _reload_data_root(self, app_root):
+        app_root = Path(app_root)
+
+        new_manager = AccountManager(app_root=app_root)
+        account, crypter = new_manager.ensure_default_account()
+        if not crypter:
+            selected, selected_crypter = select_start_account(new_manager)
+            if not selected or not selected_crypter:
+                return False
+            account, crypter = selected, selected_crypter
+
+        try:
+            if getattr(self, '_tracked_watcher', None):
+                paths = self._tracked_watcher.files() + self._tracked_watcher.directories()
+                if paths:
+                    self._tracked_watcher.removePaths(paths)
+        except Exception:
+            pass
+        try:
+            self.storage._cleanup_cache_dir()
+        except Exception:
+            pass
+
+        os.environ[DATA_ROOT_ENV] = str(app_root)
+        ensure_custom_files()
+        reload_customization()
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(customized_stylesheet(STYLE))
+        apply_text_overrides()
+        self.account_manager = new_manager
+        self.account = account
+        self.storage = Storage(
+            app_dir=self.account_manager.account_dir(account),
+            crypter=crypter,
+            migrate_apple=False,
+        )
+        self.screenshot_board = self.storage.get_screenshot_board()
+        self.current_note_id = self.screenshot_board['id'] if self.workspace_mode == 'screenshot' else None
+        self.view_switch.set_view('active', emit=False)
+        self.search_input.blockSignals(True)
+        self.search_input.clear()
+        self.search_input.blockSignals(False)
+        self.editor.clear()
+        self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
+        self.attachment_bar.setVisible(False)
+        self._refresh_editor_categories()
+        self._refresh_current_workspace()
+        self._setup_tracking_watchers()
+        self._start_background_tagging()
+        return True
 
     def closeEvent(self, event):
         if self.save_timer.isActive():
@@ -7257,9 +9097,13 @@ class MainWindow(QMainWindow):
 
     def _on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._show_window_from_tray()
+            self._show_window_from_tray(force=True)
 
-    def _show_window_from_tray(self):
+    def _show_window_from_tray(self, force=False):
+        now = time.time()
+        if not force and now - getattr(self, '_last_window_activation', 0.0) < WINDOW_ACTIVATE_COOLDOWN_SECONDS:
+            return
+        self._last_window_activation = now
         if self.isMinimized():
             self.showNormal()
         else:
@@ -7287,7 +9131,7 @@ def _activate_running_instance():
     sock = QLocalSocket()
     sock.connectToServer(SINGLE_INSTANCE_KEY)
     if sock.waitForConnected(500):
-        sock.write(b'show')
+        sock.write(b'already-running')
         sock.flush()
         sock.waitForBytesWritten(500)
         sock.disconnectFromServer()
@@ -7309,7 +9153,7 @@ class LoginDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
-        layout.setSpacing(16)
+        layout.setSpacing(14)
 
         title = QLabel('FRESH')
         title.setObjectName('account_title')
@@ -7407,7 +9251,7 @@ class PasswordSetupDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         label = QLabel(title)
         label.setObjectName('account_title_small')
@@ -7440,8 +9284,8 @@ class PasswordSetupDialog(QDialog):
         ok_btn.setObjectName('account_primary')
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._accept)
-        row.addWidget(cancel_btn)
-        row.addWidget(ok_btn)
+        row.addWidget(cancel_btn, 1)
+        row.addWidget(ok_btn, 1)
         layout.addLayout(row)
 
     def _accept(self):
@@ -7472,7 +9316,7 @@ class NewAccountDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
-        layout.setSpacing(12)
+        layout.setSpacing(14)
 
         label = QLabel('新建账户')
         label.setObjectName('account_title_small')
@@ -7515,8 +9359,8 @@ class NewAccountDialog(QDialog):
         ok_btn.setObjectName('account_primary')
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._accept)
-        row.addWidget(cancel_btn)
-        row.addWidget(ok_btn)
+        row.addWidget(cancel_btn, 1)
+        row.addWidget(ok_btn, 1)
         layout.addLayout(row)
         self._sync_password_fields(False)
 
@@ -7772,26 +9616,27 @@ def select_start_account(account_manager):
 
 
 def main():
-    # 单实例：先用 QLockFile 抢锁，再尝试通知已有实例显示窗口
+    # 单实例：已有实例运行时静默退出，避免外部重复启动时不断把窗口拉到前台。
     runtime_dir = QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation) or tempfile.gettempdir()
     Path(runtime_dir).mkdir(parents=True, exist_ok=True)
     lock_file = QLockFile(str(Path(runtime_dir) / 'FRESH.lock'))
     lock_file.setStaleLockTime(0)
     if not lock_file.tryLock(100):
-        # 已有实例：让它显示出来再退出
         _activate_running_instance()
         return
 
     app = QApplication(sys.argv)
     app.setApplicationName('FRESH')
     app.setOrganizationName('FRESH')
+    settings = QSettings('FRESH', 'FRESH')
+    data_root = configured_data_root(settings)
     ensure_custom_files()
     install_text_overrides(app)
     app.setStyleSheet(customized_stylesheet(STYLE))
     # 关闭窗口后不退出应用（保留在系统托盘）
     app.setQuitOnLastWindowClosed(False)
 
-    account_manager = AccountManager()
+    account_manager = AccountManager(app_root=data_root)
     account, crypter = select_start_account(account_manager)
     if not account or not crypter:
         return
@@ -7804,7 +9649,7 @@ def main():
     window = MainWindow(storage, account=account, account_manager=account_manager)
     window.show()
 
-    # 监听本地 socket，让后续启动的实例可以唤起窗口
+    # 监听本地 socket 只用于兼容已有启动流程；不再响应 show，避免窗口反复弹出。
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
     server = QLocalServer()
     server.listen(SINGLE_INSTANCE_KEY)
@@ -7813,9 +9658,13 @@ def main():
         sock = server.nextPendingConnection()
         if sock is None:
             return
-        sock.readyRead.connect(lambda: sock.readAll())
+        def _read_request():
+            try:
+                sock.readAll()
+            except Exception:
+                pass
+        sock.readyRead.connect(_read_request)
         sock.disconnected.connect(sock.deleteLater)
-        window._show_window_from_tray()
 
     server.newConnection.connect(_on_new_connection)
     app._single_instance_server = server  # 保活引用

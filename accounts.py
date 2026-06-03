@@ -10,15 +10,10 @@ from pathlib import Path
 from cryptography.fernet import InvalidToken
 
 from crypter import Crypter, PASSWORD_KDF_ITERATIONS, PasswordCrypter
+from storage import default_app_root
 
 
 VERIFIER_PREFIX = 'FRESH_ACCOUNT_VERIFIER:'
-
-
-def default_app_root() -> Path:
-    appdata = os.getenv('APPDATA') or str(Path.home())
-    return Path(appdata) / 'FRESH'
-
 
 class AccountError(Exception):
     pass
