@@ -1,38 +1,31 @@
 """FRESH - 苹果风格便签"""
-import ctypes
+import base64
 import json
+import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 import uuid
 import zipfile
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
+from html import escape as html_escape
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-
-try:
-    import winreg
-except ImportError:
-    winreg = None
-
-try:
-    import win32com.client as win32com_client
-except Exception:
-    win32com_client = None
 
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QRect, QRectF, QUrl, QPoint, QPointF, QThread,
-    QFileSystemWatcher, QEvent, QSettings, QLockFile, QStandardPaths, QDate
+    QFileSystemWatcher, QEvent, QEventLoop, QSettings, QLockFile, QStandardPaths, QDate,
+    QVariantAnimation, QEasingCurve
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
-    QPixmap, QImage, QFont, QColor, QPainter, QPolygonF,
+    QPixmap, QImage, QImageReader, QFont, QColor, QPainter, QPolygonF,
     QDesktopServices, QFontMetrics, QKeySequence, QIcon, QShortcut, QGuiApplication,
-    QPen, QCursor, QPainterPath,
+    QPen, QCursor, QPainterPath, QLinearGradient, QBrush,
     QTextCharFormat, QTextCursor, QTextListFormat
 )
 from PySide6.QtWidgets import (
@@ -48,8 +41,15 @@ from PySide6.QtWidgets import (
     QToolTip, QDateEdit
 )
 
-from accounts import AccountError, AccountManager
-from storage import SCREENSHOT_BOARD_ID, Storage
+from accounts import AccountError, AccountManager, MIN_PASSWORD_LENGTH
+from app_paths import DATA_ROOT_ENV, portable_data_root, set_data_root
+from crypter import PASSWORD_KDF_ITERATIONS, PasswordCrypter, SaltFileError
+from storage import (
+    IMAGE_EXTS,
+    SCREENSHOT_BOARD_ID,
+    Storage,
+    is_attachment_image as is_image_attachment,
+)
 from styles import STYLE
 from customization import (
     DEFAULT_TEXTS,
@@ -65,8 +65,10 @@ from customization import (
     save_text_config_values,
     text_config_path,
     tr,
+    validate_qss_text,
 )
 import ftrack
+from win_shell import open_local_path, reveal_in_file_manager, explorer_open_folders
 from shell_notify import (
     ShellChangeFilter,
     SHCNE_RENAMEITEM, SHCNE_RENAMEFOLDER,
@@ -75,16 +77,36 @@ from shell_notify import (
 )
 
 
-DATA_ROOT_ENV = 'FRESH_APP_ROOT'
 DATA_ROOT_SETTINGS = 'data/root_dir'
 
+logger = logging.getLogger('fresh')
 
-def portable_data_root() -> Path:
-    if getattr(sys, 'frozen', False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-    return base_dir / 'FRESH_Data'
+
+def setup_logging(data_root: Path):
+    """把日志写到数据目录下的 fresh.log（轮转 1MB×2）。
+
+    之前全项目近 200 处 except Exception: pass，线上问题完全不可诊断；
+    关键路径的吞错现在至少会留下日志。
+    """
+    try:
+        data_root = Path(data_root)
+        data_root.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            data_root / 'fresh.log', maxBytes=1_000_000, backupCount=2, encoding='utf-8'
+        )
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+        root = logging.getLogger()
+        root.setLevel(logging.INFO)
+        root.addHandler(handler)
+        logging.captureWarnings(True)
+
+        def _hook(exc_type, exc, tb):
+            logger.critical('未捕获异常', exc_info=(exc_type, exc, tb))
+            sys.__excepthook__(exc_type, exc, tb)
+
+        sys.excepthook = _hook
+    except Exception:
+        pass
 
 
 def legacy_appdata_root() -> Path:
@@ -102,7 +124,7 @@ def _copy_initial_data_root(src: Path, dst: Path):
     try:
         shutil.copytree(src, dst, dirs_exist_ok=True)
     except Exception:
-        pass
+        logger.exception('迁移旧数据目录失败: %s -> %s', src, dst)
 
 
 def configured_data_root(settings: QSettings | None = None) -> Path:
@@ -116,16 +138,26 @@ def configured_data_root(settings: QSettings | None = None) -> Path:
     root = Path(configured).expanduser() if configured else portable_data_root()
     if not configured:
         _copy_initial_data_root(legacy_appdata_root(), root)
-    os.environ[DATA_ROOT_ENV] = str(root)
+    set_data_root(root)
     return root
 
 
 def copy_data_root(src: Path, dst: Path):
+    """复制数据根目录。返回失败清单 [(路径, 错误)]，空列表表示全部成功。
+
+    之前逐项静默吞错：文件被占用/权限不足/磁盘满都会被跳过，调用方却
+    提示"已切换"，用户实际切到一个缺数据的目录。
+    """
     src = Path(src)
     dst = Path(dst)
+    failures = []
     if not src.exists() or src.resolve() == dst.resolve():
-        return
-    dst.mkdir(parents=True, exist_ok=True)
+        return failures
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        failures.append((str(dst), str(exc)))
+        return failures
     for child in src.iterdir():
         target = dst / child.name
         try:
@@ -134,8 +166,18 @@ def copy_data_root(src: Path, dst: Path):
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(child, target)
-        except Exception:
-            pass
+        except shutil.Error as exc:
+            # copytree 部分失败时抛出聚合错误，解包列出具体文件
+            try:
+                for item_src, _item_dst, why in exc.args[0]:
+                    failures.append((str(item_src), str(why)))
+            except Exception:
+                failures.append((str(child), str(exc)))
+            logger.warning('复制数据目录部分失败: %s', exc)
+        except Exception as exc:
+            failures.append((str(child), str(exc)))
+            logger.warning('复制数据目录失败 %s: %s', child, exc)
+    return failures
 
 
 def is_path_inside(path: Path, parent: Path) -> bool:
@@ -173,6 +215,54 @@ def markdown_to_preview(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
 
 
+_THUMB_CACHE = OrderedDict()
+_THUMB_CACHE_MAX = 600
+
+
+def load_scaled_pixmap(path, max_w, max_h, dpr=None):
+    """按目标尺寸解码图片并做 LRU 缓存。返回 None 表示不存在或解码失败。
+
+    QPixmap(path) 会把原图全分辨率解码进内存（4K 截图几十毫秒/几十 MB），
+    网格、时间线每次重建都重复解码是最大的卡顿源。QImageReader 按
+    缩略图尺寸解码 + (路径, mtime, 尺寸, dpr) 缓存基本消掉这部分成本；
+    按 devicePixelRatio 放大解码再标记，高分屏不再发虚。
+    """
+    p = Path(path)
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    if dpr is None:
+        try:
+            screen = QGuiApplication.primaryScreen()
+            dpr = screen.devicePixelRatio() if screen else 1.0
+        except Exception:
+            dpr = 1.0
+    dpr = max(1.0, float(dpr))
+    key = (str(p), mtime, int(max_w), int(max_h), round(dpr, 2))
+    cached = _THUMB_CACHE.get(key)
+    if cached is not None:
+        _THUMB_CACHE.move_to_end(key)
+        return cached
+    reader = QImageReader(str(p))
+    reader.setAutoTransform(True)
+    size = reader.size()
+    target_w = max(1, int(max_w * dpr))
+    target_h = max(1, int(max_h * dpr))
+    if size.isValid() and size.width() > 0 and size.height() > 0:
+        if size.width() > target_w or size.height() > target_h:
+            reader.setScaledSize(size.scaled(target_w, target_h, Qt.KeepAspectRatio))
+    image = reader.read()
+    if image.isNull():
+        return None
+    pixmap = QPixmap.fromImage(image)
+    pixmap.setDevicePixelRatio(dpr)
+    _THUMB_CACHE[key] = pixmap
+    while len(_THUMB_CACHE) > _THUMB_CACHE_MAX:
+        _THUMB_CACHE.popitem(last=False)
+    return pixmap
+
+
 def looks_like_qt_html(text: str) -> bool:
     stripped = (text or '').lstrip().lower()
     return (
@@ -182,11 +272,36 @@ def looks_like_qt_html(text: str) -> bool:
     )
 
 
+_PREVIEW_CACHE = OrderedDict()
+_SEARCH_TEXT_CACHE = OrderedDict()
+_NOTE_CACHE_MAX = 4096
+
+
+def _note_cache_key(note: dict):
+    # update_note 改动任何字段都会刷新 updated_at，可作为内容版本号
+    return (note.get('id') or id(note), note.get('updated_at', ''), note.get('content_format', ''))
+
+
 def note_content_preview(note: dict) -> str:
+    """生成列表预览文本（带缓存）。
+
+    delegate 每次重绘都会调用；不缓存的话，鼠标划过/滚动列表时每行
+    每帧都对全文 HTML 跑一遍正则，长富文本下明显掉帧。
+    """
+    key = _note_cache_key(note)
+    hit = _PREVIEW_CACHE.get(key)
+    if hit is not None:
+        _PREVIEW_CACHE.move_to_end(key)
+        return hit
     content = note.get('content', '') or ''
     if note.get('content_format') == 'markdown':
-        return markdown_to_preview(content)
-    return html_to_preview(content)
+        result = markdown_to_preview(content)
+    else:
+        result = html_to_preview(content)
+    _PREVIEW_CACHE[key] = result
+    while len(_PREVIEW_CACHE) > _NOTE_CACHE_MAX:
+        _PREVIEW_CACHE.popitem(last=False)
+    return result
 
 
 def note_display_title(note: dict) -> str:
@@ -198,6 +313,12 @@ def note_display_title(note: dict) -> str:
 
 
 def note_search_text(note: dict) -> str:
+    """搜索匹配文本（带缓存）——搜索框每个按键都会对全部笔记调用一遍。"""
+    key = _note_cache_key(note)
+    hit = _SEARCH_TEXT_CACHE.get(key)
+    if hit is not None:
+        _SEARCH_TEXT_CACHE.move_to_end(key)
+        return hit
     parts = [
         note.get('title', ''),
         note_content_preview(note),
@@ -221,7 +342,11 @@ def note_search_text(note: dict) -> str:
             att.get('added_at', ''),
             att.get('archived_at', ''),
         ])
-    return ' '.join(str(part) for part in parts if part).lower()
+    result = ' '.join(str(part) for part in parts if part).lower()
+    _SEARCH_TEXT_CACHE[key] = result
+    while len(_SEARCH_TEXT_CACHE) > _NOTE_CACHE_MAX:
+        _SEARCH_TEXT_CACHE.popitem(last=False)
+    return result
 
 
 def iter_attachment_tree(attachments):
@@ -311,52 +436,6 @@ def format_size(size: int) -> str:
     return f"{size / 1024 ** 3:.2f} GB"
 
 
-def _is_root_path(path):
-    try:
-        p = Path(path)
-        return bool(p.anchor) and p.parent == p
-    except Exception:
-        return False
-
-
-def open_local_path(path):
-    p = Path(path)
-    if not p.exists():
-        return False
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
-    if sys.platform == 'win32':
-        try:
-            os.startfile(str(p))
-            return True
-        except Exception:
-            pass
-    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
-
-
-def reveal_in_file_manager(path):
-    p = Path(path)
-    if not p.exists():
-        return False
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
-    if sys.platform == 'win32':
-        try:
-            if not _is_root_path(p):
-                subprocess.Popen(['explorer.exe', f'/select,{str(p)}'])
-            else:
-                subprocess.Popen(['explorer.exe', str(p)])
-            return True
-        except Exception:
-            pass
-    target = p.parent if p.is_file() or (p.is_dir() and not _is_root_path(p)) else p
-    return QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
-
-
 def recovery_scan_roots(scan_settings, drive_hints=None):
     """Roots for recovery scans.
 
@@ -404,76 +483,26 @@ def recovery_scan_roots(scan_settings, drive_hints=None):
 
 
 # ============ 开机启动 ============
-
-AUTOSTART_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
-AUTOSTART_NAME = 'FRESH'
-
-
-def _autostart_command():
-    if getattr(sys, 'frozen', False):
-        return f'"{sys.executable}"'
-    main_path = Path(__file__).resolve()
-    python_exe = sys.executable
-    pythonw = python_exe
-    if python_exe and python_exe.lower().endswith('python.exe'):
-        candidate = Path(python_exe).with_name('pythonw.exe')
-        if candidate.exists():
-            pythonw = str(candidate)
-    return f'"{pythonw}" "{main_path}"'
+#
+# The unsigned packaged build disables registry-startup support. Some scanners
+# classify Python apps that can write login startup entries as shell loaders,
+# even when the feature is user-triggered.
 
 
 def autostart_supported():
-    return winreg is not None and sys.platform == 'win32'
+    return False
 
 
 def is_autostart_enabled():
-    if not autostart_supported():
-        return False
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
-            winreg.QueryValueEx(k, AUTOSTART_NAME)
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return False
+    return False
 
 
 def set_autostart(enable):
-    if not autostart_supported():
-        return False
-    try:
-        if enable:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as k:
-                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
-        else:
-            try:
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as k:
-                    winreg.DeleteValue(k, AUTOSTART_NAME)
-            except FileNotFoundError:
-                pass
-        return True
-    except OSError:
-        return False
+    return False
 
 
 def refresh_autostart_if_needed():
-    if not autostart_supported():
-        return
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as k:
-            current_cmd, _ = winreg.QueryValueEx(k, AUTOSTART_NAME)
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    new_cmd = _autostart_command()
-    if current_cmd != new_cmd:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE) as k:
-                winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, new_cmd)
-        except OSError:
-            pass
+    return
 
 
 # ============ 备忘录列表自定义渲染 ============
@@ -816,7 +845,8 @@ class ArchiveListDelegate(QStyledItemDelegate):
 
 # ============ 截图模式相关 ============
 
-IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'}
+# IMAGE_EXTS / is_image_attachment 统一从 storage 导入：
+# 之前两边各写一份，None 防御已经分叉，将来加新后缀也只会改一处
 SHELL_CREATE_MATCH_WINDOW_SECONDS = 180.0
 SHELL_DELETE_RETRY_WINDOW_SECONDS = 180.0
 AUTO_RECOVERY_COOLDOWN_SECONDS = 30.0
@@ -824,13 +854,6 @@ WINDOW_ACTIVATE_COOLDOWN_SECONDS = 8.0
 CLIPBOARD_MOVE_MATCH_WINDOW_SECONDS = 180.0
 DROPEFFECT_COPY = 1
 DROPEFFECT_MOVE = 2
-
-
-def is_image_attachment(att):
-    if att.get('type') == 'folder':
-        return False
-    name = att.get('original_name', '')
-    return Path(name).suffix.lower() in IMAGE_EXTS
 
 
 def attachment_kind_label(att):
@@ -922,54 +945,6 @@ def clipboard_drop_effect(mime):
         if len(data) >= 4:
             return int.from_bytes(data[:4], byteorder='little', signed=False)
     return 0
-
-
-def explorer_open_folders():
-    """Best-effort list of open File Explorer folders, foreground window first."""
-    if sys.platform != 'win32' or win32com_client is None:
-        return []
-    try:
-        import pythoncom
-        pythoncom.CoInitialize()
-    except Exception:
-        pass
-    try:
-        foreground = int(ctypes.windll.user32.GetForegroundWindow())
-    except Exception:
-        foreground = 0
-    out = []
-    seen = set()
-    try:
-        shell = win32com_client.Dispatch('Shell.Application')
-        windows = shell.Windows()
-    except Exception:
-        return []
-    try:
-        count = int(windows.Count)
-    except Exception:
-        count = 0
-    for i in range(count):
-        try:
-            window = windows.Item(i)
-            hwnd = int(getattr(window, 'HWND', 0) or 0)
-            path = window.Document.Folder.Self.Path
-        except Exception:
-            continue
-        if not path:
-            continue
-        try:
-            p = Path(path)
-            if not p.exists() or not p.is_dir():
-                continue
-            key = os.path.normcase(os.path.normpath(str(p)))
-        except Exception:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((0 if hwnd and hwnd == foreground else 1, str(p)))
-    out.sort(key=lambda item: item[0])
-    return [path for _priority, path in out]
 
 
 def grab_clipboard_image_path():
@@ -1096,7 +1071,8 @@ class RegionCaptureOverlay(QDialog):
                     max(1, int(sel.width() * sx)),
                     max(1, int(sel.height() * sy)),
                 )
-                painter.drawPixmap(sel, self.pixmap.copy(source))
+                # 三参重载直接从源 pixmap 取区域绘制，避免拖拽期间每帧 copy 大图
+                painter.drawPixmap(sel, self.pixmap, source)
             painter.setPen(QPen(QColor('#FFFFFF'), 2))
             painter.drawRect(sel.adjusted(0, 0, -1, -1))
         else:
@@ -1161,6 +1137,7 @@ class ModeSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._mode = 'text'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1185,9 +1162,15 @@ class ModeSwitch(QWidget):
         self.shot_btn.clicked.connect(lambda: self._click('screenshot'))
 
     def _click(self, mode):
+        if mode == self.current_mode():
+            # 重复点击当前已选模式：只复位按钮态，不触发整条刷新链
+            self.set_mode(mode, emit=False)
+            return
         self.set_mode(mode, emit=True)
 
     def set_mode(self, mode, emit=False):
+        mode = 'screenshot' if mode == 'screenshot' else 'text'
+        self._mode = mode
         self.text_btn.blockSignals(True)
         self.shot_btn.blockSignals(True)
         self.text_btn.setChecked(mode == 'text')
@@ -1198,7 +1181,7 @@ class ModeSwitch(QWidget):
             self.changed.emit(mode)
 
     def current_mode(self):
-        return 'screenshot' if self.shot_btn.isChecked() else 'text'
+        return self._mode
 
 
 class ViewSwitch(QWidget):
@@ -1207,6 +1190,7 @@ class ViewSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._view = 'active'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1231,9 +1215,14 @@ class ViewSwitch(QWidget):
         self.archived_btn.clicked.connect(lambda: self._click('archived'))
 
     def _click(self, view):
+        if view == self.current_view():
+            self.set_view(view, emit=False)
+            return
         self.set_view(view, emit=True)
 
     def set_view(self, view, emit=False):
+        view = 'archived' if view == 'archived' else 'active'
+        self._view = view
         self.active_btn.blockSignals(True)
         self.archived_btn.blockSignals(True)
         self.active_btn.setChecked(view == 'active')
@@ -1248,7 +1237,7 @@ class ViewSwitch(QWidget):
         self.archived_btn.setText(f'归档  ·  {archived_count}')
 
     def current_view(self):
-        return 'archived' if self.archived_btn.isChecked() else 'active'
+        return self._view
 
 
 class TextFormatSwitch(QWidget):
@@ -1257,6 +1246,7 @@ class TextFormatSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._format = 'rich'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1281,10 +1271,14 @@ class TextFormatSwitch(QWidget):
         self.markdown_btn.clicked.connect(lambda: self._click('markdown'))
 
     def _click(self, fmt):
+        if fmt == self.current_format():
+            self.set_format(fmt, emit=False)
+            return
         self.set_format(fmt, emit=True)
 
     def set_format(self, fmt, emit=False):
         fmt = 'markdown' if fmt == 'markdown' else 'rich'
+        self._format = fmt
         self.rich_btn.blockSignals(True)
         self.markdown_btn.blockSignals(True)
         self.rich_btn.setChecked(fmt == 'rich')
@@ -1295,7 +1289,7 @@ class TextFormatSwitch(QWidget):
             self.changed.emit(fmt)
 
     def current_format(self):
-        return 'markdown' if self.markdown_btn.isChecked() else 'rich'
+        return self._format
 
 
 class DropHintCard(QFrame):
@@ -1457,8 +1451,8 @@ class ScreenshotThumbnail(QFrame):
             painter.drawText(pix.rect(), Qt.AlignCenter, tr('图片不存在'))
             painter.end()
             return pix
-        pixmap = QPixmap(str(self.file_path))
-        if pixmap.isNull():
+        pixmap = load_scaled_pixmap(self.file_path, self.THUMB_W, self.THUMB_H)
+        if pixmap is None:
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
             painter = QPainter(pix)
@@ -1466,10 +1460,7 @@ class ScreenshotThumbnail(QFrame):
             painter.drawText(pix.rect(), Qt.AlignCenter, tr('无法加载'))
             painter.end()
             return pix
-        return pixmap.scaled(
-            self.THUMB_W, self.THUMB_H,
-            Qt.KeepAspectRatio, Qt.FastTransformation
-        )
+        return pixmap
 
     def _build_attachment_thumbnail(self):
         pix = QPixmap(self.THUMB_W, self.THUMB_H)
@@ -1613,8 +1604,12 @@ class ScreenshotChildAttachmentChip(QFrame):
         icon.setObjectName('thumb_attachment_icon')
         icon.setFixedSize(16, 16)
         if is_image_attachment(attachment) and self.file_path.exists():
-            pixmap = QPixmap(str(self.file_path))
-            icon.setPixmap(pixmap.scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+            # 之前整图解码只为做 16x16 图标
+            pixmap = load_scaled_pixmap(self.file_path, 16, 16)
+            if pixmap is not None:
+                icon.setPixmap(pixmap)
+            else:
+                icon.setPixmap(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
         elif attachment.get('type') == 'folder':
             icon.setPixmap(build_folder_icon(16).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
         else:
@@ -1813,7 +1808,17 @@ class ScreenshotGrid(QScrollArea):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._current_images and self._cols() != self._current_cols:
-            self._render()
+            # 跨列时只重新排版现有缩略图，不销毁重建（重建要重新解码全部图片）
+            self._relayout()
+
+    def _relayout(self):
+        cols = self._cols()
+        self._current_cols = cols
+        while self.grid.count() > 0:
+            self.grid.takeAt(0)
+        for i, thumb in enumerate(self._thumbnails):
+            row, col = divmod(i, cols)
+            self.grid.addWidget(thumb, row, col, Qt.AlignTop | Qt.AlignLeft)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() or event.mimeData().hasImage():
@@ -1866,7 +1871,10 @@ class ImageViewerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(Path(file_path).name)
         self.resize(960, 680)
-        self.setStyleSheet("background: #1D1D1F;")
+        # 带选择器只作用于对话框本身——无选择器的内联样式会级联到所有
+        # 子控件，把 styles.py 里查看器工具栏按钮的样式整个压掉
+        self.setObjectName('image_viewer_dialog')
+        self.setStyleSheet('QDialog#image_viewer_dialog { background: #1D1D1F; }')
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1985,11 +1993,13 @@ class ArchivePhotoDialog(QDialog):
         thumb.setFixedSize(120, 82)
         thumb.setAlignment(Qt.AlignCenter)
         if is_image:
-            pixmap = QPixmap(str(file_path))
+            pixmap = load_scaled_pixmap(file_path, 120, 82) or QPixmap()
         else:
             pixmap = build_folder_icon(58) if attachment.get('type') == 'folder' else build_file_icon(file_path, 58, AttachmentCard.EXT_COLORS)
         if pixmap.isNull():
             thumb.setText('无法预览')
+        elif is_image:
+            thumb.setPixmap(pixmap)
         else:
             thumb.setPixmap(pixmap.scaled(120, 82, Qt.KeepAspectRatio, Qt.FastTransformation))
 
@@ -2022,8 +2032,8 @@ class ArchivePhotoDialog(QDialog):
         self.category_combo.lineEdit().setText(
             attachment.get('archive_category', '') or attachment.get('category', '') or ''
         )
+        # currentTextChanged 已覆盖手动输入，重复连 lineEdit 会让每个按键触发两次
         self.category_combo.currentTextChanged.connect(self._sync_ok_enabled)
-        self.category_combo.lineEdit().textChanged.connect(self._sync_ok_enabled)
         category_row.addWidget(category_label)
         category_row.addWidget(self.category_combo, 1)
 
@@ -2040,12 +2050,12 @@ class ArchivePhotoDialog(QDialog):
         self.cancel_btn = QPushButton('取消')
         self.cancel_btn.setObjectName('archive_dialog_cancel')
         self.cancel_btn.setCursor(Qt.PointingHandCursor)
-        self.cancel_btn.setFocusPolicy(Qt.NoFocus)
         self.cancel_btn.clicked.connect(self.reject)
         self.ok_btn = QPushButton('归档附件')
         self.ok_btn.setObjectName('archive_dialog_ok')
         self.ok_btn.setCursor(Qt.PointingHandCursor)
-        self.ok_btn.setFocusPolicy(Qt.NoFocus)
+        # 按钮可聚焦 + 默认键，键盘（Tab/Enter/Esc）也能完成归档
+        self.ok_btn.setDefault(True)
         self.ok_btn.clicked.connect(self.accept)
         buttons.addStretch()
         buttons.addWidget(self.cancel_btn)
@@ -2071,34 +2081,25 @@ class ArchivePhotoDialog(QDialog):
         self.ok_btn.setEnabled(bool(self.content()))
 
 
-def choose_archive_category(parent, storage, current='', required=True):
+def choose_category(parent, storage, current='', *, required=True,
+                    title=None, prompt=None, allow_empty_choice=False):
+    """归档分类 / 附件分类共用的选择对话框（两者候选互通）。"""
+    title = title or tr('归档分类')
+    prompt = prompt or tr('选择或输入分类:')
     current = (current or '').strip()
     categories = list(storage.all_categories() if storage else [])
     categories = [category for category in categories if category]
     if current and current not in categories:
         categories.append(current)
         categories.sort()
-    if not required and '' not in categories:
+    if allow_empty_choice and '' not in categories:
         categories.insert(0, '')
 
     if categories:
         index = categories.index(current) if current in categories else 0
-        category, ok = QInputDialog.getItem(
-            parent,
-            tr('归档分类'),
-            tr('选择或输入分类:'),
-            categories,
-            index,
-            True,
-        )
+        category, ok = QInputDialog.getItem(parent, title, prompt, categories, index, True)
     else:
-        category, ok = QInputDialog.getText(
-            parent,
-            tr('归档分类'),
-            tr('输入分类:'),
-            QLineEdit.Normal,
-            current,
-        )
+        category, ok = QInputDialog.getText(parent, title, prompt, QLineEdit.Normal, current)
     if not ok:
         return None
     category = (category or '').strip()
@@ -2106,6 +2107,14 @@ def choose_archive_category(parent, storage, current='', required=True):
         QMessageBox.information(parent, tr('需要分类'), tr('请填写归档分类。'))
         return None
     return category
+
+
+def choose_archive_category(parent, storage, current='', required=True):
+    return choose_category(
+        parent, storage, current,
+        required=required,
+        allow_empty_choice=not required,
+    )
 
 
 def attachment_category_candidates(storage):
@@ -2120,37 +2129,14 @@ def attachment_category_candidates(storage):
 
 
 def choose_attachment_category(parent, storage, current=''):
-    current = (current or '').strip()
     # 与归档分类共用同一套候选（笔记 + 附件的全部分类），名字互通。
-    categories = list(storage.all_categories() if storage else [])
-    categories = [category for category in categories if category]
-    if current and current not in categories:
-        categories.append(current)
-        categories.sort()
-    if '' not in categories:
-        categories.insert(0, '')
-
-    if categories:
-        index = categories.index(current) if current in categories else 0
-        category, ok = QInputDialog.getItem(
-            parent,
-            tr('附件分类'),
-            tr('选择或输入附件分类:'),
-            categories,
-            index,
-            True,
-        )
-    else:
-        category, ok = QInputDialog.getText(
-            parent,
-            tr('附件分类'),
-            tr('输入附件分类:'),
-            QLineEdit.Normal,
-            current,
-        )
-    if not ok:
-        return None
-    return (category or '').strip()
+    return choose_category(
+        parent, storage, current,
+        required=False,
+        title=tr('附件分类'),
+        prompt=tr('选择或输入附件分类:'),
+        allow_empty_choice=True,
+    )
 
 
 class EmptyState(QWidget):
@@ -2315,6 +2301,19 @@ def period_label(key, granularity):
 class TimelineReviewChart(QWidget):
     category_selected = Signal(str)
 
+    # —— 配色（QPainter 硬编码色无法被 QSS 覆盖，集中为类常量便于一处主题化）——
+    BLUE = '#2F7BFF'; BLUE_LIGHT = '#5C9BFF'
+    GREEN = '#34C759'; GREEN_LIGHT = '#5AD27A'
+    GOLD = '#FF9F0A'; GOLD_LIGHT = '#FFB340'
+    SILVER = '#AEB8C6'; SILVER_LIGHT = '#C9D2DE'
+    BRONZE = '#CD7F45'; BRONZE_LIGHT = '#E0A87E'
+    TEXT = '#263548'; MUTED = '#65758B'; FAINT = '#8B98AA'
+    GRID = '#EEF2F8'; CARD_BORDER = '#E8E8ED'
+    DIM = '#C7C7CC'; DIM_LIGHT = '#D6DEEA'
+    HOVER = '#F7FAFF'; BADGE_BG = '#EAF2FF'
+    PEAK_BLUE = '#1E5FD6'; PEAK_GREEN = '#1F9D4E'
+    HEAT_EMPTY = '#EBEDF0'
+    HEAT_SCALE = ['#C8EBD3', '#86D6A1', '#52C07D', '#2C9E55']
     def __init__(self, chart_type, title, parent=None):
         super().__init__(parent)
         self.chart_type = chart_type
@@ -2325,6 +2324,20 @@ class TimelineReviewChart(QWidget):
         self.rank_order = 'slow'
         self._hit_regions = []
         self._rank_regions = []
+        self._heat_regions = []
+        self._hover_index = -1
+        self._grow = 1.0
+        self._animations_enabled = True
+        self._anim = None
+        try:
+            self._anim = QVariantAnimation(self)
+            self._anim.setStartValue(0.0)
+            self._anim.setEndValue(1.0)
+            self._anim.setDuration(520)
+            self._anim.setEasingCurve(QEasingCurve.OutCubic)
+            self._anim.valueChanged.connect(self._on_grow)
+        except Exception:
+            self._anim = None
         self.setObjectName('timeline_chart')
         self.setMouseTracking(True)
         self.setMinimumHeight(140)
@@ -2337,40 +2350,112 @@ class TimelineReviewChart(QWidget):
         self.rank_order = rank_order or 'slow'
         self._hit_regions = []
         self._rank_regions = []
+        self._heat_regions = []
+        self._hover_index = -1
         QToolTip.hideText()
+        # 过滤/搜索会高频调用 set_records，这里只刷新到终值；入场生长动画由对话框 showEvent 触发 animate_in。
+        self._grow = 1.0
         self.update()
+
+    def _anim_allowed(self):
+        return (self._animations_enabled and self._anim is not None
+                and not os.environ.get('FRESH_NO_ANIM')
+                and bool(self.records) and self.chart_type != 'heatmap')
+
+    def animate_in(self):
+        # 入场生长动画；由 TimelineDialog.showEvent 调用（构造期 populate 不可见，不会触发）。
+        if not self._anim_allowed() or not self.isVisible():
+            self._grow = 1.0
+            self.update()
+            return
+        try:
+            self._anim.stop()
+            self._grow = 0.0
+            self._anim.start()
+        except Exception:
+            self._grow = 1.0
+            self.update()
+
+    def _on_grow(self, value):
+        try:
+            self._grow = max(0.0, min(1.0, float(value)))
+        except Exception:
+            self._grow = 1.0
+        self.update()
+
+    def set_animations_enabled(self, enabled):
+        self._animations_enabled = bool(enabled)
+
+    def stop_animation(self):
+        try:
+            if self._anim is not None:
+                self._anim.stop()
+        except Exception:
+            pass
+        self._grow = 1.0
+
+    def hideEvent(self, event):
+        self.stop_animation()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.setPen(QPen(QColor('#E8E8ED'), 1))
-        painter.setBrush(QColor('#FFFFFF'))
-        painter.drawRoundedRect(rect, 8, 8)
+        card = self._draw_card(painter, rect)
 
         title_font = QFont(painter.font())
         title_font.setPointSize(11)
         title_font.setWeight(QFont.DemiBold)
         painter.setFont(title_font)
-        painter.setPen(QColor('#263548'))
-        painter.drawText(rect.adjusted(16, 12, -16, 0), Qt.AlignLeft | Qt.AlignTop, self.title)
+        painter.setPen(QColor(self.TEXT))
+        painter.drawText(card.adjusted(16, 11, -16, 0), Qt.AlignLeft | Qt.AlignTop, self.title)
 
-        plot = rect.adjusted(16, 40, -16, -16)
+        plot = card.adjusted(16, 38, -16, -14)
         self._hit_regions = []
         self._rank_regions = []
-        if not self.records and self.chart_type != 'category':
+        self._heat_regions = []
+        ct = self.chart_type
+        if not self.records and ct != 'category':
             self._draw_empty(painter, plot)
-        elif self.chart_type == 'trend':
+        elif ct == 'trend':
             self._draw_trend(painter, plot)
-        elif self.chart_type == 'category':
+        elif ct == 'category':
             self._draw_category(painter, plot)
+        elif ct == 'heatmap':
+            self._draw_heatmap(painter, plot)
         else:
             self._draw_ranking(painter, plot)
         painter.end()
 
+    def _draw_card(self, painter, rect):
+        # 白卡 + 多层半透明描边模拟柔和阴影（不挂 QGraphicsDropShadowEffect，避免与列表 OpacityEffect 冲突）
+        card = QRectF(rect.left(), rect.top(), rect.width(), max(10.0, rect.height() - 3))
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(40, 70, 110, 13), 1))
+        painter.drawRoundedRect(card.adjusted(0.5, 2.0, -0.5, 2.0), 9, 9)
+        painter.setPen(QPen(QColor(40, 70, 110, 6), 1))
+        painter.drawRoundedRect(card.adjusted(0.0, 3.2, 0.0, 3.2), 9, 9)
+        painter.setPen(QPen(QColor(self.CARD_BORDER), 1))
+        painter.setBrush(QColor('#FFFFFF'))
+        painter.drawRoundedRect(card, 9, 9)
+        return card
+
     def _draw_empty(self, painter, rect):
         painter.setPen(QColor('#9AA8BA'))
         painter.drawText(rect, Qt.AlignCenter, '暂无完成记录')
+
+    def _grad_vert(self, cx, top, bottom, c_top, c_bottom):
+        g = QLinearGradient(cx, top, cx, bottom)
+        g.setColorAt(0.0, QColor(c_top))
+        g.setColorAt(1.0, QColor(c_bottom))
+        return QBrush(g)
+
+    def _grad_horiz(self, left, right, cy, c_left, c_right):
+        g = QLinearGradient(left, cy, right, cy)
+        g.setColorAt(0.0, QColor(c_left))
+        g.setColorAt(1.0, QColor(c_right))
+        return QBrush(g)
 
     def _draw_trend(self, painter, rect):
         buckets = defaultdict(lambda: {'created': 0, 'done': 0, 'selected_created': 0, 'selected_done': 0})
@@ -2393,33 +2478,59 @@ class TimelineReviewChart(QWidget):
 
         max_count = max(max(buckets[key]['created'], buckets[key]['done']) for key in keys) or 1
         label_h = 18
-        plot = rect.adjusted(0, 0, 0, -label_h)
-        group_w = plot.width() / max(1, len(keys))
-        bar_w = max(4, min(13, group_w * 0.24))
+        plot = rect.adjusted(0, 6, 0, -label_h)
         base_y = plot.bottom()
         chart_h = max(1, plot.height() - 4)
+        grow = self._grow
+
+        painter.setPen(QPen(QColor(self.GRID), 1, Qt.DashLine))
+        for gi in range(1, 4):
+            gy = base_y - chart_h * gi / 4
+            painter.drawLine(QPointF(plot.left(), gy), QPointF(plot.right(), gy))
+
+        group_w = plot.width() / max(1, len(keys))
+        bar_w = max(4, min(13, group_w * 0.24))
+        peak_idx = max(range(len(keys)), key=lambda i: max(buckets[keys[i]]['created'], buckets[keys[i]]['done']))
+        small_font = QFont(painter.font())
+        small_font.setPointSize(8)
 
         for idx, key in enumerate(keys):
             x = plot.left() + idx * group_w + group_w / 2
-            created_h = chart_h * buckets[key]['created'] / max_count
-            done_h = chart_h * buckets[key]['done'] / max_count
+            created_h = chart_h * buckets[key]['created'] / max_count * grow
+            done_h = chart_h * buckets[key]['done'] / max_count * grow
+            cb = QRectF(x - bar_w - 1, base_y - created_h, bar_w, created_h)
+            db = QRectF(x + 1, base_y - done_h, bar_w, done_h)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor('#C7C7CC') if self.selected_category else QColor('#2F7BFF'))
-            painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - created_h, bar_w, created_h), 3, 3)
-            painter.setBrush(QColor('#C7C7CC') if self.selected_category else QColor('#34C759'))
-            painter.drawRoundedRect(QRectF(x + 1, base_y - done_h, bar_w, done_h), 3, 3)
             if self.selected_category:
-                selected_created_h = chart_h * buckets[key]['selected_created'] / max_count
-                selected_done_h = chart_h * buckets[key]['selected_done'] / max_count
-                painter.setBrush(QColor('#2F7BFF'))
-                painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - selected_created_h, bar_w, selected_created_h), 3, 3)
-                painter.setBrush(QColor('#34C759'))
-                painter.drawRoundedRect(QRectF(x + 1, base_y - selected_done_h, bar_w, selected_done_h), 3, 3)
+                painter.setBrush(QColor(self.DIM))
+                painter.drawRoundedRect(cb, 3, 3)
+                painter.drawRoundedRect(db, 3, 3)
+                sc_h = chart_h * buckets[key]['selected_created'] / max_count * grow
+                sd_h = chart_h * buckets[key]['selected_done'] / max_count * grow
+                painter.setBrush(self._grad_vert(x, base_y - sc_h, base_y, self.BLUE_LIGHT, self.BLUE))
+                painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - sc_h, bar_w, sc_h), 3, 3)
+                painter.setBrush(self._grad_vert(x, base_y - sd_h, base_y, self.GREEN_LIGHT, self.GREEN))
+                painter.drawRoundedRect(QRectF(x + 1, base_y - sd_h, bar_w, sd_h), 3, 3)
+            else:
+                painter.setBrush(self._grad_vert(x, base_y - created_h, base_y, self.BLUE_LIGHT, self.BLUE))
+                painter.drawRoundedRect(cb, 3, 3)
+                painter.setBrush(self._grad_vert(x, base_y - done_h, base_y, self.GREEN_LIGHT, self.GREEN))
+                painter.drawRoundedRect(db, 3, 3)
+                painter.setBrush(QColor(255, 255, 255, 95))
+                if created_h > 3:
+                    painter.drawRoundedRect(QRectF(cb.left(), cb.top(), bar_w, 2.4), 2, 2)
+                if done_h > 3:
+                    painter.drawRoundedRect(QRectF(db.left(), db.top(), bar_w, 2.4), 2, 2)
+            if idx == peak_idx and len(keys) > 1 and grow > 0.82:
+                top_v = max(buckets[key]['created'], buckets[key]['done'])
+                if top_v > 0:
+                    painter.setFont(small_font)
+                    painter.setPen(QColor(self.PEAK_BLUE) if buckets[key]['created'] >= buckets[key]['done'] else QColor(self.PEAK_GREEN))
+                    ty = base_y - max(created_h, done_h) - 13
+                    painter.drawText(QRectF(x - group_w / 2, ty, group_w, 12), Qt.AlignCenter, str(top_v))
 
-        painter.setPen(QColor('#8B98AA'))
-        label_font = QFont(painter.font())
-        label_font.setPointSize(8)
-        painter.setFont(label_font)
+        painter.setPen(QColor(self.FAINT))
+        painter.setFont(small_font)
         step = max(1, len(keys) // 5)
         for idx, key in enumerate(keys):
             if idx % step != 0 and idx != len(keys) - 1:
@@ -2427,14 +2538,17 @@ class TimelineReviewChart(QWidget):
             x = rect.left() + idx * group_w
             painter.drawText(QRectF(x, rect.bottom() - label_h + 2, group_w, label_h), Qt.AlignCenter, period_label(key, self.granularity))
 
-        legend_font = QFont(painter.font())
-        legend_font.setPointSize(8)
-        painter.setFont(legend_font)
-        painter.setPen(QColor('#65758B'))
-        painter.fillRect(QRectF(rect.right() - 96, rect.top(), 8, 8), QColor('#2F7BFF'))
-        painter.drawText(QRectF(rect.right() - 84, rect.top() - 3, 38, 16), Qt.AlignLeft | Qt.AlignVCenter, '创建')
-        painter.fillRect(QRectF(rect.right() - 44, rect.top(), 8, 8), QColor('#34C759'))
-        painter.drawText(QRectF(rect.right() - 32, rect.top() - 3, 38, 16), Qt.AlignLeft | Qt.AlignVCenter, '完成')
+        painter.setFont(small_font)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self.BLUE))
+        painter.drawRoundedRect(QRectF(rect.right() - 96, rect.top(), 8, 8), 2, 2)
+        painter.setPen(QColor(self.MUTED))
+        painter.drawText(QRectF(rect.right() - 84, rect.top() - 3, 40, 16), Qt.AlignLeft | Qt.AlignVCenter, '创建')
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(self.GREEN))
+        painter.drawRoundedRect(QRectF(rect.right() - 44, rect.top(), 8, 8), 2, 2)
+        painter.setPen(QColor(self.MUTED))
+        painter.drawText(QRectF(rect.right() - 32, rect.top() - 3, 40, 16), Qt.AlignLeft | Qt.AlignVCenter, '完成')
 
     def _draw_category(self, painter, rect):
         groups = defaultdict(lambda: {'total': 0.0, 'count': 0})
@@ -2442,7 +2556,9 @@ class TimelineReviewChart(QWidget):
             category = record.get('category') or '未分类'
             groups[category]['total'] += record.get('duration_seconds') or 0
             groups[category]['count'] += 1
-        items = sorted(groups.items(), key=lambda item: item[1]['total'], reverse=True)
+        use_duration = any(data['total'] > 0 for data in groups.values())
+        metric_key = 'total' if use_duration else 'count'
+        items = sorted(groups.items(), key=lambda item: item[1][metric_key], reverse=True)
         if self.selected_category and self.selected_category in groups:
             head = items[:7]
             if self.selected_category not in [cat for cat, _ in head]:
@@ -2454,30 +2570,40 @@ class TimelineReviewChart(QWidget):
             self._draw_empty(painter, rect)
             return
 
-        self._hit_regions = []
-        max_total = max(data['total'] for _, data in items) or 1
+        all_total = sum(data[metric_key] for _, data in groups.items()) or 1
+        max_total = max(data[metric_key] for _, data in items) or 1
         row_h = max(18, min(28, rect.height() / max(1, len(items))))
-        label_w = min(118, rect.width() * 0.34)
+        label_w = min(118, rect.width() * 0.32)
+        track_w = max(2.0, rect.width() - label_w - 92)
+        grow = self._grow
         for idx, (category, data) in enumerate(items):
             y = rect.top() + idx * row_h
             dim = bool(self.selected_category and category != self.selected_category)
-            color = QColor('#8E8E93' if dim else '#2F7BFF')
-            text_color = QColor('#9AA8BA' if dim else '#263548')
-            bar_rect = QRectF(rect.left() + label_w, y + 4, max(2, (rect.width() - label_w - 70) * data['total'] / max_total), row_h - 8)
-            painter.setPen(text_color)
+            track = QRectF(rect.left() + label_w, y + 4, track_w, row_h - 8)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(47, 123, 255, 26))
+            painter.drawRoundedRect(track, 5, 5)
+            metric = data[metric_key]
+            bw = max(2.0, track_w * metric / max_total * grow)
+            bar_rect = QRectF(track.left(), track.top(), bw, track.height())
+            if dim:
+                painter.setBrush(self._grad_horiz(bar_rect.left(), track.right(), bar_rect.center().y(), self.DIM_LIGHT, self.DIM))
+            else:
+                painter.setBrush(self._grad_horiz(bar_rect.left(), track.right(), bar_rect.center().y(), self.BLUE, self.BLUE_LIGHT))
+            painter.drawRoundedRect(bar_rect, 5, 5)
+            painter.setPen(QColor(self.FAINT) if dim else QColor(self.TEXT))
             painter.drawText(
                 QRectF(rect.left(), y, label_w - 8, row_h),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 painter.fontMetrics().elidedText(category, Qt.ElideRight, int(label_w - 10)),
             )
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(color)
-            painter.drawRoundedRect(bar_rect, 5, 5)
-            painter.setPen(QColor('#9AA8BA' if dim else '#65758B'))
+            pct = round(metric / all_total * 100)
+            value_text = duration_text(data['total']) if use_duration else f"{data['count']} 项"
+            painter.setPen(QColor(self.FAINT) if dim else QColor(self.MUTED))
             painter.drawText(
-                QRectF(bar_rect.right() + 8, y, 62, row_h),
+                QRectF(track.right() + 8, y, 84, row_h),
                 Qt.AlignLeft | Qt.AlignVCenter,
-                duration_text(data['total']),
+                f"{value_text} · {pct}%",
             )
             self._hit_regions.append((QRectF(rect.left(), y, rect.width(), row_h), category))
 
@@ -2500,28 +2626,62 @@ class TimelineReviewChart(QWidget):
         if not records:
             self._draw_empty(painter, rect)
             return
+        records = records[:max(1, int(rect.height() // 21))]
         max_duration = max(r.get('duration_seconds') or 0 for r in records) or 1
-        row_h = max(19, min(29, rect.height() / max(1, len(records))))
-        label_w = min(160, rect.width() * 0.45)
+        row_h = max(20, min(32, rect.height() / max(1, len(records))))
+        badge = min(18.0, row_h - 6)
+        label_x = rect.left() + badge + 10
+        label_w = min(170, rect.width() * 0.42)
+        track_left = label_x + label_w
+        track_w = max(2.0, rect.right() - track_left - 76)
+        grow = self._grow
+        badge_font = QFont(painter.font())
+        badge_font.setPointSize(8)
+        badge_font.setWeight(QFont.Bold)
+        base_font = QFont(self.font())
         for idx, record in enumerate(records):
             y = rect.top() + idx * row_h
             duration = record.get('duration_seconds') or 0
             dim = bool(self.selected_category and record.get('category') != self.selected_category)
-            color = QColor('#C7C7CC' if dim else '#34C759')
-            text_color = QColor('#9AA8BA' if dim else '#263548')
-            painter.setPen(text_color)
+            if idx == self._hover_index:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(self.HOVER))
+                painter.drawRoundedRect(QRectF(rect.left() - 4, y + 1, rect.width() + 8, row_h - 2), 6, 6)
+            bc = QRectF(rect.left(), y + (row_h - badge) / 2, badge, badge)
+            painter.setPen(Qt.NoPen)
+            if not dim and idx == 0:
+                painter.setBrush(self._grad_vert(bc.center().x(), bc.top(), bc.bottom(), self.GOLD_LIGHT, self.GOLD))
+            elif not dim and idx == 1:
+                painter.setBrush(self._grad_vert(bc.center().x(), bc.top(), bc.bottom(), self.SILVER_LIGHT, self.SILVER))
+            elif not dim and idx == 2:
+                painter.setBrush(self._grad_vert(bc.center().x(), bc.top(), bc.bottom(), self.BRONZE_LIGHT, self.BRONZE))
+            else:
+                painter.setBrush(QColor(self.BADGE_BG))
+            painter.drawEllipse(bc)
+            painter.setFont(badge_font)
+            if not dim and idx < 3:
+                painter.setPen(QColor('#FFFFFF'))
+            else:
+                painter.setPen(QColor(self.FAINT) if dim else QColor(self.BLUE))
+            painter.drawText(bc, Qt.AlignCenter, str(idx + 1))
+            painter.setFont(base_font)
+            painter.setPen(QColor(self.FAINT) if dim else QColor(self.TEXT))
             title = record.get('title') or '未命名'
             painter.drawText(
-                QRectF(rect.left(), y, label_w - 8, row_h),
+                QRectF(label_x, y, label_w - 8, row_h),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 painter.fontMetrics().elidedText(title, Qt.ElideRight, int(label_w - 10)),
             )
-            bar_rect = QRectF(rect.left() + label_w, y + 5, max(2, (rect.width() - label_w - 76) * duration / max_duration), row_h - 10)
+            bw = max(2.0, track_w * duration / max_duration * grow)
+            bar_rect = QRectF(track_left, y + (row_h - 9) / 2, bw, 9)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(color)
-            painter.drawRoundedRect(bar_rect, 5, 5)
-            painter.setPen(QColor('#9AA8BA' if dim else '#65758B'))
-            painter.drawText(QRectF(bar_rect.right() + 8, y, 68, row_h), Qt.AlignLeft | Qt.AlignVCenter, duration_text(duration))
+            if dim:
+                painter.setBrush(QColor(self.DIM))
+            else:
+                painter.setBrush(self._grad_horiz(track_left, track_left + track_w, bar_rect.center().y(), self.GREEN, self.GREEN_LIGHT))
+            painter.drawRoundedRect(bar_rect, 4, 4)
+            painter.setPen(QColor(self.FAINT) if dim else QColor(self.MUTED))
+            painter.drawText(QRectF(track_left + track_w + 8, y, 70, row_h), Qt.AlignLeft | Qt.AlignVCenter, duration_text(duration))
             self._rank_regions.append((QRectF(rect.left(), y, rect.width(), row_h), record))
 
     def _tooltip_point(self, event):
@@ -2534,37 +2694,143 @@ class TimelineReviewChart(QWidget):
             return format_time_long(value.isoformat())
         return format_time_long(value or '')
 
+    def _heat_level(self, count, max_count):
+        if count <= 0:
+            return -1
+        if max_count <= 1:
+            return 3
+        if count == 1:
+            return 0
+        if count <= max(2, max_count * 0.34):
+            return 1
+        if count <= max(3, max_count * 0.67):
+            return 2
+        return 3
+
+    def _draw_heatmap(self, painter, rect):
+        counts = defaultdict(int)
+        latest = None
+        for record in self.records:
+            dt = record.get('completed_dt')
+            if not dt:
+                continue
+            day = dt.date()
+            counts[day] += 1
+            if latest is None or day > latest:
+                latest = day
+        if not counts:
+            self._draw_empty(painter, rect)
+            return
+        try:
+            today = datetime.now().date()
+        except Exception:
+            today = latest
+        end = today if (today and today >= latest) else latest
+
+        top_pad, left_pad, legend_h, gap = 16.0, 22.0, 16.0, 3.0
+        grid = QRectF(rect.left() + left_pad, rect.top() + top_pad,
+                      rect.width() - left_pad, rect.height() - top_pad - legend_h)
+        weeks = int((grid.width() + gap) // (13.0 + gap))
+        weeks = max(8, min(27, weeks))
+        cell = (grid.width() - gap * (weeks - 1)) / weeks
+        cell = max(6.0, min(15.0, cell))
+        cell = min(cell, (grid.height() - gap * 6) / 7)
+        end_monday = end - timedelta(days=end.weekday())
+        start_monday = end_monday - timedelta(weeks=weeks - 1)
+        max_count = max(counts.values())
+
+        painter.setPen(Qt.NoPen)
+        small_font = QFont(painter.font())
+        small_font.setPointSize(7)
+        last_month = None
+        for col in range(weeks):
+            week_start = start_monday + timedelta(weeks=col)
+            x = grid.left() + col * (cell + gap)
+            if week_start.month != last_month:
+                last_month = week_start.month
+                painter.setPen(QColor(self.FAINT))
+                painter.setFont(small_font)
+                painter.drawText(QRectF(x, rect.top(), 32, top_pad), Qt.AlignLeft | Qt.AlignVCenter, f'{week_start.month}月')
+                painter.setPen(Qt.NoPen)
+            for row in range(7):
+                day = week_start + timedelta(days=row)
+                if today and day > today:
+                    continue
+                y = grid.top() + row * (cell + gap)
+                count = counts.get(day, 0)
+                level = self._heat_level(count, max_count)
+                painter.setBrush(QColor(self.HEAT_EMPTY) if level < 0 else QColor(self.HEAT_SCALE[level]))
+                cr = QRectF(x, y, cell, cell)
+                painter.drawRoundedRect(cr, 2, 2)
+                self._heat_regions.append((cr, day, count))
+
+        painter.setFont(small_font)
+        painter.setPen(QColor(self.FAINT))
+        for row, lab in ((0, '一'), (2, '三'), (4, '五')):
+            y = grid.top() + row * (cell + gap)
+            painter.drawText(QRectF(rect.left(), y, left_pad - 4, cell), Qt.AlignRight | Qt.AlignVCenter, lab)
+
+        lx = rect.right() - 92
+        ly = rect.bottom() - legend_h + 2
+        painter.setPen(QColor(self.FAINT))
+        painter.drawText(QRectF(lx - 22, ly, 20, 12), Qt.AlignRight | Qt.AlignVCenter, '少')
+        painter.setPen(Qt.NoPen)
+        for i in range(4):
+            painter.setBrush(QColor(self.HEAT_SCALE[i]))
+            painter.drawRoundedRect(QRectF(lx + i * 15, ly + 1, 11, 11), 2, 2)
+        painter.setPen(QColor(self.FAINT))
+        painter.drawText(QRectF(lx + 4 * 15 + 2, ly, 18, 12), Qt.AlignLeft | Qt.AlignVCenter, '多')
+
     def mouseMoveEvent(self, event):
+        pos = QPointF(event.position()) if hasattr(event, 'position') else QPointF(event.pos())
         if self.chart_type == 'ranking':
-            pos = QPointF(event.position()) if hasattr(event, 'position') else QPointF(event.pos())
-            for rect, record in self._rank_regions:
-                if rect.contains(pos):
-                    title = record.get('title') or '未命名'
-                    category = record.get('category') or '未分类'
-                    tooltip = (
-                        f'{title}\n'
-                        f'分类：{category}\n'
-                        f'耗时：{duration_text(record.get("duration_seconds") or 0)}\n'
-                        f'创建：{self._format_record_dt(record.get("created_dt")) or "未知"}\n'
-                        f'完成：{self._format_record_dt(record.get("completed_dt")) or "未知"}'
-                    )
-                    QToolTip.showText(self._tooltip_point(event), tooltip, self)
-                    return
-            QToolTip.hideText()
+            hit = -1
+            hovered = None
+            for i, (region, record) in enumerate(self._rank_regions):
+                if region.contains(pos):
+                    hit, hovered = i, record
+                    break
+            if hit != self._hover_index:
+                self._hover_index = hit
+                self.update()
+            if hovered is not None:
+                title = hovered.get('title') or '未命名'
+                category = hovered.get('category') or '未分类'
+                tooltip = (
+                    f'{title}\n'
+                    f'分类：{category}\n'
+                    f'耗时：{duration_text(hovered.get("duration_seconds") or 0)}\n'
+                    f'创建：{self._format_record_dt(hovered.get("created_dt")) or "未知"}\n'
+                    f'完成：{self._format_record_dt(hovered.get("completed_dt")) or "未知"}'
+                )
+                QToolTip.showText(self._tooltip_point(event), tooltip, self)
+            else:
+                QToolTip.hideText()
+        elif self.chart_type == 'heatmap':
+            shown = False
+            for region, day, count in self._heat_regions:
+                if region.contains(pos):
+                    QToolTip.showText(self._tooltip_point(event), f'{day.month}月{day.day}日 · 完成 {count} 件', self)
+                    shown = True
+                    break
+            if not shown:
+                QToolTip.hideText()
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
         QToolTip.hideText()
+        if self._hover_index != -1:
+            self._hover_index = -1
+            self.update()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        if self.chart_type != 'category':
-            return super().mousePressEvent(event)
         pos = QPointF(event.position()) if hasattr(event, 'position') else QPointF(event.pos())
-        for rect, category in self._hit_regions:
-            if rect.contains(pos):
-                self.category_selected.emit(category)
-                return
+        if self.chart_type == 'category':
+            for region, category in self._hit_regions:
+                if region.contains(pos):
+                    self.category_selected.emit(category)
+                    return
         super().mousePressEvent(event)
 
 
@@ -2647,15 +2913,12 @@ class TimelineItem(QFrame):
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
             return pix
-        pixmap = QPixmap(str(self.file_path))
-        if pixmap.isNull():
+        pixmap = load_scaled_pixmap(self.file_path, self.THUMB_W, self.THUMB_H)
+        if pixmap is None:
             pix = QPixmap(self.THUMB_W, self.THUMB_H)
             pix.fill(QColor("#F5F5F7"))
             return pix
-        return pixmap.scaled(
-            self.THUMB_W, self.THUMB_H,
-            Qt.KeepAspectRatio, Qt.FastTransformation
-        )
+        return pixmap
 
     def mouseDoubleClickEvent(self, event):
         self.open_requested.emit(self.attachment['id'])
@@ -2785,8 +3048,20 @@ class TimelineDialog(QDialog):
             | Qt.WindowCloseButtonHint
         )
         self.setMinimumSize(720, 520)
-        self.resize(860, 640)
+        # 初始尺寸适配屏幕可用区域（之前写死 1004x968，超出常见笔记本屏高）
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self.resize(min(1004, avail.width() - 80), min(968, avail.height() - 80))
+        else:
+            self.resize(1004, 700)
         self._updating_category_filter = False
+        # 防抖：搜索框/日期每个变更都全量重建列表（含读盘解码缩略图），
+        # 停顿 250ms 再刷新
+        self._populate_debounce = QTimer(self)
+        self._populate_debounce.setSingleShot(True)
+        self._populate_debounce.setInterval(250)
+        self._populate_debounce.timeout.connect(self._populate)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -2845,14 +3120,14 @@ class TimelineDialog(QDialog):
         self.start_date_edit.setDisplayFormat('yyyy-MM-dd')
         self.start_date_edit.setMinimumDate(QDate(1900, 1, 1))
         self.start_date_edit.setMaximumDate(today.addYears(20))
-        self.start_date_edit.dateChanged.connect(lambda _: self._populate())
+        self.start_date_edit.dateChanged.connect(lambda _: self._populate_debounce.start())
         self.end_date_edit = QDateEdit(today)
         self.end_date_edit.setObjectName('timeline_date_edit')
         self.end_date_edit.setCalendarPopup(True)
         self.end_date_edit.setDisplayFormat('yyyy-MM-dd')
         self.end_date_edit.setMinimumDate(QDate(1900, 1, 1))
         self.end_date_edit.setMaximumDate(today.addYears(20))
-        self.end_date_edit.dateChanged.connect(lambda _: self._populate())
+        self.end_date_edit.dateChanged.connect(lambda _: self._populate_debounce.start())
         from_label = QLabel(tr('从'))
         from_label.setObjectName('timeline_date_label')
         to_label = QLabel(tr('到'))
@@ -2902,27 +3177,41 @@ class TimelineDialog(QDialog):
 
         stats_row = QHBoxLayout()
         stats_row.setSpacing(10)
-        self.count_value, count_card = self._make_stat('完成', '0')
-        self.avg_value, avg_card = self._make_stat('平均耗时', '0')
-        self.total_value, total_card = self._make_stat('总耗时', '0')
-        self.span_value, span_card = self._make_stat('跨度', '0')
+        self.count_value, self.count_sub, count_card = self._make_stat('完成', '0')
+        self.streak_value, self.streak_sub, streak_card = self._make_stat('连续打卡', '0', accent=True)
+        self.avg_value, self.avg_sub, avg_card = self._make_stat('活跃天数', '0')
+        self.total_value, self.total_sub, total_card = self._make_stat('总投入', '0')
+        self.span_value, self.span_sub, span_card = self._make_stat('跨度', '0')
         stats_row.addWidget(count_card)
+        stats_row.addWidget(streak_card)
         stats_row.addWidget(avg_card)
         stats_row.addWidget(total_card)
         stats_row.addWidget(span_card)
         review_layout.addLayout(stats_row)
+        review_layout.addWidget(self._make_insight_strip())
 
         chart_grid = QGridLayout()
         chart_grid.setContentsMargins(0, 0, 0, 0)
         chart_grid.setHorizontalSpacing(10)
         chart_grid.setVerticalSpacing(10)
+        self.heatmap_chart = TimelineReviewChart('heatmap', '活跃热力图')
         self.trend_chart = TimelineReviewChart('trend', '创建 / 完成')
-        self.category_chart = TimelineReviewChart('category', '分类耗时')
+        self.category_chart = TimelineReviewChart('category', '分类投入')
         self.ranking_chart = TimelineReviewChart('ranking', '耗时排行')
         self.category_chart.category_selected.connect(self._select_category_from_chart)
-        chart_grid.addWidget(self.trend_chart, 0, 0)
-        chart_grid.addWidget(self.category_chart, 0, 1)
-        chart_grid.addWidget(self.ranking_chart, 1, 0, 1, 2)
+        self.charts = [self.heatmap_chart, self.trend_chart, self.category_chart, self.ranking_chart]
+        self.heatmap_chart.setMinimumHeight(120)
+        self.heatmap_chart.setMaximumHeight(142)
+        self.trend_chart.setMinimumHeight(150)
+        self.trend_chart.setMaximumHeight(162)
+        self.category_chart.setMinimumHeight(150)
+        self.category_chart.setMaximumHeight(162)
+        self.ranking_chart.setMinimumHeight(150)
+        self.ranking_chart.setMaximumHeight(172)
+        chart_grid.addWidget(self.heatmap_chart, 0, 0, 1, 2)
+        chart_grid.addWidget(self.trend_chart, 1, 0)
+        chart_grid.addWidget(self.category_chart, 1, 1)
+        chart_grid.addWidget(self.ranking_chart, 2, 0, 1, 2)
         review_layout.addLayout(chart_grid)
 
         detail_title = QLabel('归档明细')
@@ -2934,26 +3223,224 @@ class TimelineDialog(QDialog):
         self.list.setFocusPolicy(Qt.NoFocus)
         self.list.setSelectionMode(QListWidget.NoSelection)
 
+        review_scroll = QScrollArea()
+        review_scroll.setObjectName('timeline_review_scroll')
+        review_scroll.setWidgetResizable(True)
+        review_scroll.setFrameShape(QFrame.NoFrame)
+        review_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        review_scroll.setWidget(review_box)
+        review_scroll.setMaximumHeight(648)
+        self.list.setMinimumHeight(140)
+
         layout.addWidget(header_box)
-        layout.addWidget(review_box)
+        layout.addWidget(review_scroll)
         layout.addWidget(detail_title)
         layout.addWidget(self.list, 1)
 
         self._populate()
 
-    def _make_stat(self, label, value):
+    def _make_stat(self, label, value, sub='', accent=False):
         card = QFrame()
-        card.setObjectName('timeline_stat_card')
+        card.setObjectName('timeline_streak_card' if accent else 'timeline_stat_card')
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 9, 12, 9)
-        layout.setSpacing(2)
+        layout.setContentsMargins(13, 8, 13, 8)
+        layout.setSpacing(1)
         value_label = QLabel(value)
-        value_label.setObjectName('timeline_stat_value')
+        value_label.setObjectName('timeline_streak_value' if accent else 'timeline_stat_value')
         label_widget = QLabel(label)
         label_widget.setObjectName('timeline_stat_label')
+        sub_label = QLabel(sub)
+        sub_label.setObjectName('timeline_stat_sub')
+        sub_label.setTextFormat(Qt.RichText)
         layout.addWidget(value_label)
         layout.addWidget(label_widget)
-        return value_label, card
+        layout.addWidget(sub_label)
+        return value_label, sub_label, card
+
+    def _make_insight_strip(self):
+        strip = QFrame()
+        strip.setObjectName('timeline_insight_strip')
+        strip_layout = QHBoxLayout(strip)
+        strip_layout.setContentsMargins(16, 9, 16, 9)
+        strip_layout.setSpacing(16)
+        self.insight_labels = []
+        self.insight_seps = []
+        for idx in range(3):
+            lab = QLabel('')
+            lab.setObjectName('timeline_insight_label')
+            lab.setTextFormat(Qt.RichText)
+            lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            strip_layout.addWidget(lab, 1)
+            self.insight_labels.append(lab)
+            if idx < 2:
+                sep = QFrame()
+                sep.setObjectName('timeline_insight_sep')
+                sep.setFixedWidth(1)
+                strip_layout.addWidget(sep)
+                self.insight_seps.append(sep)
+        self.insight_strip = strip
+        return strip
+
+    @staticmethod
+    def _sub_html(text, color):
+        return f'<span style="color:{color};">{html_escape(str(text))}</span>'
+
+    def _delta_sub(self, insights, count, active_days):
+        delta = insights.get('period_delta')
+        if delta is None:
+            if active_days:
+                return self._sub_html(f'日均 {round(count / active_days, 1)} 件', '#8B98AA')
+            return ''
+        prev = insights.get('prev_count', 0)
+        if prev == 0:
+            return self._sub_html(f'本期新增 {count} 件 🎉', '#34C759')
+        if delta > 0:
+            return self._sub_html(f'较上期 +{delta}', '#34C759')
+        if delta < 0:
+            return self._sub_html(f'较上期 {delta}', '#8B98AA')
+        return self._sub_html('与上期相当', '#8B98AA')
+
+    def _compute_insights(self, all_records, summary_records, range_bounds, granularity):
+        info = {}
+        try:
+            today = datetime.now().date()
+        except Exception:
+            today = None
+        done_days = sorted({r['completed_dt'].date() for r in all_records if r.get('completed_dt')})
+        day_set = set(done_days)
+        streak = 0
+        if day_set and today is not None:
+            cursor = today if today in day_set else (today - timedelta(days=1))
+            while cursor in day_set:
+                streak += 1
+                cursor = cursor - timedelta(days=1)
+        best = run = 0
+        prev_day = None
+        for day in done_days:
+            run = run + 1 if (prev_day is not None and (day - prev_day).days == 1) else 1
+            best = max(best, run)
+            prev_day = day
+        info['streak'] = streak
+        info['best_streak'] = best
+        info['today_done'] = bool(today is not None and today in day_set)
+        life_total = len(all_records)
+        info['life_total'] = life_total
+        milestones = [10, 25, 50, 100, 200, 365, 500, 1000, 2000, 5000]
+        nxt = next((m for m in milestones if m > life_total), None)
+        info['next_milestone'] = nxt
+        info['milestone_remaining'] = (nxt - life_total) if nxt else 0
+        start, end_excl = range_bounds if range_bounds else (None, None)
+        if start is not None:
+            try:
+                end_eff = end_excl or datetime.now()
+                span = end_eff - start
+                prev_start = start - span
+                info['prev_count'] = sum(
+                    1 for r in all_records
+                    if r.get('completed_dt') and prev_start <= r['completed_dt'] < start
+                )
+                info['period_delta'] = len(summary_records) - info['prev_count']
+            except Exception:
+                info['period_delta'] = None
+        else:
+            info['period_delta'] = None
+        s_days = {r['completed_dt'].date() for r in summary_records if r.get('completed_dt')}
+        info['active_days'] = len(s_days)
+        per_day = defaultdict(int)
+        for r in summary_records:
+            if r.get('completed_dt'):
+                per_day[r['completed_dt'].date()] += 1
+        if per_day:
+            day, cnt = max(per_day.items(), key=lambda kv: kv[1])
+            info['peak_day'] = day
+            info['peak_day_count'] = cnt
+        cat_total = defaultdict(float)
+        cat_count = defaultdict(int)
+        total_dur = 0.0
+        for r in summary_records:
+            seconds = r.get('duration_seconds') or 0
+            category = r.get('category') or '未分类'
+            cat_total[category] += seconds
+            cat_count[category] += 1
+            total_dur += seconds
+        if cat_total and total_dur > 0:
+            cat, seconds = max(cat_total.items(), key=lambda kv: kv[1])
+            info['top_category'] = cat
+            info['top_category_pct'] = round(seconds / total_dur * 100)
+            info['top_category_metric'] = '时长'
+        elif cat_count:
+            cat, count = max(cat_count.items(), key=lambda kv: kv[1])
+            info['top_category'] = cat
+            info['top_category_pct'] = round(count / max(1, sum(cat_count.values())) * 100)
+            info['top_category_metric'] = '数量'
+        durs = [
+            r['duration_seconds']
+            for r in sorted(summary_records, key=lambda r: r.get('completed_dt') or datetime.min)
+            if (r.get('duration_seconds') or 0) >= 60
+        ]
+        if len(durs) >= 6:
+            half = len(durs) // 2
+            early = durs[:half]
+            recent = durs[half:]
+            early_avg = sum(early) / len(early)
+            recent_avg = sum(recent) / len(recent)
+            if early_avg > 0:
+                info['speed_pct'] = round((early_avg - recent_avg) / early_avg * 100)
+        hours = defaultdict(int)
+        for r in summary_records:
+            if r.get('completed_dt'):
+                hours[r['completed_dt'].hour] += 1
+        if hours:
+            info['peak_hour'] = max(hours.items(), key=lambda kv: kv[1])[0]
+        return info
+
+    def _render_insight_strip(self, insights):
+        msgs = []
+        nxt = insights.get('next_milestone')
+        life = insights.get('life_total', 0)
+        if nxt:
+            rem = insights.get('milestone_remaining', 0)
+            msgs.append(f'🏆 累计完成 <b>{life}</b> 件 · 距 {nxt} 件还差 <b>{rem}</b> 件')
+        elif life:
+            msgs.append(f'🏆 累计完成 <b>{life}</b> 件，已越过所有里程碑')
+        peak_day = insights.get('peak_day')
+        peak_count = insights.get('peak_day_count')
+        if peak_day and peak_count:
+            msgs.append(f'⚡ 最高产的一天：{peak_day.month}月{peak_day.day}日，完成 <b>{peak_count}</b> 件')
+        top_cat = insights.get('top_category')
+        top_pct = insights.get('top_category_pct')
+        if top_cat and top_pct:
+            metric = '时长' if insights.get('top_category_metric') == '时长' else '数量'
+            msgs.append(f'🎯 最多来自 <b>#{html_escape(str(top_cat))}</b>，占 {top_pct}% {metric}')
+        peak_hour = insights.get('peak_hour')
+        if peak_hour is not None and len(msgs) < 3:
+            msgs.append(f'🕒 {peak_hour} 点前后是你的高产时刻')
+        labels = getattr(self, 'insight_labels', [])
+        any_shown = False
+        for idx, lab in enumerate(labels):
+            if idx < len(msgs):
+                lab.setText(msgs[idx])
+                lab.setVisible(True)
+                any_shown = True
+            else:
+                lab.setText('')
+                lab.setVisible(False)
+        for idx, sep in enumerate(getattr(self, 'insight_seps', [])):
+            sep.setVisible(idx + 1 < len(msgs))
+        if hasattr(self, 'insight_strip'):
+            self.insight_strip.setVisible(any_shown)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, '_entrance_played', False):
+            self._entrance_played = True
+            for chart in getattr(self, 'charts', []):
+                chart.animate_in()
+
+    def closeEvent(self, event):
+        for chart in getattr(self, 'charts', []):
+            chart.stop_animation()
+        super().closeEvent(event)
 
     def _sync_custom_range_visibility(self):
         self.custom_range_widget.setVisible((self.range_filter.currentData() or 'all') == 'custom')
@@ -2965,7 +3452,7 @@ class TimelineDialog(QDialog):
     def _on_category_search_changed(self):
         if self._updating_category_filter:
             return
-        self._populate()
+        self._populate_debounce.start()
 
     def _category_query(self):
         editor = self.category_filter.lineEdit()
@@ -3123,22 +3610,69 @@ class TimelineDialog(QDialog):
         else:
             self._populate()
 
-    def _update_summary(self, records, active_records):
+    def _update_summary(self, records, active_records, all_records, range_bounds, granularity):
         category_query = self._category_query()
         summary_records = active_records if category_query else records
+        insights = self._compute_insights(all_records, summary_records, range_bounds, granularity)
         count = len(summary_records)
         total = sum(record.get('duration_seconds') or 0 for record in summary_records)
-        avg = total / count if count else 0
-        self.count_value.setText(str(count))
-        self.avg_value.setText(duration_text(avg))
-        self.total_value.setText(duration_text(total))
+        active_days = insights.get('active_days', 0)
+        shot_count = sum(1 for record in summary_records if record.get('kind') == 'attachment')
+        note_count = sum(1 for record in summary_records if record.get('kind') == 'note')
+        done_dates = [r['completed_dt'].date() for r in summary_records if r.get('completed_dt')]
         if summary_records:
-            first = min(record['created_dt'] for record in summary_records if record.get('created_dt'))
-            last = max(record['completed_dt'] for record in summary_records if record.get('completed_dt'))
-            span_days = max(1, (last.date() - first.date()).days + 1)
-            self.span_value.setText(f'{span_days} 天')
+            firsts = [r['created_dt'] for r in summary_records if r.get('created_dt')]
+            lasts = [r['completed_dt'] for r in summary_records if r.get('completed_dt')]
+            span_days = max(1, (max(lasts).date() - min(firsts).date()).days + 1) if (firsts and lasts) else 0
         else:
-            self.span_value.setText('0 天')
+            span_days = 0
+
+        self.count_value.setText(str(count))
+        self.count_sub.setText(self._delta_sub(insights, count, active_days))
+
+        streak = insights.get('streak', 0)
+        best = insights.get('best_streak', 0)
+        self.streak_value.setText(f'{streak} 天')
+        if streak > 0 and insights.get('today_done'):
+            self.streak_sub.setText(self._sub_html(f'🔥 最长 {best} 天', '#FF9F0A'))
+        elif streak > 0:
+            self.streak_sub.setText(self._sub_html(f'今天再完成 1 条续上 · 最长 {best} 天', '#8B98AA'))
+        else:
+            self.streak_sub.setText(self._sub_html('归档 1 条开启连续记录 🔥', '#8B98AA'))
+
+        self.avg_value.setText(f'{active_days} 天' if count else '—')
+        if span_days and active_days:
+            pct = round(active_days / span_days * 100)
+            tail = ' 👏' if pct >= 80 else ''
+            self.avg_sub.setText(self._sub_html(f'{span_days} 天里活跃 {pct}%{tail}', '#8B98AA'))
+        else:
+            self.avg_sub.setText('')
+
+        if not count:
+            self.total_value.setText('—')
+            self.total_sub.setText('')
+        elif total > 0:
+            self.total_value.setText(duration_text(total))
+            if active_days:
+                self.total_sub.setText(self._sub_html(f'日均投入 {duration_text(total / active_days)}', '#8B98AA'))
+            else:
+                self.total_sub.setText('')
+        else:
+            self.total_value.setText(f'{count} 项')
+            self.total_sub.setText(self._sub_html(f'附件 {shot_count} · 备忘 {note_count}', '#8B98AA'))
+
+        self.span_value.setText(f'{span_days} 天' if count else '—')
+        if done_dates:
+            first_done = min(done_dates).strftime('%m/%d')
+            last_done = max(done_dates).strftime('%m/%d')
+            if first_done == last_done:
+                self.span_sub.setText(self._sub_html(first_done, '#8B98AA'))
+            else:
+                self.span_sub.setText(self._sub_html(f'{first_done} 至 {last_done}', '#8B98AA'))
+        else:
+            self.span_sub.setText('')
+
+        self._render_insight_strip(insights)
 
     def _populate(self):
         self.list.clear()
@@ -3152,10 +3686,9 @@ class TimelineDialog(QDialog):
         rank_order = self.rank_filter.currentData() or 'slow'
         chart_records = self._chart_records(records, active_records, selected_category, category_query)
 
-        self.trend_chart.set_records(chart_records, selected_category, granularity, rank_order)
-        self.category_chart.set_records(chart_records, selected_category, granularity, rank_order)
-        self.ranking_chart.set_records(chart_records, selected_category, granularity, rank_order)
-        self._update_summary(records, active_records)
+        for chart in self.charts:
+            chart.set_records(chart_records, selected_category, granularity, rank_order)
+        self._update_summary(records, active_records, all_records, self._range_bounds(), granularity)
 
         list_records = self._timeline_records_for_list(records, active_records)
         count_items = [record.get('item') for record in active_records if record.get('item')]
@@ -3440,14 +3973,17 @@ class RecentlyDeletedDialog(QDialog):
         if reply != QMessageBox.Yes:
             return
         changed = False
-        for data in items:
-            if data.get('kind') == 'note':
-                note = data.get('note') or {}
-                changed = self.storage.hard_delete_note(note.get('id')) or changed
-            else:
-                note = data.get('note') or {}
-                att = data.get('attachment') or {}
-                changed = self.storage.hard_remove_attachment(note.get('id'), att.get('id')) or changed
+        # batch()：N 项删除只在最后落盘一次。之前每项都全量序列化+加密
+        # +写盘，几十项就能让界面冻结数秒。
+        with self.storage.batch():
+            for data in items:
+                if data.get('kind') == 'note':
+                    note = data.get('note') or {}
+                    changed = self.storage.hard_delete_note(note.get('id')) or changed
+                else:
+                    note = data.get('note') or {}
+                    att = data.get('attachment') or {}
+                    changed = self.storage.hard_remove_attachment(note.get('id'), att.get('id')) or changed
         if changed:
             self._populate()
             self.state_changed.emit()
@@ -3476,6 +4012,79 @@ class RecentlyDeletedDialog(QDialog):
         if ok:
             self._populate()
             self.state_changed.emit()
+
+
+# ============ 通用后台任务 ============
+
+class WorkerCancelled(Exception):
+    """后台任务被用户取消。"""
+
+
+class FuncWorker(QThread):
+    """把一个函数放到工作线程执行，配合模态进度对话框使用。
+
+    导出/导入备份、重加密这类长 I/O 之前全部在 UI 线程同步执行，
+    数据量大时主窗口直接"未响应"。
+    """
+    progressed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self.result = None
+        self.error = None
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def check_cancelled(self):
+        if self.cancelled:
+            raise WorkerCancelled()
+
+    def report(self, text):
+        self.progressed.emit(str(text))
+
+    def run(self):
+        try:
+            self.result = self._fn(self)
+        except WorkerCancelled:
+            self.cancelled = True
+        except Exception as exc:
+            self.error = exc
+            logger.exception('后台任务失败')
+
+
+def run_with_progress(parent, title, label, fn, cancellable=True):
+    """在工作线程跑 fn(worker)，期间显示模态进度对话框。
+
+    返回完成后的 FuncWorker（检查 .cancelled / .error / .result）。
+    模态对话框同时阻止用户在任务进行中改动数据，避免并发修改。
+    """
+    worker = FuncWorker(fn)
+    dlg = QProgressDialog(label, tr('取消') if cancellable else '', 0, 0, parent)
+    dlg.setWindowTitle(title)
+    dlg.setWindowModality(Qt.WindowModal)
+    dlg.setMinimumDuration(300)
+    dlg.setAutoClose(False)
+    dlg.setAutoReset(False)
+    if not cancellable:
+        dlg.setCancelButton(None)
+    worker.progressed.connect(dlg.setLabelText)
+    if cancellable:
+        dlg.canceled.connect(worker.cancel)
+    loop = QEventLoop()
+    worker.finished.connect(loop.quit)
+    worker.start()
+    dlg.show()
+    loop.exec()
+    try:
+        dlg.canceled.disconnect()
+    except Exception:
+        pass
+    dlg.close()
+    dlg.deleteLater()
+    return worker
 
 
 # ============ 文件追踪扫描 ============
@@ -3557,14 +4166,13 @@ class FtrackScanWorker(QThread):
             # 2. Everything（如果可用）按 tag + name 定位
             if tag and name and ftrack.everything_mode(es_path) and self.scan_settings.get('use_everything', True):
                 self.phase_changed.emit('用 Everything 查找带标签的文件')
-                found_map = ftrack._scan_via_everything(
+                found_map = ftrack.scan_via_everything(
                     {tag: name},
                     drive_hints=[hint] if hint else None,
                     on_found=None,
                     cancel=self._is_cancelled,
                     progress=lambda d: self.progress.emit(d),
                     phase=lambda p: self.phase_changed.emit(p),
-                    stream=ftrack.ADS_STREAM,
                     es_path=es_path,
                 )
                 if found_map.get(tag):
@@ -3631,8 +4239,10 @@ class FtrackScanWorker(QThread):
                     return
                 if hash_matches:
                     result['candidates'] = hash_matches
-        except Exception:
-            pass
+        except Exception as exc:
+            # 扫描出错和"未找到"必须可区分，否则任何编码/权限问题都被伪装成文件不存在
+            logger.exception('重点扫描失败')
+            result['error'] = str(exc)
         self.finished_with_result.emit(result)
 
 
@@ -3740,8 +4350,17 @@ class AutoRecoveryWorker(QThread):
                                 es_path=es_path,
                             ) or []
                         )
+                    # 两个来源会命中同一个文件（快速根目录 + Everything 索引），
+                    # 不去重会让"唯一命中"判定失败，还把同一文件 hash 两遍
+                    deduped = {}
+                    for p in (paths or []):
+                        try:
+                            key = os.path.normcase(os.path.normpath(p))
+                        except Exception:
+                            key = p
+                        deduped.setdefault(key, p)
                     hash_matches = [
-                        p for p in (paths or [])
+                        p for p in deduped.values()
                         if ftrack.path_matches_hash(p, tracking)
                     ]
                     if len(hash_matches) == 1:
@@ -3758,14 +4377,13 @@ class AutoRecoveryWorker(QThread):
             }
             if everything_name_targets and not self._cancel and ftrack.everything_mode(es_path):
                 on_phase(f'用 Everything ({ftrack.everything_mode(es_path)}) 加速查找')
-                found_by_tag = ftrack._scan_via_everything(
+                found_by_tag = ftrack.scan_via_everything(
                     everything_name_targets,
                     drive_hints=self.drive_hints,
                     on_found=on_found,
                     cancel=lambda: self._cancel,
                     progress=on_progress,
                     phase=on_phase,
-                    stream=ftrack.ADS_STREAM,
                     es_path=es_path,
                 )
                 found.update(found_by_tag or {})
@@ -3802,6 +4420,7 @@ class AutoRecoveryWorker(QThread):
                 )
             self.finished_clean.emit(self._dirs_scanned)
         except Exception:
+            logger.exception('自动找回扫描失败')
             self.finished_clean.emit(0)
 
 
@@ -3843,7 +4462,7 @@ class ScanSettingsDialog(QDialog):
         es_path_row.setSpacing(8)
         es_path_row.addWidget(QLabel('es.exe 路径:'))
         self.es_path_edit = QLineEdit(self.settings.get('es_path', ''))
-        self.es_path_edit.setPlaceholderText('留空 = 自动检测（PATH + Everything 安装目录）')
+        self.es_path_edit.setPlaceholderText('留空 = 自动检测 PATH / 程序目录 / 常见安装目录')
         es_path_row.addWidget(self.es_path_edit, 1)
         es_browse = QPushButton('浏览...')
         es_browse.clicked.connect(self._browse_es)
@@ -3931,13 +4550,14 @@ class ScanSettingsDialog(QDialog):
             text = f'✅ es.exe 已就绪: {es_path}\n    ⚠️ Everything 主程序未运行，请先打开 Everything 才能加速'
             color = '#FF9500'
         else:
-            ed = ftrack._find_running_everything_dir()
-            tip = f'\n    你的 Everything 装在: {ed}' if ed else ''
             text = ('❌ 无 Everything 可用\n'
-                    '    建议：1) 启动 Everything.exe；或 2) 下载 es.exe 放到 PATH / 指定路径' + tip)
+                    '    建议：1) 启动 Everything.exe 使用 IPC；或 2) 手动指定 es.exe / 放到 PATH')
             color = '#FF3B30'
         self.es_status_label.setText(text)
         self.es_status_label.setStyleSheet(f'color: {color};')
+
+    def _update_everything_dir_tip_async(self):
+        return
 
     def _open_download_page(self):
         QDesktopServices.openUrl(QUrl(ftrack.EVERYTHING_DOWNLOAD_URL))
@@ -3945,7 +4565,7 @@ class ScanSettingsDialog(QDialog):
     def _browse_es(self):
         start = self.es_path_edit.text().strip()
         if not start:
-            start = ftrack._find_running_everything_dir() or ''
+            start = ftrack.find_running_everything_dir() or ''
         f, _ = QFileDialog.getOpenFileName(self, '选择 es.exe', start, 'es.exe (es.exe);;所有文件 (*.*)')
         if f:
             self.es_path_edit.setText(f)
@@ -4031,13 +4651,7 @@ class CustomizationDialog(QDialog):
         directory = ensure_custom_files()
         text_config_path()
         custom_qss_path()
-        if sys.platform == 'win32':
-            try:
-                os.startfile(str(directory))
-                return
-            except Exception:
-                pass
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        open_local_path(directory)
 
     def _build_text_tab(self):
         page = QWidget()
@@ -4138,26 +4752,43 @@ class CustomizationDialog(QDialog):
         self._populate_text_table()
 
     def _missing_placeholders(self):
-        missing = []
+        problems = []
         for source, default in DEFAULT_TEXTS.items():
             expected = set(re.findall(r'\{([A-Za-z_][A-Za-z0-9_]*)\}', source))
-            if not expected:
-                continue
             value = self._all_texts.get(source, default)
             actual = set(re.findall(r'\{([A-Za-z_][A-Za-z0-9_]*)\}', value))
-            diff = sorted(expected - actual)
-            if diff:
-                missing.append(f'{source} -> {", ".join(diff)}')
-        return missing
+            missing = sorted(expected - actual)
+            if missing:
+                problems.append(f'{source} -> 缺少 {", ".join(missing)}')
+            # 多出/拼错的占位符同样致命：format 会抛 KeyError，整句回退原文
+            unknown = sorted(actual - expected)
+            if unknown:
+                problems.append(f'{source} -> 未知占位符 {", ".join(unknown)}')
+        return problems
 
     def _save(self):
         missing = self._missing_placeholders()
         if missing:
             reply = QMessageBox.question(
                 self,
-                '占位符缺失',
-                tr('下面这些文字缺少必要占位符，保存后动态数字或名称可能无法显示：\n\n{items}\n\n仍然保存吗？',
+                '占位符问题',
+                tr('下面这些文字的占位符有问题，保存后动态数字或名称可能无法显示：\n\n{items}\n\n仍然保存吗？',
                    items='\n'.join(missing[:8])),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        qss_text = self.qss_edit.toPlainText()
+        qss_warnings = validate_qss_text(qss_text)
+        if qss_warnings:
+            # Qt 对非法 QSS 只在控制台打 warning 然后静默忽略整条规则，
+            # 用户只会看到"没生效"——保存前必须提示
+            reply = QMessageBox.question(
+                self,
+                'QSS 语法警告',
+                tr('自定义样式可能存在语法问题：\n\n{items}\n\n有问题的规则会被 Qt 静默忽略。仍然保存吗？',
+                   items='\n'.join(qss_warnings[:6])),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -4165,7 +4796,7 @@ class CustomizationDialog(QDialog):
                 return
         try:
             save_text_config_values(self._all_texts)
-            save_custom_qss_text(self.qss_edit.toPlainText())
+            save_custom_qss_text(qss_text)
         except Exception as e:
             QMessageBox.warning(self, '保存失败', tr('无法保存配置：{error}', error=e))
             return
@@ -4223,8 +4854,20 @@ class ShortcutsDialog(QDialog):
                 editor.setMaximumSequenceLength(1)
             except Exception:
                 pass
+            # QKeySequenceEdit 自身没有清空手段，提示里却写着"清空=禁用"
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(4)
+            clear_btn = QPushButton('✕')
+            clear_btn.setFixedSize(22, 22)
+            clear_btn.setToolTip('清除（禁用此快捷键）')
+            clear_btn.setCursor(Qt.PointingHandCursor)
+            clear_btn.clicked.connect(editor.clear)
+            cell_layout.addWidget(editor, 1)
+            cell_layout.addWidget(clear_btn, 0)
             self._editors[action_id] = editor
-            table.setCellWidget(row, 1, editor)
+            table.setCellWidget(row, 1, cell)
 
             default_item = QTableWidgetItem(default_seq or '（无）')
             default_item.setFlags(default_item.flags() & ~Qt.ItemIsEditable)
@@ -4285,7 +4928,9 @@ class CandidatePickerDialog(QDialog):
         hint = f'扫描到 {len(candidates)} 个同名文件，请选择哪个是 "{attachment_name}"：'
         if size_hint:
             hint += f'（原文件大小 {format_size(size_hint)}，已用 ★ 标出匹配项）'
-        layout.addWidget(QLabel(hint))
+        hint_label = QLabel(hint)
+        hint_label.setWordWrap(True)  # 长文件名不再把对话框撑爆
+        layout.addWidget(hint_label)
 
         self.list_widget = QListWidget()
         for path in candidates:
@@ -4306,11 +4951,15 @@ class CandidatePickerDialog(QDialog):
         btn_row.addStretch()
         cancel_btn = QPushButton('取消')
         cancel_btn.clicked.connect(self.reject)
-        ok_btn = QPushButton('选定')
-        ok_btn.setDefault(True)
-        ok_btn.clicked.connect(self._accept_selected)
+        self.ok_btn = QPushButton('选定')
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setEnabled(False)  # 未选中时置灰，点了才不会"毫无反应"
+        self.ok_btn.clicked.connect(self._accept_selected)
+        self.list_widget.itemSelectionChanged.connect(
+            lambda: self.ok_btn.setEnabled(self.list_widget.currentItem() is not None)
+        )
         btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(self.ok_btn)
         layout.addLayout(btn_row)
 
     def _accept_selected(self, *_):
@@ -4672,7 +5321,13 @@ class AttachmentBar(QWidget):
                         card.category_change_requested.connect(self._on_category_change)
                     self.scroll_layout.addWidget(card)
                 except Exception:
-                    pass
+                    # 渲染失败的附件不能无声消失——给个占位提示并记日志
+                    logger.exception('附件卡片渲染失败: %s', att.get('original_name', ''))
+                    broken = QLabel(tr('附件 {name} 显示失败',
+                                       name=att.get('original_name', '') or att.get('id', '')))
+                    broken.setObjectName('attachment_render_error')
+                    broken.setWordWrap(True)
+                    self.scroll_layout.addWidget(broken)
         elif self._attachments:
             self.empty_label.setText(tr('这个分类下没有附件'))
             self.scroll_layout.addWidget(self.empty_label)
@@ -4805,8 +5460,8 @@ class NoteEditor(QWidget):
         self.category_combo.setInsertPolicy(QComboBox.NoInsert)
         self.category_combo.lineEdit().setPlaceholderText(tr('分类'))
         self.category_combo.setToolTip(tr('分类'))
+        # currentTextChanged 已覆盖手动输入，重复连 lineEdit 会让信号每键发两遍
         self.category_combo.currentTextChanged.connect(self._on_category_changed)
-        self.category_combo.lineEdit().textChanged.connect(self._on_category_changed)
         self.format_switch = TextFormatSwitch()
         self.format_switch.changed.connect(self._on_content_format_changed)
         time_row.addWidget(self.format_switch, 0, Qt.AlignRight | Qt.AlignVCenter)
@@ -4878,7 +5533,24 @@ class NoteEditor(QWidget):
         ):
             toolbar.addWidget(btn)
         toolbar.addStretch()
+
+        # 键盘可达性：工具栏按钮都是 NoFocus，必须给标准快捷键
+        for seq, handler in (
+            (QKeySequence.Bold, self._toggle_bold),
+            (QKeySequence.Italic, self._toggle_italic),
+            (QKeySequence.Underline, self._toggle_underline),
+        ):
+            shortcut = QShortcut(seq, self.content_edit)
+            shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.activated.connect(self._shortcut_format_handler(handler))
         return toolbar
+
+    def _shortcut_format_handler(self, handler):
+        def run():
+            # Markdown 模式下富文本格式不可用
+            if self._content_format != 'markdown':
+                handler()
+        return run
 
     def _format_button(self, text, tooltip):
         btn = QPushButton(text)
@@ -5055,6 +5727,18 @@ class NoteEditor(QWidget):
     def _on_content_format_changed(self, fmt):
         if self._loading:
             return
+        # 富文本→Markdown 是有损转换（颜色/字号等格式会丢），且会清空撤销栈
+        # 并随自动保存立刻落盘，必须先确认
+        if self.content_edit.toPlainText().strip():
+            target = 'Markdown' if fmt == 'markdown' else tr('富文本')
+            reply = QMessageBox.question(
+                self, tr('切换格式'),
+                tr('切换到 {format} 会转换当前内容，部分格式可能丢失，且无法撤销。\n确定切换吗？', format=target),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self.format_switch.set_format(self._content_format, emit=False)
+                return
         self._switch_content_format(fmt)
         self.content_changed.emit(self.get_content())
 
@@ -5157,6 +5841,9 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._setup_shortcuts()
         self._setup_tray()
+        # 存储回调：保存失败提示、数据损坏只读保护提示
+        self._wire_storage(self.storage)
+        self._notify_legacy_archive()
 
         # 文件追踪：实时监听已跟踪附件的父目录与文件本身，捕捉编辑保存
         self._tracked_watcher = QFileSystemWatcher(self)
@@ -5225,16 +5912,58 @@ class MainWindow(QMainWindow):
             return
         batch = queue[:5]
         self._tagging_queue = queue[5:]
-        for _note, att in batch:
-            try:
-                if not att.get('tracking'):
-                    self.storage.ensure_tracking(att)
-                else:
-                    if self.storage.refresh_tracking_if_changed(att):
-                        self._tagging_changed = True
-            except Exception:
-                pass
-        QTimer.singleShot(80, self._tag_next_batch)
+
+        # 已有 tracking 的只做轻量刷新；batch() 把逐项 save 合并成一次
+        need_build = []
+        with self.storage.batch():
+            for _note, att in batch:
+                try:
+                    if not att.get('tracking'):
+                        p = att.get('original_path', '')
+                        if p and Path(p).exists():
+                            need_build.append((att.get('id'), str(Path(p).resolve())))
+                    else:
+                        if self.storage.refresh_tracking_if_changed(att):
+                            self._tagging_changed = True
+                except Exception:
+                    logger.exception('后台刷新追踪信息失败')
+
+        if not need_build:
+            QTimer.singleShot(80, self._tag_next_batch)
+            return
+
+        # 补打标签要对文件做最多 64MB 的 SHA-256——放到后台线程，
+        # 主线程只回填结果（之前是在 UI 线程哈希且每个附件落盘一次）
+        def job(worker):
+            out = []
+            for att_id, path in need_build:
+                try:
+                    out.append((att_id, ftrack.build_tracking(path)))
+                except Exception:
+                    logger.exception('后台补打追踪标签失败: %s', path)
+                    out.append((att_id, None))
+            return out
+
+        tag_worker = FuncWorker(job)
+        self._tagging_worker = tag_worker
+
+        def _apply():
+            results = tag_worker.result or []
+            tag_worker.deleteLater()
+            if getattr(self, '_tagging_worker', None) is tag_worker:
+                self._tagging_worker = None
+            with self.storage.batch():
+                for att_id, tr_data in results:
+                    if not tr_data:
+                        continue
+                    note, att = self.storage.find_attachment(att_id)
+                    if note and att and not att.get('tracking'):
+                        att['tracking'] = tr_data
+                        self.storage.save()
+            QTimer.singleShot(80, self._tag_next_batch)
+
+        tag_worker.finished.connect(_apply)
+        tag_worker.start()
 
     def _setup_tracking_watchers(self):
         """为每个已跟踪附件的父目录加监听；同时也直接监听文件本身，
@@ -5345,9 +6074,14 @@ class MainWindow(QMainWindow):
             if missing_folder:
                 self._start_auto_recovery(reason='auto')
             elif missing_other:
-                self.statusBar().showMessage(tr('有附件路径失效，可在更多菜单手动查找'), 5000)
+                # 永久失效的文件不再每 60 秒重复唠叨，本次会话只提醒一次
+                if not getattr(self, '_missing_attachment_notified', False):
+                    self._missing_attachment_notified = True
+                    self.statusBar().showMessage(tr('有附件路径失效，可在更多菜单手动查找'), 5000)
+            else:
+                self._missing_attachment_notified = False
         except Exception:
-            pass
+            logger.exception('附件状态轮询失败')
 
     def _install_shell_notifications(self):
         """订阅 Windows Shell 文件变更事件。"""
@@ -5376,6 +6110,47 @@ class MainWindow(QMainWindow):
             self._shell_filter = None
 
     def _on_shell_event(self, event_code, path1, path2):
+        """Shell 通知入口：只入队，合并 200ms 内的事件后批处理。
+
+        往磁盘复制一个大文件夹会产生成百上千条 CREATE/UPDATE 事件，
+        之前每条都在 UI 线程同步做附件匹配（stat/读 ADS），界面秒级冻结。
+        """
+        timer = getattr(self, '_shell_event_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(200)
+            timer.timeout.connect(self._flush_shell_events)
+            self._shell_event_timer = timer
+        queue = getattr(self, '_shell_event_queue', None)
+        if queue is None:
+            queue = []
+            self._shell_event_queue = queue
+        item = (int(event_code or 0), str(path1 or ''), str(path2 or ''))
+        if not queue or queue[-1] != item:
+            queue.append(item)
+        if len(queue) >= 500:
+            timer.stop()
+            self._flush_shell_events()
+            return
+        if not timer.isActive():
+            timer.start()
+
+    def _flush_shell_events(self):
+        queue = getattr(self, '_shell_event_queue', None) or []
+        self._shell_event_queue = None
+        seen = set()
+        for code, p1, p2 in queue:
+            key = (code, p1, p2)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self._process_shell_event(code, p1, p2)
+            except Exception:
+                logger.exception('处理 Shell 事件失败')
+
+    def _process_shell_event(self, event_code, path1, path2):
         """Shell 通知回调：检查 path1 是否匹配某个跟踪附件，匹配就改成 path2。"""
         if not path1 and not path2:
             return
@@ -6047,7 +6822,7 @@ class MainWindow(QMainWindow):
             self.workspace_switch.set_mode('text', emit=False)
             self.new_btn.setText('+  新建记事')
             self.search_input.setPlaceholderText('搜索记录')
-            self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
+            self._set_list_delegate('note')
             self.current_note_id = None
             self._suppress_auto_select = True
             try:
@@ -6066,7 +6841,7 @@ class MainWindow(QMainWindow):
         self.workspace_switch.set_mode('screenshot', emit=False)
         self.new_btn.setText('+  新建记事')
         self.search_input.setPlaceholderText('搜索记录')
-        self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
+        self._set_list_delegate('shot')
         self.current_note_id = self.screenshot_board['id']
         self._refresh_screenshot_board()
 
@@ -6416,7 +7191,12 @@ class MainWindow(QMainWindow):
         self.search_input.setObjectName('search_box')
         self.search_input.setPlaceholderText('搜索记录')
         self.search_input.setClearButtonEnabled(True)
-        self.search_input.textChanged.connect(lambda _: self._refresh_current_workspace())
+        # 防抖：每个按键全量重建列表+缩略图太重，停顿 250ms 再刷新
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(250)
+        self._search_debounce.timeout.connect(self._refresh_current_workspace)
+        self.search_input.textChanged.connect(lambda _: self._search_debounce.start())
         self.search_input.installEventFilter(self)
 
         self.view_switch = ViewSwitch()
@@ -6434,7 +7214,7 @@ class MainWindow(QMainWindow):
         self.list_widget = QListWidget()
         self.list_widget.setObjectName('note_list')
         self.list_widget.setMouseTracking(True)
-        self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
+        self._set_list_delegate('shot')
         self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
         self.list_widget.itemDoubleClicked.connect(self._on_list_item_activated)
         self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -6529,9 +7309,34 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _set_list_delegate(self, kind):
+        """复用三个列表 delegate 实例。
+
+        之前每次刷新都 new 一个新 delegate（旧的以 list_widget 为父对象
+        永不释放），搜索时每个按键泄漏一个。"""
+        cache = getattr(self, '_list_delegates', None)
+        if cache is None:
+            cache = {
+                'note': NoteListDelegate(self.list_widget),
+                'shot': ScreenshotListDelegate(self.list_widget),
+                'archive': ArchiveListDelegate(self.list_widget),
+            }
+            self._list_delegates = cache
+        delegate = cache[kind]
+        if self.list_widget.itemDelegate() is not delegate:
+            self.list_widget.setItemDelegate(delegate)
+
     def _refresh_external_attachment_views(self):
-        self._safe_refresh_current_workspace()
-        QTimer.singleShot(0, self._safe_refresh_current_workspace)
+        # 合并刷新：同一事件循环内的多次触发只重建一次（之前是同步+singleShot(0)
+        # 连刷两遍，每遍都全量重建列表和缩略图）
+        timer = getattr(self, '_ext_refresh_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(self._safe_refresh_current_workspace)
+            self._ext_refresh_timer = timer
+        timer.start()
 
     def _on_workspace_changed(self, mode):
         if self.save_timer.isActive():
@@ -6551,7 +7356,7 @@ class MainWindow(QMainWindow):
         if mode == 'screenshot':
             self.new_btn.setText('+  新建记事')
             self.search_input.setPlaceholderText('搜索记录')
-            self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
+            self._set_list_delegate('shot')
             self.current_note_id = self.screenshot_board['id']
             self._refresh_screenshot_board()
             return
@@ -6559,7 +7364,7 @@ class MainWindow(QMainWindow):
         self.new_btn.setText('+  新建记事')
         self.search_input.setPlaceholderText('搜索记录')
         self.archive_category_filter.setVisible(False)
-        self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
+        self._set_list_delegate('note')
         self.editor.clear()
         self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
         self.current_note_id = None
@@ -6574,7 +7379,7 @@ class MainWindow(QMainWindow):
     def _on_archive_category_search_changed(self):
         if self._updating_archive_category_filter:
             return
-        self._refresh_current_workspace()
+        self._search_debounce.start()
 
     def _archive_category_query(self):
         editor = self.archive_category_filter.lineEdit()
@@ -6678,7 +7483,7 @@ class MainWindow(QMainWindow):
             self._populate_archive_items(selected_key=key)
             return
         self.search_input.setPlaceholderText('搜索记录')
-        self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
+        self._set_list_delegate('shot')
         selected_id = preferred_attachment_id
         if not selected_id:
             item = self.list_widget.currentItem()
@@ -6771,7 +7576,7 @@ class MainWindow(QMainWindow):
             item = self.list_widget.currentItem()
             selected_key = archive_item_key(item.data(Qt.UserRole)) if item else ''
 
-        self.list_widget.setItemDelegate(ArchiveListDelegate(self.list_widget))
+        self._set_list_delegate('archive')
         self._refresh_archive_category_filter()
         self.archive_category_filter.setVisible(True)
         self.search_input.setPlaceholderText('搜索记录')
@@ -6842,7 +7647,7 @@ class MainWindow(QMainWindow):
         self.search_input.setPlaceholderText('搜索记录')
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
-        self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
+        self._set_list_delegate('note')
         search = self.search_input.text().strip().lower()
         view = self.view_switch.current_view()
         self._refresh_archive_category_filter()
@@ -7242,7 +8047,7 @@ class MainWindow(QMainWindow):
             self.workspace_switch.set_mode('screenshot', emit=False)
             self.new_btn.setText('+  新建记事')
             self.search_input.setPlaceholderText('搜索记录')
-            self.list_widget.setItemDelegate(ScreenshotListDelegate(self.list_widget))
+            self._set_list_delegate('shot')
             self.current_note_id = self.screenshot_board['id']
         if clear_filters:
             if self.view_switch.current_view() != 'active':
@@ -7279,19 +8084,30 @@ class MainWindow(QMainWindow):
                 self.activateWindow()
 
         def do_capture():
-            pixmap, virtual = grab_virtual_desktop_pixmap()
-            if pixmap is None or pixmap.isNull() or virtual.isEmpty():
+            # try/finally 保证 _capture_in_progress 一定被复位——
+            # 之前任何一处抛异常都会让截图功能直到重启前永久失效
+            accepted = False
+            result_path = None
+            failed = False
+            try:
+                pixmap, virtual = grab_virtual_desktop_pixmap()
+                if pixmap is None or pixmap.isNull() or virtual.isEmpty():
+                    failed = True
+                else:
+                    dlg = RegionCaptureOverlay(pixmap, virtual)
+                    accepted = dlg.exec() == QDialog.Accepted
+                    result_path = dlg.result_path
+            except Exception:
+                logger.exception('框选截图过程出错')
+                failed = True
+            finally:
                 restore_after_capture()
+            if failed:
                 if quiet_failure and getattr(self, 'tray_icon', None):
                     self.tray_icon.showMessage('框选截图失败', '无法获取屏幕截图。', QSystemTrayIcon.Warning, 3000)
                 else:
                     QMessageBox.warning(self, '框选截图失败', '无法获取屏幕截图。')
                 return
-
-            dlg = RegionCaptureOverlay(pixmap, virtual)
-            accepted = dlg.exec() == QDialog.Accepted
-            result_path = dlg.result_path
-            restore_after_capture()
             if accepted and result_path:
                 self._on_image_pasted(result_path)
 
@@ -7366,7 +8182,7 @@ class MainWindow(QMainWindow):
     def create_new_note(self):
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
-        self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
+        self._set_list_delegate('note')
         self.new_btn.setText('+  新建记事')
         self.search_input.setPlaceholderText('搜索记录')
         self.archive_category_filter.setVisible(False)
@@ -7745,6 +8561,14 @@ class MainWindow(QMainWindow):
             return
         found = result.get('path') if result else None
         if not found:
+            error = (result or {}).get('error')
+            if error:
+                # 扫描中途出错和"确实不存在"是两回事，不能都说"未找到"
+                QMessageBox.warning(
+                    self, '扫描出错',
+                    f'查找 "{name}" 时扫描过程出错，结果可能不完整：\n{error}\n\n'
+                    f'详细信息见数据目录下的 fresh.log。')
+                return
             candidates = (result or {}).get('candidates') or []
             if not candidates:
                 QMessageBox.warning(self, '未找到', f'未在磁盘上找到与 "{name}" 匹配的文件。')
@@ -7849,9 +8673,9 @@ class MainWindow(QMainWindow):
                 note, att = self.storage.find_attachment(att_id)
                 if not att:
                     continue
+                # 只记录失败时间做冷却，不改 updated_at——
+                # 之前找回失败反而把便笺顶到列表最上面
                 att['recovery_failed_at'] = time.time()
-                if note:
-                    note['updated_at'] = datetime.now().isoformat()
             if tag_to_att:
                 try:
                     self.storage.save()
@@ -8018,10 +8842,58 @@ class MainWindow(QMainWindow):
             return
 
     def _on_file_dropped(self, file_path):
-        if self.workspace_mode == 'screenshot' and self._current_screenshot_attachment():
-            self._add_child_attachment_to_current_screenshot(file_path)
+        # 多文件拖入时每个文件发一次信号；攒一拍批量入库，
+        # 之前是每个文件一次全量加密落盘 + 一次整板重建
+        pending = getattr(self, '_pending_dropped_files', None)
+        if pending is None:
+            pending = []
+            self._pending_dropped_files = pending
+            QTimer.singleShot(0, self._flush_dropped_files)
+        pending.append(str(file_path))
+
+    def _flush_dropped_files(self):
+        paths = getattr(self, '_pending_dropped_files', None) or []
+        self._pending_dropped_files = None
+        if not paths:
             return
-        self._add_attachment_to_current(file_path, copy=False)
+        if self.workspace_mode != 'screenshot':
+            with self.storage.batch():
+                for p in paths:
+                    self._add_attachment_to_current(p, copy=False)
+            return
+        parent = self._current_screenshot_attachment()
+        if parent is not None:
+            failed = 0
+            with self.storage.batch():
+                for p in paths:
+                    if not self.storage.add_child_attachment(parent.get('id'), p, copy=False):
+                        failed += 1
+            self._refresh_screenshot_board(preferred_attachment_id=parent.get('id'))
+            if failed:
+                QMessageBox.warning(self, '添加失败', f'{failed} 个文件或文件夹无法添加。')
+            else:
+                self.statusBar().showMessage(tr('已添加到当前截图'), 3000)
+            return
+        last_id = None
+        failed = 0
+        non_image = 0
+        with self.storage.batch():
+            for p in paths:
+                source = Path(p)
+                if source.is_file() and source.suffix.lower() in IMAGE_EXTS:
+                    att = self.storage.add_screenshot(p)
+                    if att:
+                        last_id = att.get('id')
+                    else:
+                        failed += 1
+                else:
+                    non_image += 1
+        if last_id:
+            self._refresh_screenshot_board(preferred_attachment_id=last_id)
+        if failed:
+            QMessageBox.warning(self, '添加失败', '只能添加图片截图。')
+        if non_image:
+            QMessageBox.information(self, '先选择截图', '请先选中一张截图，再给这张截图添加文件或文件夹。')
 
     def _on_attachment_bar_file_dropped(self, file_path):
         if self.workspace_mode == 'screenshot':
@@ -8033,7 +8905,8 @@ class MainWindow(QMainWindow):
         self._add_attachment_to_current(file_path, copy=True)
 
     def _add_screenshot_from_path(self, file_path, copy=False):
-        attachment = self.storage.add_screenshot(file_path, copy=copy)
+        # 截图板图片一律落为加密副本，copy 参数仅保留兼容旧调用
+        attachment = self.storage.add_screenshot(file_path)
         if not attachment:
             QMessageBox.warning(self, '添加失败', '只能添加图片截图。')
             return None
@@ -8262,10 +9135,55 @@ class MainWindow(QMainWindow):
         self.storage.crypter = dlg.current_crypter
         self.statusBar().showMessage('账户设置已更新', 3000)
 
-    def _switch_account(self, account, crypter):
-        if not self.account_manager:
+    def _on_storage_save_failed(self, error):
+        # 保存失败必须显式提醒——之前是静默 pass，用户以为已保存
+        try:
+            self.statusBar().showMessage(tr('保存失败：{error}', error=error), 8000)
+        except Exception:
+            pass
+        now = time.monotonic()
+        if now - getattr(self, '_last_save_warn', 0.0) > 60:
+            self._last_save_warn = now
+            QMessageBox.warning(
+                self, tr('保存失败'),
+                tr('数据写入磁盘失败：\n{error}\n\n'
+                   '请检查磁盘空间或文件是否被占用。问题解决前请勿退出程序，'
+                   '否则最近的修改会丢失。', error=error),
+            )
+
+    def _wire_storage(self, storage):
+        storage.on_save_failed = self._on_storage_save_failed
+        if storage.load_failed:
+            QMessageBox.critical(
+                self, tr('数据加载失败'),
+                tr('数据文件无法解密或已损坏：\n{error}\n\n'
+                   '已进入只读保护：本次会话的任何修改都不会写入磁盘，'
+                   '以免覆盖仅存的原始数据。\n'
+                   '原文件已留底为 data.corrupt-*.json，请先备份数据目录'
+                   '或修复密钥文件后重启程序。', error=storage.load_error),
+            )
+
+    def _notify_legacy_archive(self):
+        manager = self.account_manager
+        archive = getattr(manager, 'last_legacy_archive', None) if manager else None
+        if not archive:
             return
-        if self.save_timer.isActive():
+        manager.last_legacy_archive = None
+        QMessageBox.information(
+            self, tr('旧数据已迁移'),
+            tr('检测到旧版数据并已导入当前账户。\n'
+               '原始旧数据已归档到：\n{path}\n\n'
+               '归档副本不受账户密码保护，确认数据完整后建议删除该目录。',
+               path=str(archive)),
+        )
+
+    def _attach_storage(self, storage, account, *, flush_pending=True):
+        """统一的存储切换路径（切换账户 / 切换数据目录共用）。
+
+        之前两处各拷贝了一份近 30 行的清理+重置样板，且已出现"是否先
+        保存挂起编辑"的行为分叉。
+        """
+        if flush_pending and self.save_timer.isActive():
             self.save_timer.stop()
             self._save_current_now()
         try:
@@ -8281,11 +9199,8 @@ class MainWindow(QMainWindow):
             pass
 
         self.account = account
-        self.storage = Storage(
-            app_dir=self.account_manager.account_dir(account),
-            crypter=crypter,
-            migrate_apple=False,
-        )
+        self.storage = storage
+        self._wire_storage(storage)
         self.screenshot_board = self.storage.get_screenshot_board()
         self.current_note_id = self.screenshot_board['id'] if self.workspace_mode == 'screenshot' else None
         self.view_switch.set_view('active', emit=False)
@@ -8299,6 +9214,19 @@ class MainWindow(QMainWindow):
         self._refresh_current_workspace()
         self._setup_tracking_watchers()
         self._start_background_tagging()
+
+    def _switch_account(self, account, crypter):
+        if not self.account_manager:
+            return
+        try:
+            storage = Storage(
+                app_dir=self.account_manager.account_dir(account),
+                crypter=crypter,
+            )
+        except SaltFileError as exc:
+            QMessageBox.critical(self, tr('密钥文件异常'), str(exc))
+            return
+        self._attach_storage(storage, account)
         self.statusBar().showMessage(f'已进入 {account.get("name") or "我的账户"}', 3000)
 
     def _show_timeline(self):
@@ -8363,7 +9291,7 @@ class MainWindow(QMainWindow):
             self._save_current_now()
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
-        self.list_widget.setItemDelegate(NoteListDelegate(self.list_widget))
+        self._set_list_delegate('note')
         self.new_btn.setText('+  新建记事')
         self.search_input.setPlaceholderText('搜索记录')
         self.view_switch.set_view('archived', emit=False)
@@ -8403,13 +9331,7 @@ class MainWindow(QMainWindow):
         directory = ensure_custom_files()
         text_config_path()
         custom_qss_path()
-        if sys.platform == 'win32':
-            try:
-                os.startfile(str(directory))
-                return
-            except Exception:
-                pass
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        open_local_path(directory)
 
     def _show_customization_dialog(self):
         dlg = CustomizationDialog(self)
@@ -8432,7 +9354,7 @@ class MainWindow(QMainWindow):
         dlg.setObjectName('account_dialog')
         dlg.setWindowTitle('备份范围')
         dlg.setModal(True)
-        dlg.setFixedWidth(390)
+        dlg.setMinimumWidth(390)
 
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(30, 28, 30, 24)
@@ -8503,11 +9425,90 @@ class MainWindow(QMainWindow):
             'account_folder': all_data,
         }
 
-    def _write_backup_data(self, zf, scope):
-        notes_payload = json.dumps(self.storage.notes, ensure_ascii=False, indent=2).encode('utf-8')
-        zf.writestr('data.json', self.storage.crypter.encrypt_bytes(notes_payload))
+    def _choose_backup_passphrase(self):
+        """选择备份口令。返回 None=取消；''=不设口令；其余为口令文本。
+
+        不设口令的备份用"本机+账户"绑定的密钥加密，重装系统/换电脑后
+        将永远无法解密——恰好在最需要备份的灾难场景下失效，所以默认
+        引导用户设置口令。
+        """
+        dlg = QDialog(self)
+        dlg.setObjectName('account_dialog')
+        dlg.setWindowTitle(tr('备份口令'))
+        dlg.setModal(True)
+        dlg.setMinimumWidth(430)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(30, 28, 30, 24)
+        layout.setSpacing(12)
+
+        title = QLabel(tr('备份口令'))
+        title.setObjectName('account_title_small')
+        layout.addWidget(title)
+
+        note = QLabel(tr(
+            '设置口令后，备份可以在任何电脑上用口令恢复（推荐）。\n'
+            '不设口令的备份只能在本机当前账户恢复，重装系统或换电脑后将无法解密。'
+        ))
+        note.setObjectName('account_subtitle')
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        pass1 = QLineEdit()
+        pass1.setEchoMode(QLineEdit.Password)
+        pass1.setPlaceholderText(tr('备份口令（至少 8 个字符）'))
+        layout.addWidget(pass1)
+
+        pass2 = QLineEdit()
+        pass2.setEchoMode(QLineEdit.Password)
+        pass2.setPlaceholderText(tr('再次输入口令'))
+        layout.addWidget(pass2)
+
+        skip_check = QCheckBox(tr('不设口令（仅本机当前账户可恢复）'))
+        skip_check.setObjectName('account_check')
+        layout.addWidget(skip_check)
+
+        def _toggle(checked):
+            pass1.setEnabled(not checked)
+            pass2.setEnabled(not checked)
+        skip_check.toggled.connect(_toggle)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        cancel_btn = QPushButton(tr('取消'))
+        cancel_btn.setObjectName('account_secondary')
+        cancel_btn.clicked.connect(dlg.reject)
+        ok_btn = QPushButton(tr('继续'))
+        ok_btn.setObjectName('account_primary')
+        ok_btn.setDefault(True)
+        row.addWidget(cancel_btn, 1)
+        row.addWidget(ok_btn, 1)
+        layout.addLayout(row)
+
+        def _confirm():
+            if skip_check.isChecked():
+                dlg.accept()
+                return
+            text = pass1.text()
+            if len(text) < 8:
+                QMessageBox.warning(dlg, tr('备份口令'), tr('口令至少需要 8 个字符。'))
+                return
+            if text != pass2.text():
+                QMessageBox.warning(dlg, tr('备份口令'), tr('两次输入的口令不一致。'))
+                return
+            dlg.accept()
+        ok_btn.clicked.connect(_confirm)
+
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return '' if skip_check.isChecked() else pass1.text()
+
+    def _write_backup_data(self, zf, scope, backup_crypter, kdf_info):
+        notes_payload = json.dumps(self.storage.notes, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        zf.writestr('data.json', backup_crypter.encrypt_bytes(notes_payload))
         manifest = {
             'app': 'FRESH',
+            'backup_format': 2,
             'created_at': datetime.now().isoformat(),
             'scope': scope.get('id'),
             'scope_label': scope.get('label'),
@@ -8518,6 +9519,7 @@ class MainWindow(QMainWindow):
             'notes_encrypted': True,
             'references_preserved': True,
         }
+        manifest.update(kdf_info or {})
         zf.writestr(
             'backup_manifest.json',
             json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8'),
@@ -8541,26 +9543,43 @@ class MainWindow(QMainWindow):
                     names.add(stored_name)
         return names
 
-    def _write_backup_blob_dir(self, zf, source_dir, zip_prefix, stored_names=None):
+    def _write_backup_blob_dir(self, zf, source_dir, zip_prefix, stored_names=None,
+                               backup_crypter=None, worker=None):
+        """打包附件目录。返回 (成功数, 失败文件名列表)。
+
+        失败必须让用户知道，否则用户会以为备份是完整的。"""
         source_dir = Path(source_dir)
         if not source_dir.exists():
-            return 0
+            return 0, []
+        backup_crypter = backup_crypter or self.storage.crypter
+        account_crypter = self.storage.crypter
         count = 0
+        failed = []
         allowed_names = set(stored_names) if stored_names is not None else None
         for f in source_dir.iterdir():
+            if worker is not None:
+                worker.check_cancelled()
             if not f.is_file() or f.name.startswith('.'):
                 continue
             if allowed_names is not None and f.name not in allowed_names:
                 continue
             try:
                 blob = f.read_bytes()
-                if not self.storage.crypter.is_encrypted(blob):
-                    blob = self.storage.crypter.encrypt_bytes(blob)
+                if backup_crypter is account_crypter:
+                    if not account_crypter.is_encrypted(blob):
+                        blob = account_crypter.encrypt_bytes(blob)
+                else:
+                    # 口令备份：先用账户密钥解出明文，再用备份口令密钥加密
+                    plain = account_crypter.decrypt_bytes(blob) if account_crypter.is_encrypted(blob) else blob
+                    blob = backup_crypter.encrypt_bytes(plain)
                 zf.writestr(f'{zip_prefix}/{f.name}', blob)
                 count += 1
+            except WorkerCancelled:
+                raise
             except Exception:
-                pass
-        return count
+                failed.append(f.name)
+                logger.exception('备份附件失败: %s', f)
+        return count, failed
 
     def _safe_archive_name(self, name, fallback='未命名'):
         value = (name or fallback or '未命名').replace('\\', '/').strip('/')
@@ -8568,11 +9587,13 @@ class MainWindow(QMainWindow):
             return fallback
         return value.split('/')[-1] or fallback
 
-    def _write_external_references(self, zf, include_folders=False, include_files=False, include_images=False):
+    def _write_external_references(self, zf, include_folders=False, include_files=False, include_images=False, worker=None):
         missing = []
         count = 0
         for note in self.storage.notes:
             for att in iter_attachment_tree(note.get('attachments', []) or []):
+                if worker is not None:
+                    worker.check_cancelled()
                 att_type = att.get('type')
                 if att_type == 'folder':
                     if not include_folders:
@@ -8595,7 +9616,7 @@ class MainWindow(QMainWindow):
 
                 src = Path(raw_path)
                 try:
-                    same_identity = self.storage.attachment_path_matches_tracking(att)
+                    same_identity = self.storage.attachment_path_matches_tracking(att, save=False)
                 except Exception:
                     same_identity = False
 
@@ -8691,6 +9712,10 @@ class MainWindow(QMainWindow):
         if not scope:
             return
 
+        passphrase = self._choose_backup_passphrase()
+        if passphrase is None:
+            return
+
         default_name = f'fresh_backup_{scope["id"]}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
         file_path, _ = QFileDialog.getSaveFileName(
             self, '导出备份', default_name, 'Zip 压缩包 (*.zip)'
@@ -8698,57 +9723,131 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        try:
-            missing = []
-            local_count = 0
-            trash_count = 0
-            external_count = 0
-            account_folder_count = 0
+        if passphrase:
+            kdf_salt = os.urandom(32)
+            backup_crypter = PasswordCrypter(passphrase, kdf_salt, PASSWORD_KDF_ITERATIONS)
+            kdf_info = {
+                'payload_encrypted': 'passphrase',
+                'kdf': 'pbkdf2-sha256',
+                'kdf_salt': base64.urlsafe_b64encode(kdf_salt).decode('ascii'),
+                'kdf_iterations': PASSWORD_KDF_ITERATIONS,
+            }
+        else:
+            backup_crypter = self.storage.crypter
+            kdf_info = {'payload_encrypted': 'account'}
+
+        include_files = bool(scope.get('include_files'))
+        include_images = bool(scope.get('include_images'))
+        include_folders = bool(scope.get('include_folders'))
+        # 口令备份的目标是跨机可恢复，账户目录原样快照（机器绑定密文 + .fkey）
+        # 对它没有意义，跳过
+        snapshot_account_folder = bool(scope.get('account_folder')) and not passphrase
+
+        def job(worker):
+            out = {
+                'missing': [], 'failed': [],
+                'local_count': 0, 'trash_count': 0,
+                'external_count': 0, 'account_folder_count': 0,
+            }
             with zipfile.ZipFile(file_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                self._write_backup_data(zf, scope)
-                include_files = bool(scope.get('include_files'))
-                include_images = bool(scope.get('include_images'))
-                include_folders = bool(scope.get('include_folders'))
+                worker.report(tr('正在打包文字数据...'))
+                self._write_backup_data(zf, scope, backup_crypter, kdf_info)
                 stored_names = self._backup_stored_names(
                     include_files=include_files,
                     include_images=include_images,
                 )
-                local_count = self._write_backup_blob_dir(
-                    zf, self.storage.attachments_dir, 'attachments', stored_names
+                worker.report(tr('正在打包本地附件...'))
+                out['local_count'], failed1 = self._write_backup_blob_dir(
+                    zf, self.storage.attachments_dir, 'attachments', stored_names,
+                    backup_crypter=backup_crypter, worker=worker,
                 )
-                trash_count = self._write_backup_blob_dir(
-                    zf, self.storage.trash_dir, 'trash', stored_names
+                out['trash_count'], failed2 = self._write_backup_blob_dir(
+                    zf, self.storage.trash_dir, 'trash', stored_names,
+                    backup_crypter=backup_crypter, worker=worker,
                 )
-
-                external_count, missing = self._write_external_references(
+                out['failed'] = failed1 + failed2
+                worker.report(tr('正在打包外部引用...'))
+                out['external_count'], out['missing'] = self._write_external_references(
                     zf,
                     include_folders=include_folders,
                     include_files=include_files,
                     include_images=include_images,
+                    worker=worker,
                 )
+                if snapshot_account_folder:
+                    worker.report(tr('正在打包账户文件夹快照...'))
+                    out['account_folder_count'] = self._write_account_folder_snapshot(zf, file_path)
+            return out
 
-                if scope.get('account_folder'):
-                    account_folder_count = self._write_account_folder_snapshot(zf, file_path)
+        worker = run_with_progress(self, tr('导出备份'), tr('正在导出备份...'), job)
+        if worker.cancelled or worker.error:
+            try:
+                Path(file_path).unlink()
+            except Exception:
+                pass
+            if worker.error:
+                QMessageBox.critical(self, '导出失败', f'导出过程中出错:\n{worker.error}')
+            else:
+                self.statusBar().showMessage(tr('已取消导出'), 3000)
+            return
 
-            included = ['加密文字数据']
-            if local_count:
-                included.append(f'本地附件/截图 {local_count} 个')
-            if trash_count:
-                included.append(f'最近删除附件 {trash_count} 个')
-            if external_count:
-                included.append(f'引用文件/文件夹内容 {external_count} 个')
-            if account_folder_count:
-                included.append(f'账户完整文件夹快照 {account_folder_count} 个文件')
+        result = worker.result or {}
+        missing = result.get('missing') or []
+        failed = result.get('failed') or []
+        included = ['加密文字数据']
+        if result.get('local_count'):
+            included.append(f"本地附件/截图 {result['local_count']} 个")
+        if result.get('trash_count'):
+            included.append(f"最近删除附件 {result['trash_count']} 个")
+        if result.get('external_count'):
+            included.append(f"引用文件/文件夹内容 {result['external_count']} 个")
+        if result.get('account_folder_count'):
+            included.append(f"账户完整文件夹快照 {result['account_folder_count']} 个文件")
 
-            msg = f'{scope["label"]}已导出到:\n{file_path}\n\n包含: ' + ' · '.join(included)
-            msg += '\n\n未打包的外部引用仍保留原路径和追踪记录。'
-            if missing:
-                preview = '\n'.join(missing[:5])
-                more = f'\n... 共 {len(missing)} 个' if len(missing) > 5 else ''
-                msg += f'\n\n以下 {len(missing)} 个引用源已不存在,未打包:\n{preview}{more}'
+        msg = f'{scope["label"]}已导出到:\n{file_path}\n\n包含: ' + ' · '.join(included)
+        if passphrase:
+            msg += '\n\n该备份已用口令加密，可在任何电脑恢复，请妥善保管口令。'
+        else:
+            msg += '\n\n该备份只能在本机当前账户恢复；如需跨电脑恢复，请重新导出并设置备份口令。'
+        msg += '\n未打包的外部引用仍保留原路径和追踪记录。'
+        if failed:
+            preview = '\n'.join(failed[:5])
+            more = f'\n... 共 {len(failed)} 个' if len(failed) > 5 else ''
+            msg += f'\n\n警告：以下 {len(failed)} 个本地附件读取失败，未包含在备份中:\n{preview}{more}'
+        if missing:
+            preview = '\n'.join(missing[:5])
+            more = f'\n... 共 {len(missing)} 个' if len(missing) > 5 else ''
+            msg += f'\n\n以下 {len(missing)} 个引用源已不存在,未打包:\n{preview}{more}'
+        if failed:
+            QMessageBox.warning(self, '导出完成（有警告）', msg)
+        else:
             QMessageBox.information(self, '导出成功', msg)
-        except Exception as e:
-            QMessageBox.critical(self, '导出失败', f'导出过程中出错:\n{e}')
+
+    def _ask_backup_passphrase_crypter(self, manifest, raw_probe):
+        """口令备份：向用户索要口令并验证，返回解密器或 None。"""
+        try:
+            salt = base64.urlsafe_b64decode((manifest.get('kdf_salt') or '').encode('ascii'))
+            iterations = int(manifest.get('kdf_iterations') or PASSWORD_KDF_ITERATIONS)
+            if not salt:
+                raise ValueError('empty salt')
+        except Exception:
+            QMessageBox.critical(self, '导入失败', tr('备份的口令参数缺失或损坏，无法解密。'))
+            return None
+        for _ in range(3):
+            text, ok = QInputDialog.getText(
+                self, tr('备份口令'),
+                tr('这个备份使用口令加密，请输入备份口令：'),
+                QLineEdit.Password,
+            )
+            if not ok:
+                return None
+            crypter = PasswordCrypter(text, salt, iterations)
+            try:
+                crypter.decrypt_bytes(raw_probe)
+                return crypter
+            except Exception:
+                QMessageBox.warning(self, tr('备份口令'), tr('口令不正确，请重试。'))
+        return None
 
     def _import_data(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -8756,6 +9855,39 @@ class MainWindow(QMainWindow):
         )
         if not file_path:
             return
+
+        # 先读 manifest 与 data.json，确定解密方式并提前验证密钥
+        try:
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                names = zf.namelist()
+                if 'data.json' not in names:
+                    raise ValueError('备份文件中缺少 data.json')
+                manifest = {}
+                if 'backup_manifest.json' in names:
+                    try:
+                        manifest = json.loads(zf.read('backup_manifest.json').decode('utf-8'))
+                    except Exception:
+                        manifest = {}
+                raw_probe = zf.read('data.json')
+        except Exception as e:
+            QMessageBox.critical(self, '导入失败', f'无法读取备份文件:\n{e}')
+            return
+
+        if (manifest or {}).get('payload_encrypted') == 'passphrase':
+            backup_crypter = self._ask_backup_passphrase_crypter(manifest, raw_probe)
+            if backup_crypter is None:
+                return
+        else:
+            backup_crypter = self.storage.crypter
+            if self.storage.crypter.is_encrypted(raw_probe):
+                try:
+                    self.storage.crypter.decrypt_bytes(raw_probe)
+                except Exception:
+                    QMessageBox.critical(
+                        self, '导入失败',
+                        tr('这个备份是用其他账户或其他电脑的密钥加密的，当前账户无法解密。\n'
+                           '如果导出时设置过备份口令，请使用带口令的备份文件。'))
+                    return
 
         msg = QMessageBox(self)
         msg.setWindowTitle('选择导入方式')
@@ -8774,74 +9906,80 @@ class MainWindow(QMainWindow):
         if clicked is None or clicked == cancel_btn:
             return
         mode = 'replace' if clicked == replace_btn else 'merge'
+        if mode == 'replace':
+            confirm = QMessageBox.warning(
+                self, '确认替换',
+                tr('替换将清除当前账户的全部备忘录和附件，并用备份内容代替。\n此操作无法撤销，确定继续吗？'),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
 
         if self.save_timer.isActive():
             self.save_timer.stop()
             self._save_current_now()
 
+        stamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        staging = self.storage.app_dir / f'import_tmp_{stamp}'
         imported_dir = self.storage.app_dir / 'imported'
+        account_crypter = self.storage.crypter
 
-        try:
+        def job(worker):
+            """阶段 A（后台线程）：把备份完整解压、校验、按账户密钥重新加密到
+            临时目录。这一阶段不碰任何现有数据，失败/取消可整体丢弃。"""
+            out = {}
+            staging_att = staging / 'attachments'
+            staging_ext = staging / 'imported'
+            staging_att.mkdir(parents=True, exist_ok=True)
+            staging_ext.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(file_path, 'r') as zf:
-                names = zf.namelist()
-                if 'data.json' not in names:
-                    raise ValueError('备份文件中缺少 data.json')
-                with zf.open('data.json') as f:
-                    raw_data = f.read()
-                if self.storage.crypter.is_encrypted(raw_data):
-                    raw_data = self.storage.crypter.decrypt_bytes(raw_data)
-                imported_notes = json.loads(raw_data.decode('utf-8'))
+                zip_names = zf.namelist()
+                raw = zf.read('data.json')
+                if backup_crypter.is_encrypted(raw):
+                    raw = backup_crypter.decrypt_bytes(raw)
+                imported_notes = json.loads(raw.decode('utf-8'))
                 if not isinstance(imported_notes, list):
                     raise ValueError('备份文件格式错误')
 
-                if mode == 'replace':
-                    for f in self.storage.attachments_dir.iterdir():
-                        if f.is_file():
-                            try:
-                                f.unlink()
-                            except Exception:
-                                pass
-                    if imported_dir.exists():
-                        shutil.rmtree(imported_dir, ignore_errors=True)
-                    self.storage.notes = []
-
-                imported_dir.mkdir(parents=True, exist_ok=True)
-
-                # 解压 attachments/ (复制类型) —— 入库时重新加密
-                for name in names:
+                worker.report(tr('正在解包附件...'))
+                for name in zip_names:
+                    worker.check_cancelled()
                     if name.startswith('attachments/') and not name.endswith('/'):
                         rel = name[len('attachments/'):]
-                        if not rel:
+                        if not rel or '..' in rel.replace('\\', '/').split('/'):
                             continue
-                        target = self.storage.attachments_dir / rel
+                        target = staging_att / rel
                         target.parent.mkdir(parents=True, exist_ok=True)
                         with zf.open(name) as src:
-                            raw = src.read()
-                        if self.storage.crypter.is_encrypted(raw):
-                            payload = raw
+                            raw_blob = src.read()
+                        if backup_crypter.is_encrypted(raw_blob):
+                            payload = account_crypter.encrypt_bytes(backup_crypter.decrypt_bytes(raw_blob))
                         else:
-                            payload = self.storage.crypter.encrypt_bytes(raw)
+                            payload = account_crypter.encrypt_bytes(raw_blob)
                         target.write_bytes(payload)
 
-                # 解压 external/<att_id>/... 到 imported/<att_id>/...
+                worker.report(tr('正在解包外部引用...'))
                 external_present = set()
-                for name in names:
+                for name in zip_names:
+                    worker.check_cancelled()
                     if not name.startswith('external/'):
                         continue
                     parts = name.split('/', 2)
                     if len(parts) < 3 or not parts[1]:
                         continue
                     att_id, rest = parts[1], parts[2]
+                    if '..' in rest.replace('\\', '/').split('/'):
+                        continue
                     external_present.add(att_id)
                     if name.endswith('/'):
-                        (imported_dir / att_id / rest).mkdir(parents=True, exist_ok=True)
+                        (staging_ext / att_id / rest).mkdir(parents=True, exist_ok=True)
                         continue
-                    target = imported_dir / att_id / rest
+                    target = staging_ext / att_id / rest
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(name) as src, open(target, 'wb') as dst:
-                        dst.write(src.read())
+                        shutil.copyfileobj(src, dst)
 
-                # 把已还原的引用类型附件路径,重定向到本地 imported 目录
+                # 引用类型附件重定向到最终的 imported/ 目录
                 redirected = 0
                 for note in imported_notes:
                     for att in iter_attachment_tree(note.get('attachments', []) or []):
@@ -8851,14 +9989,65 @@ class MainWindow(QMainWindow):
                             att['original_path'] = str(new_path)
                             redirected += 1
 
+                out['notes'] = imported_notes
+                out['redirected'] = redirected
+                out['has_app'] = any(n.startswith('app/') for n in zip_names)
+            return out
+
+        worker = run_with_progress(self, tr('导入备份'), tr('正在校验并解包备份...'), job)
+        if worker.cancelled or worker.error:
+            shutil.rmtree(staging, ignore_errors=True)
+            if worker.error:
+                QMessageBox.critical(self, '导入失败', f'导入过程中出错:\n{worker.error}\n\n现有数据未受影响。')
+            else:
+                self.statusBar().showMessage(tr('已取消导入'), 3000)
+            return
+
+        result = worker.result or {}
+        imported_notes = result.get('notes') or []
+
+        # 阶段 B（主线程）：提交。只剩同卷移动和内存操作，速度快、可回滚。
+        old_notes = self.storage.notes
+        replaced_dir = None
+        try:
+            if mode == 'replace':
+                replaced_dir = self.storage.app_dir / f'replaced_{stamp}'
+                replaced_dir.mkdir(parents=True, exist_ok=True)
+                if self.storage.attachments_dir.exists():
+                    shutil.move(str(self.storage.attachments_dir), str(replaced_dir / 'attachments'))
+                self.storage.attachments_dir.mkdir(parents=True, exist_ok=True)
+                if imported_dir.exists():
+                    shutil.move(str(imported_dir), str(replaced_dir / 'imported'))
+                self.storage.notes = []
+
+            staging_att = staging / 'attachments'
+            if staging_att.exists():
+                for f in staging_att.iterdir():
+                    target = self.storage.attachments_dir / f.name
+                    if not target.exists():
+                        shutil.move(str(f), str(target))
+            staging_ext = staging / 'imported'
+            if staging_ext.exists():
+                imported_dir.mkdir(parents=True, exist_ok=True)
+                for child in staging_ext.iterdir():
+                    dest = imported_dir / child.name
+                    if dest.exists():
+                        if dest.is_dir():
+                            shutil.rmtree(dest, ignore_errors=True)
+                        else:
+                            dest.unlink()
+                    shutil.move(str(child), str(dest))
+
+            # batch()：抑制 get_screenshot_board() 等中间步骤的落盘，
+            # 整个提交只在最后写一次
+            with self.storage.batch():
                 screenshot_board = self.storage.get_screenshot_board()
                 existing_ids = {n['id'] for n in self.storage.notes}
+                existing_att_ids = {
+                    att.get('id') for _n, att, _p, _c in self.storage.iter_attachments()
+                }
                 for note in imported_notes:
                     if note.get('id') == SCREENSHOT_BOARD_ID:
-                        existing_att_ids = {
-                            att.get('id')
-                            for att in iter_attachment_tree(screenshot_board.get('attachments', []) or [])
-                        }
                         for att in note.get('attachments', []) or []:
                             self._dedupe_attachment_tree_ids(att, existing_att_ids)
                             screenshot_board.setdefault('attachments', []).append(att)
@@ -8866,30 +10055,54 @@ class MainWindow(QMainWindow):
                         continue
                     if mode == 'merge' and note.get('id') in existing_ids:
                         note['id'] = uuid.uuid4().hex
+                    # 普通便笺的附件 id 也要去重，否则重复导入会产生重复 id
+                    for att in note.get('attachments', []) or []:
+                        self._dedupe_attachment_tree_ids(att, existing_att_ids)
                     self.storage.notes.append(note)
-
                 self.storage.sort_notes()
-                self.storage.save()
-
-                has_app = any(n.startswith('app/') for n in names)
-
-            self.current_note_id = None
-            self.editor.clear()
-            self.screenshot_board = self.storage.get_screenshot_board()
-            self.current_note_id = self.screenshot_board['id']
-            self._refresh_screenshot_board()
-
-            extra = ''
-            if redirected:
-                extra += f'\n· {redirected} 个引用文件/文件夹已还原到本地'
-            if has_app:
-                extra += '\n· 备份中包含软件源码 (位于 zip 内 app/ 目录,需手动解压使用)'
-            QMessageBox.information(
-                self, '导入成功',
-                f'已导入 {len(imported_notes)} 条备忘录。{extra}'
-            )
+            if not self.storage.save():
+                raise OSError(self.storage.save_error or '数据写盘失败')
         except Exception as e:
-            QMessageBox.critical(self, '导入失败', f'导入过程中出错:\n{e}')
+            logger.exception('导入提交阶段失败，正在回滚')
+            self.storage.notes = old_notes
+            self.storage.save()  # 立即把旧数据重新持久化，防止中间态留在磁盘上
+            if replaced_dir is not None:
+                try:
+                    if (replaced_dir / 'attachments').exists():
+                        shutil.rmtree(self.storage.attachments_dir, ignore_errors=True)
+                        shutil.move(str(replaced_dir / 'attachments'), str(self.storage.attachments_dir))
+                    if (replaced_dir / 'imported').exists():
+                        shutil.rmtree(imported_dir, ignore_errors=True)
+                        shutil.move(str(replaced_dir / 'imported'), str(imported_dir))
+                    replaced_dir.rmdir()
+                except Exception:
+                    logger.exception('回滚旧附件目录失败: %s', replaced_dir)
+            shutil.rmtree(staging, ignore_errors=True)
+            QMessageBox.critical(self, '导入失败', f'导入过程中出错:\n{e}\n\n已恢复原有数据。')
+            return
+
+        shutil.rmtree(staging, ignore_errors=True)
+        if replaced_dir is not None:
+            shutil.rmtree(replaced_dir, ignore_errors=True)
+            logger.info('替换导入完成，旧附件已清理')
+
+        # 刷新 UI：尊重当前工作区，不再强切到截图板
+        self.current_note_id = None
+        self.editor.clear()
+        self.screenshot_board = self.storage.get_screenshot_board()
+        if self.workspace_mode == 'screenshot':
+            self.current_note_id = self.screenshot_board['id']
+        self._refresh_current_workspace()
+
+        extra = ''
+        if result.get('redirected'):
+            extra += f"\n· {result['redirected']} 个引用文件/文件夹已还原到本地"
+        if result.get('has_app'):
+            extra += '\n· 备份中包含软件源码 (位于 zip 内 app/ 目录,需手动解压使用)'
+        QMessageBox.information(
+            self, '导入成功',
+            f'已导入 {len(imported_notes)} 条备忘录。{extra}'
+        )
 
     def _dedupe_attachment_tree_ids(self, attachment, existing_ids):
         if not attachment:
@@ -8902,13 +10115,7 @@ class MainWindow(QMainWindow):
 
     def _open_data_folder(self):
         path = self.account_manager.app_root if self.account_manager else self.storage.app_dir
-        if sys.platform == 'win32':
-            try:
-                os.startfile(str(path))
-                return
-            except Exception:
-                pass
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        open_local_path(path)
 
     def _choose_data_folder(self):
         if not self.account_manager:
@@ -8942,7 +10149,16 @@ class MainWindow(QMainWindow):
 
         try:
             if reply == QMessageBox.Yes:
-                copy_data_root(current_root, new_root)
+                failures = copy_data_root(current_root, new_root)
+                if failures:
+                    preview = '\n'.join(f'{p}: {err}' for p, err in failures[:8])
+                    more = f'\n... 共 {len(failures)} 项失败' if len(failures) > 8 else ''
+                    QMessageBox.critical(
+                        self, '复制失败',
+                        tr('部分数据未能复制到新文件夹，已取消切换，当前数据保持不变：\n\n')
+                        + preview + more,
+                    )
+                    return
             if not self._reload_data_root(new_root):
                 QMessageBox.information(self, '选择数据文件夹', tr('没有进入新数据文件夹，已保留当前数据文件夹。'))
                 return
@@ -8954,27 +10170,19 @@ class MainWindow(QMainWindow):
     def _reload_data_root(self, app_root):
         app_root = Path(app_root)
 
-        new_manager = AccountManager(app_root=app_root)
-        account, crypter = new_manager.ensure_default_account()
-        if not crypter:
-            selected, selected_crypter = select_start_account(new_manager)
-            if not selected or not selected_crypter:
-                return False
-            account, crypter = selected, selected_crypter
-
         try:
-            if getattr(self, '_tracked_watcher', None):
-                paths = self._tracked_watcher.files() + self._tracked_watcher.directories()
-                if paths:
-                    self._tracked_watcher.removePaths(paths)
-        except Exception:
-            pass
-        try:
-            self.storage._cleanup_cache_dir()
-        except Exception:
-            pass
+            new_manager = AccountManager(app_root=app_root)
+            account, crypter = new_manager.ensure_default_account()
+            if not crypter:
+                selected, selected_crypter = select_start_account(new_manager)
+                if not selected or not selected_crypter:
+                    return False
+                account, crypter = selected, selected_crypter
+        except SaltFileError as exc:
+            QMessageBox.critical(self, tr('密钥文件异常'), str(exc))
+            return False
 
-        os.environ[DATA_ROOT_ENV] = str(app_root)
+        set_data_root(app_root)
         ensure_custom_files()
         reload_customization()
         app = QApplication.instance()
@@ -8982,25 +10190,15 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(customized_stylesheet(STYLE))
         apply_text_overrides()
         self.account_manager = new_manager
-        self.account = account
-        self.storage = Storage(
-            app_dir=self.account_manager.account_dir(account),
-            crypter=crypter,
-            migrate_apple=False,
-        )
-        self.screenshot_board = self.storage.get_screenshot_board()
-        self.current_note_id = self.screenshot_board['id'] if self.workspace_mode == 'screenshot' else None
-        self.view_switch.set_view('active', emit=False)
-        self.search_input.blockSignals(True)
-        self.search_input.clear()
-        self.search_input.blockSignals(False)
-        self.editor.clear()
-        self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
-        self.attachment_bar.setVisible(False)
-        self._refresh_editor_categories()
-        self._refresh_current_workspace()
-        self._setup_tracking_watchers()
-        self._start_background_tagging()
+        try:
+            storage = Storage(
+                app_dir=new_manager.account_dir(account),
+                crypter=crypter,
+            )
+        except SaltFileError as exc:
+            QMessageBox.critical(self, tr('密钥文件异常'), str(exc))
+            return False
+        self._attach_storage(storage, account)
         return True
 
     def closeEvent(self, event):
@@ -9041,6 +10239,12 @@ class MainWindow(QMainWindow):
                 auto.wait(2000)
             except Exception:
                 pass
+        tagw = getattr(self, '_tagging_worker', None)
+        if tagw is not None:
+            try:
+                tagw.wait(2000)
+            except Exception:
+                pass
         if getattr(self, 'tray_icon', None):
             self.tray_icon.hide()
         super().closeEvent(event)
@@ -9059,7 +10263,10 @@ class MainWindow(QMainWindow):
 
         menu = QMenu()
         show_action = menu.addAction(tr('显示 FRESH'))
-        show_action.triggered.connect(self._show_window_from_tray)
+        # 用户主动点菜单必须立即生效，不能吃 8 秒激活冷却
+        show_action.triggered.connect(lambda: self._show_window_from_tray(force=True))
+        lock_action = menu.addAction(tr('锁定'))
+        lock_action.triggered.connect(self._lock_now)
         menu.addSeparator()
         quick_note_action = menu.addAction(tr('快速新建文字'))
         quick_note_action.triggered.connect(self._quick_new_text_note)
@@ -9076,7 +10283,9 @@ class MainWindow(QMainWindow):
         self.tray_icon.show()
 
     def _make_app_icon(self):
-        size = 64
+        # 高分屏：用 256px 画布渲染再交给 QIcon 缩放，64px 固定画布在
+        # 150%/200% 缩放下托盘图标会发糊
+        size = 256
         pix = QPixmap(size, size)
         pix.fill(Qt.transparent)
         painter = QPainter(pix)
@@ -9084,11 +10293,11 @@ class MainWindow(QMainWindow):
         # 圆角方块底色
         painter.setBrush(QColor('#34C759'))
         painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
-        # F 字母
+        painter.drawRoundedRect(8, 8, size - 16, size - 16, 48, 48)
+        # F 字母（按画布比例用像素字号，避免点字号随 DPI 漂移溢出）
         painter.setPen(QColor('#FFFFFF'))
         font = QFont(painter.font())
-        font.setPointSize(36)
+        font.setPixelSize(int(size * 0.56))
         font.setWeight(QFont.Bold)
         painter.setFont(font)
         painter.drawText(pix.rect(), Qt.AlignCenter, 'F')
@@ -9108,6 +10317,53 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _lock_now(self):
+        """手动锁定：丢弃当前存储与解密缓存，重新走登录验证。
+
+        之前解锁后没有任何再锁定路径——关窗只是进托盘，离开电脑的
+        任何人点托盘图标就能看到全部内容。
+        """
+        if not self.account_manager:
+            return
+        has_password_account = any(
+            self.account_manager.account_has_password(acc)
+            for acc in self.account_manager.accounts()
+        )
+        if not has_password_account:
+            QMessageBox.information(
+                self, tr('锁定'),
+                tr('当前没有设置密码的账户，锁定不起作用。\n请先在「账户设置」里为账户设置密码。'))
+            return
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+            self._save_current_now()
+        self.hide()
+        while True:
+            account, crypter = select_start_account(self.account_manager)
+            if account and crypter:
+                break
+            reply = QMessageBox.question(
+                None, tr('已锁定'),
+                tr('未解锁任何账户。要退出 FRESH 吗？'),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self._quit_from_tray()
+                return
+        try:
+            storage = Storage(
+                app_dir=self.account_manager.account_dir(account),
+                crypter=crypter,
+            )
+        except SaltFileError as exc:
+            QMessageBox.critical(None, tr('密钥文件异常'), str(exc))
+            self._quit_from_tray()
+            return
+        self._attach_storage(storage, account)
+        self.show()
         self.raise_()
         self.activateWindow()
 
@@ -9149,7 +10405,7 @@ class LoginDialog(QDialog):
         self.setObjectName('account_dialog')
         self.setWindowTitle('FRESH')
         self.setModal(True)
-        self.setFixedWidth(390)
+        self.setMinimumWidth(390)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
@@ -9247,7 +10503,7 @@ class PasswordSetupDialog(QDialog):
         self.setObjectName('account_dialog')
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setFixedWidth(390)
+        self.setMinimumWidth(390)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
@@ -9260,7 +10516,7 @@ class PasswordSetupDialog(QDialog):
         self.password_edit = QLineEdit()
         self.password_edit.setObjectName('account_field')
         self.password_edit.setEchoMode(QLineEdit.Password)
-        self.password_edit.setPlaceholderText('新密码')
+        self.password_edit.setPlaceholderText(f'新密码（至少 {MIN_PASSWORD_LENGTH} 位，建议混合字母数字）')
         layout.addWidget(self.password_edit)
 
         self.confirm_edit = QLineEdit()
@@ -9296,8 +10552,9 @@ class PasswordSetupDialog(QDialog):
             self.confirm_edit.selectAll()
             self.confirm_edit.setFocus()
             return
-        if len(password) < 6:
-            self.error_label.setText('密码至少 6 位')
+        if len(password) < MIN_PASSWORD_LENGTH:
+            # 账户密码是离线暴力破解的唯一防线，6 位口令几小时就能被穷举
+            self.error_label.setText(f'密码至少 {MIN_PASSWORD_LENGTH} 位')
             self.password_edit.setFocus()
             return
         self.password = password
@@ -9312,7 +10569,7 @@ class NewAccountDialog(QDialog):
         self.setObjectName('account_dialog')
         self.setWindowTitle('新建账户')
         self.setModal(True)
-        self.setFixedWidth(390)
+        self.setMinimumWidth(390)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
@@ -9381,8 +10638,8 @@ class NewAccountDialog(QDialog):
                 self.confirm_edit.selectAll()
                 self.confirm_edit.setFocus()
                 return
-            if len(password) < 6:
-                self.error_label.setText('密码至少 6 位')
+            if len(password) < MIN_PASSWORD_LENGTH:
+                self.error_label.setText(f'密码至少 {MIN_PASSWORD_LENGTH} 位')
                 self.password_edit.setFocus()
                 return
             self.password = password
@@ -9398,7 +10655,7 @@ class AccountSettingsDialog(QDialog):
         self.setObjectName('account_dialog')
         self.setWindowTitle('账户')
         self.setModal(True)
-        self.setFixedWidth(430)
+        self.setMinimumWidth(430)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 28, 30, 24)
@@ -9481,23 +10738,56 @@ class AccountSettingsDialog(QDialog):
         except AccountError as exc:
             QMessageBox.warning(self, '账户', str(exc))
 
+    def _verify_current_password(self, action_label):
+        """改/清密码前先验证当前密码。
+
+        之前会话内任何人都能静默移除密码实现永久访问。"""
+        if not self.manager.account_has_password(self.current_account):
+            return True
+        for _ in range(3):
+            text, ok = QInputDialog.getText(
+                self, action_label,
+                tr('请输入当前密码以继续：'),
+                QLineEdit.Password,
+            )
+            if not ok:
+                return False
+            account, _crypter = self.manager.unlock(text)
+            if account and account.get('id') == self.current_account.get('id'):
+                return True
+            QMessageBox.warning(self, action_label, tr('密码不正确，请重试。'))
+        return False
+
     def _set_password(self):
-        dlg = PasswordSetupDialog('修改密码' if self.manager.account_has_password(self.current_account) else '设置密码', self)
+        action = '修改密码' if self.manager.account_has_password(self.current_account) else '设置密码'
+        if not self._verify_current_password(action):
+            return
+        dlg = PasswordSetupDialog(action, self)
         if dlg.exec() != QDialog.Accepted:
             return
-        try:
-            self.current_account, self.current_crypter = self.manager.set_account_password(
-                self.current_account,
-                self.current_crypter,
-                dlg.password,
-            )
-            self.accept()
-        except AccountError as exc:
-            QMessageBox.warning(self, '账户', str(exc))
-        except Exception as exc:
-            QMessageBox.critical(self, '账户', f'设置密码失败:\n{exc}')
+        manager = self.manager
+        account = self.current_account
+        crypter = self.current_crypter
+        password = dlg.password
+
+        def job(worker):
+            worker.report(tr('正在用新密码重新加密账户数据...'))
+            return manager.set_account_password(account, crypter, password)
+
+        # 重加密全部附件可能要几十秒，放后台线程；进度对话框模态防并发修改
+        worker = run_with_progress(self, action, tr('正在重新加密账户数据...'), job, cancellable=False)
+        if worker.error:
+            if isinstance(worker.error, AccountError):
+                QMessageBox.warning(self, '账户', str(worker.error))
+            else:
+                QMessageBox.critical(self, '账户', f'设置密码失败:\n{worker.error}')
+            return
+        self.current_account, self.current_crypter = worker.result
+        self.accept()
 
     def _clear_password(self):
+        if not self._verify_current_password('移除密码'):
+            return
         reply = QMessageBox.question(
             self,
             '移除密码',
@@ -9507,16 +10797,23 @@ class AccountSettingsDialog(QDialog):
         )
         if reply != QMessageBox.Yes:
             return
-        try:
-            self.current_account, self.current_crypter = self.manager.clear_account_password(
-                self.current_account,
-                self.current_crypter,
-            )
-            self.accept()
-        except AccountError as exc:
-            QMessageBox.warning(self, '账户', str(exc))
-        except Exception as exc:
-            QMessageBox.critical(self, '账户', f'移除密码失败:\n{exc}')
+        manager = self.manager
+        account = self.current_account
+        crypter = self.current_crypter
+
+        def job(worker):
+            worker.report(tr('正在用本机密钥重新加密账户数据...'))
+            return manager.clear_account_password(account, crypter)
+
+        worker = run_with_progress(self, '移除密码', tr('正在重新加密账户数据...'), job, cancellable=False)
+        if worker.error:
+            if isinstance(worker.error, AccountError):
+                QMessageBox.warning(self, '账户', str(worker.error))
+            else:
+                QMessageBox.critical(self, '账户', f'移除密码失败:\n{worker.error}')
+            return
+        self.current_account, self.current_crypter = worker.result
+        self.accept()
 
     def _create_account(self):
         dlg = NewAccountDialog(self)
@@ -9616,36 +10913,53 @@ def select_start_account(account_manager):
 
 
 def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName('FRESH')
+    app.setOrganizationName('FRESH')
+
     # 单实例：已有实例运行时静默退出，避免外部重复启动时不断把窗口拉到前台。
     runtime_dir = QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation) or tempfile.gettempdir()
     Path(runtime_dir).mkdir(parents=True, exist_ok=True)
     lock_file = QLockFile(str(Path(runtime_dir) / 'FRESH.lock'))
     lock_file.setStaleLockTime(0)
     if not lock_file.tryLock(100):
-        _activate_running_instance()
-        return
+        if _activate_running_instance():
+            return
+        # 没有活着的实例却拿不到锁：多半是崩溃残留，清掉重试，
+        # 不再让用户双击后毫无反应
+        lock_file.removeStaleLockFile()
+        if not lock_file.tryLock(100):
+            QMessageBox.critical(
+                None, 'FRESH',
+                'FRESH 似乎已在运行，或上次异常退出留下了锁文件。\n'
+                '请结束已运行的 FRESH 进程后重试。',
+            )
+            return
 
-    app = QApplication(sys.argv)
-    app.setApplicationName('FRESH')
-    app.setOrganizationName('FRESH')
     settings = QSettings('FRESH', 'FRESH')
     data_root = configured_data_root(settings)
+    setup_logging(data_root)
+    logger.info('FRESH 启动，数据目录: %s', data_root)
     ensure_custom_files()
     install_text_overrides(app)
     app.setStyleSheet(customized_stylesheet(STYLE))
     # 关闭窗口后不退出应用（保留在系统托盘）
     app.setQuitOnLastWindowClosed(False)
 
-    account_manager = AccountManager(app_root=data_root)
-    account, crypter = select_start_account(account_manager)
-    if not account or not crypter:
+    try:
+        account_manager = AccountManager(app_root=data_root)
+        account, crypter = select_start_account(account_manager)
+        if not account or not crypter:
+            return
+        storage = Storage(
+            app_dir=account_manager.account_dir(account),
+            crypter=crypter,
+        )
+    except SaltFileError as exc:
+        logger.critical('密钥文件异常: %s', exc)
+        QMessageBox.critical(None, '密钥文件异常', str(exc))
         return
 
-    storage = Storage(
-        app_dir=account_manager.account_dir(account),
-        crypter=crypter,
-        migrate_apple=False,
-    )
     window = MainWindow(storage, account=account, account_manager=account_manager)
     window.show()
 

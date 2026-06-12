@@ -1,0 +1,37 @@
+# UTF-8
+#
+# PyInstaller 版本信息资源。给 exe 加上文件版本/产品名/公司名等元数据，
+# 显著降低火绒/360/SmartScreen 对"无版本信息的未签名 GUI exe"的启发式权重。
+# 修改版本号时同时改 filevers / prodvers（四元组）与下面字符串里的版本。
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '080404b0',
+          [
+            StringStruct('CompanyName', 'FRESH'),
+            StringStruct('FileDescription', 'FRESH 便签'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'FRESH'),
+            StringStruct('LegalCopyright', 'Copyright (C) 2026 FRESH'),
+            StringStruct('OriginalFilename', 'FRESH.exe'),
+            StringStruct('ProductName', 'FRESH 便签'),
+            StringStruct('ProductVersion', '1.0.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)

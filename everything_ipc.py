@@ -70,6 +70,12 @@ if _IS_WIN:
     user32.DefWindowProcW.restype = LRESULT
     user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
     user32.SendMessageW.restype = LRESULT
+    # wintypes 没有 DWORD_PTR，结果出参用 POINTER(c_size_t) 等价表示
+    user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    user32.SendMessageTimeoutW.restype = LRESULT
     user32.PeekMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
     user32.PeekMessageW.restype = wintypes.BOOL
     user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
@@ -85,6 +91,9 @@ if _IS_WIN:
 WM_COPYDATA = 0x004A
 HWND_MESSAGE = wintypes.HWND(-3)
 PM_REMOVE = 0x0001
+# SendMessageTimeoutW 标志：目标挂死(无响应)时直接放弃。
+# 注意不要用 SMTO_BLOCK——我们依赖发送等待期间同步处理 Everything 回传的 WM_COPYDATA。
+SMTO_ABORTIFHUNG = 0x0002
 
 EVERYTHING_IPC_WNDCLASS = 'EVERYTHING_TASKBAR_NOTIFICATION'
 
@@ -187,6 +196,31 @@ def is_everything_running():
         return False
 
 
+def _read_wstr_bounded(buf_addr, cb_data, offset):
+    """在回复缓冲区 [buf_addr, buf_addr+cb_data) 内安全读取 NUL 结尾的 WCHAR 字符串。
+
+    偏移越界（畸形回复）返回 None；字符串未在缓冲区内终止则截断到缓冲区末尾，
+    避免 wstring_at 无限定长度读越界导致崩溃。
+    """
+    try:
+        off = int(offset)
+    except (TypeError, ValueError):
+        return None
+    # 至少要容得下 1 个 WCHAR
+    if off < 0 or off + 2 > cb_data:
+        return None
+    max_chars = (cb_data - off) // 2
+    try:
+        s = ctypes.wstring_at(buf_addr + off, max_chars)
+    except Exception:
+        return None
+    # 带 size 的 wstring_at 不会在 NUL 处停下，手动截断到首个 NUL
+    nul = s.find('\x00')
+    if nul != -1:
+        s = s[:nul]
+    return s
+
+
 def _parse_list_reply(buf_addr, cb_data):
     """解析 EVERYTHING_IPC_LISTW 回复，返回完整路径列表。"""
     if cb_data < ctypes.sizeof(EVERYTHING_IPC_LISTW_HEADER):
@@ -203,15 +237,12 @@ def _parse_list_reply(buf_addr, cb_data):
         if item_off + item_size > cb_data:
             break
         item = EVERYTHING_IPC_ITEMW.from_buffer_copy(buf[item_off:item_off + item_size])
-        # 字符串以 WCHAR 数组形式存在 buffer 内偏移处，null 结尾
-        try:
-            filename = ctypes.wstring_at(buf_addr + item.filename_offset)
-        except Exception:
-            filename = ''
-        try:
-            path = ctypes.wstring_at(buf_addr + item.path_offset)
-        except Exception:
-            path = ''
+        # 字符串以 WCHAR 数组形式存在 buffer 内偏移处，null 结尾；读取严格限制在回复缓冲区内
+        filename = _read_wstr_bounded(buf_addr, cb_data, item.filename_offset)
+        path = _read_wstr_bounded(buf_addr, cb_data, item.path_offset)
+        if filename is None or path is None:
+            # 偏移越界的畸形条目：跳过，不要崩溃
+            continue
         if path and filename:
             paths.append(os.path.join(path, filename))
         elif filename:
@@ -256,11 +287,13 @@ def query(search_text, max_results=200, search_flags=0, timeout_ms=5000):
             try:
                 cds_ptr = ctypes.cast(lparam, ctypes.POINTER(COPYDATASTRUCT))
                 cds = cds_ptr.contents
-                if int(cds.dwData) == reply_msg or True:  # Everything 通常使用 reply_copydata_message
+                # Everything 回复的 dwData == 查询头里的 reply_copydata_message。
+                # 只接受匹配的回复，其余 WM_COPYDATA 一律交给 DefWindowProc。
+                if int(cds.dwData) == reply_msg:
                     paths = _parse_list_reply(cds.lpData, cds.cbData)
                     results.extend(paths)
-                received[0] = True
-                return 1
+                    received[0] = True
+                    return 1
             except Exception:
                 received[0] = True
                 return 1
@@ -299,11 +332,20 @@ def query(search_text, max_results=200, search_flags=0, timeout_ms=5000):
         )
 
         # 发送查询；这一步可能会同步走 WindowProc，所以 received 可能立刻就 True
-        user32.SendMessageW(
+        # 用 SendMessageTimeoutW 替代 SendMessageW：Everything 消息循环卡死时不会把我们永久挂起。
+        # 只用 SMTO_ABORTIFHUNG，不加 SMTO_BLOCK（否则回传消息无法在等待期间被同步处理，必然互等超时）。
+        smto_result = ctypes.c_size_t(0)
+        sent = user32.SendMessageTimeoutW(
             hwnd_everything, WM_COPYDATA,
             wintypes.WPARAM(int(hwnd)),
             ctypes.addressof(cds),
+            SMTO_ABORTIFHUNG,
+            min(int(timeout_ms), 3000),
+            byref(smto_result),
         )
+        if not sent:
+            # 失败/超时（目标挂死等）。窗口由 finally 统一 DestroyWindow，这里直接放弃。
+            return None
 
         # 抽取消息直到收到回复或超时
         start = time.time()

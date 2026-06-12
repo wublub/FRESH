@@ -14,6 +14,9 @@ from storage import default_app_root
 
 
 VERIFIER_PREFIX = 'FRESH_ACCOUNT_VERIFIER:'
+MIN_PASSWORD_LENGTH = 10
+_REKEY_TMP_SUFFIX = '.rekey-tmp'
+_REKEY_COMMIT_FLAG = '.rekey-commit'
 
 class AccountError(Exception):
     pass
@@ -26,7 +29,10 @@ class AccountManager:
         self.index_file = self.app_root / 'accounts.json'
         self.app_root.mkdir(parents=True, exist_ok=True)
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
+        # 旧数据归档目录（import_legacy_into 成功后记录，供界面提示）
+        self.last_legacy_archive = None
         self._index = self._load_index()
+        self._recover_pending_rekeys()
 
     def _load_index(self):
         if not self.index_file.exists():
@@ -47,8 +53,73 @@ class AccountManager:
         self.app_root.mkdir(parents=True, exist_ok=True)
         data = json.dumps(self._index, ensure_ascii=False, indent=2)
         tmp = self.index_file.with_suffix('.json.tmp')
-        tmp.write_text(data, encoding='utf-8')
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self.index_file)
+
+    def _recover_pending_rekeys(self):
+        """启动时恢复上次中断的改密/清密迁移。
+
+        无需任何密码：提交阶段只剩重命名（新密文已在 .rekey-tmp 里），
+        直接续传；未到提交阶段则回滚，原文件从未被改动。
+        """
+        changed = False
+        for account in self._index.get('accounts') or []:
+            account_dir = self.accounts_dir / account.get('id', '')
+            if not account_dir.exists():
+                account.pop('pending_rekey', None)
+                continue
+            pending = account.get('pending_rekey')
+            commit_flag = account_dir / _REKEY_COMMIT_FLAG
+            tmps = list(account_dir.rglob(f'*{_REKEY_TMP_SUFFIX}'))
+            if pending and commit_flag.exists():
+                # 提交阶段被打断：完成剩余重命名，然后晋升新密钥参数
+                for tmp in tmps:
+                    try:
+                        os.replace(tmp, tmp.with_name(tmp.name[:-len(_REKEY_TMP_SUFFIX)]))
+                    except Exception:
+                        pass
+                self._promote_pending(account, pending)
+                try:
+                    commit_flag.unlink()
+                except Exception:
+                    pass
+                changed = True
+                continue
+            if pending or tmps or commit_flag.exists():
+                # 未进入提交阶段：原文件完好，安全回滚
+                for tmp in tmps:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
+                try:
+                    if commit_flag.exists():
+                        commit_flag.unlink()
+                except Exception:
+                    pass
+                if pending:
+                    account.pop('pending_rekey', None)
+                    changed = True
+        if changed:
+            self._save_index()
+
+    @staticmethod
+    def _promote_pending(account, pending):
+        if pending.get('kind') == 'password':
+            account['salt'] = pending.get('salt', '')
+            account['iterations'] = pending.get('iterations') or PASSWORD_KDF_ITERATIONS
+            account['verifier'] = pending.get('verifier', '')
+            account['password_set_at'] = datetime.now().isoformat()
+        else:
+            account.pop('salt', None)
+            account.pop('iterations', None)
+            account.pop('verifier', None)
+            account['password_cleared_at'] = datetime.now().isoformat()
+        account['updated_at'] = datetime.now().isoformat()
+        account.pop('pending_rekey', None)
 
     def accounts(self):
         return list(self._index.get('accounts') or [])
@@ -118,8 +189,8 @@ class AccountManager:
         name = (name or '').strip() or '我的账户'
         has_password = bool(password)
         if has_password:
-            if len(password or '') < 6:
-                raise AccountError('密码至少需要 6 个字符。')
+            if len(password or '') < MIN_PASSWORD_LENGTH:
+                raise AccountError(f'密码至少需要 {MIN_PASSWORD_LENGTH} 个字符。')
             existing, _ = self.unlock(password)
             if existing:
                 raise AccountError('这个密码已经属于一个账户。请为新账户设置不同密码。')
@@ -194,8 +265,8 @@ class AccountManager:
         return dict(account)
 
     def set_account_password(self, account, old_crypter, new_password: str):
-        if len(new_password or '') < 6:
-            raise AccountError('密码至少需要 6 个字符。')
+        if len(new_password or '') < MIN_PASSWORD_LENGTH:
+            raise AccountError(f'密码至少需要 {MIN_PASSWORD_LENGTH} 个字符。')
         existing, _ = self.unlock(new_password)
         if existing and existing.get('id') != account.get('id'):
             raise AccountError('这个密码已经属于另一个账户。请设置不同密码。')
@@ -206,14 +277,15 @@ class AccountManager:
         target_dir = self.account_dir(account)
         salt = os.urandom(32)
         new_crypter = PasswordCrypter(new_password, salt, PASSWORD_KDF_ITERATIONS)
-        self._reencrypt_account_files(target_dir, old_crypter, new_crypter)
         verifier = new_crypter.encrypt_bytes((VERIFIER_PREFIX + account['id']).encode('utf-8'))
-        account['salt'] = base64.urlsafe_b64encode(salt).decode('ascii')
-        account['iterations'] = PASSWORD_KDF_ITERATIONS
-        account['verifier'] = base64.urlsafe_b64encode(verifier).decode('ascii')
-        account['password_set_at'] = datetime.now().isoformat()
-        account['updated_at'] = datetime.now().isoformat()
-        account = self._replace_account(account)
+        pending = {
+            'kind': 'password',
+            'salt': base64.urlsafe_b64encode(salt).decode('ascii'),
+            'iterations': PASSWORD_KDF_ITERATIONS,
+            'verifier': base64.urlsafe_b64encode(verifier).decode('ascii'),
+            'started_at': datetime.now().isoformat(),
+        }
+        account = self._run_rekey(account, target_dir, old_crypter, new_crypter, pending)
         return account, new_crypter
 
     def clear_account_password(self, account, old_crypter):
@@ -224,14 +296,38 @@ class AccountManager:
             return account, Crypter(self.account_dir(account))
         target_dir = self.account_dir(account)
         new_crypter = Crypter(target_dir)
-        self._reencrypt_account_files(target_dir, old_crypter, new_crypter)
-        account.pop('salt', None)
-        account.pop('iterations', None)
-        account.pop('verifier', None)
-        account['password_cleared_at'] = datetime.now().isoformat()
-        account['updated_at'] = datetime.now().isoformat()
-        account = self._replace_account(account)
+        pending = {
+            'kind': 'machine',
+            'started_at': datetime.now().isoformat(),
+        }
+        account = self._run_rekey(account, target_dir, old_crypter, new_crypter, pending)
         return account, new_crypter
+
+    def _run_rekey(self, account, target_dir: Path, old_crypter, new_crypter, pending):
+        """两阶段重加密：
+
+        1. 先把新密钥参数作为 pending_rekey 落盘（新 salt 绝不能只存在内存里，
+           否则中途崩溃后已转换的文件在密码学上永久不可恢复）；
+        2. 把所有文件加密成 .rekey-tmp 旁路副本，原文件保持原样，任何失败都
+           能无损回滚；
+        3. 提交阶段只做纯重命名（写 .rekey-commit 标记），崩溃后启动时无需
+           密码即可续传，最后晋升 pending 为正式密钥参数。
+        """
+        account['pending_rekey'] = pending
+        account = self._replace_account(account)
+        try:
+            self._reencrypt_account_files(target_dir, old_crypter, new_crypter)
+        except Exception:
+            account.pop('pending_rekey', None)
+            self._replace_account(account)
+            raise
+        self._promote_pending(account, pending)
+        account = self._replace_account(account)
+        try:
+            (target_dir / _REKEY_COMMIT_FLAG).unlink()
+        except Exception:
+            pass
+        return account
 
     def _reencrypt_account_files(self, target_dir: Path, old_crypter, new_crypter):
         files = [target_dir / 'data.json']
@@ -239,14 +335,34 @@ class AccountManager:
             folder = target_dir / dirname
             if folder.exists():
                 files.extend(path for path in folder.iterdir() if path.is_file() and not path.name.startswith('.'))
-        for path in files:
-            if not path.exists() or not path.is_file():
-                continue
-            blob = path.read_bytes()
-            plain = old_crypter.decrypt_bytes(blob) if old_crypter and old_crypter.is_encrypted(blob) else blob
-            encrypted = new_crypter.encrypt_bytes(plain)
-            tmp = path.with_name(path.name + '.tmp')
-            tmp.write_bytes(encrypted)
+        staged = []
+        try:
+            for path in files:
+                if not path.exists() or not path.is_file():
+                    continue
+                if path.name.endswith(_REKEY_TMP_SUFFIX):
+                    continue
+                blob = path.read_bytes()
+                plain = old_crypter.decrypt_bytes(blob) if old_crypter and old_crypter.is_encrypted(blob) else blob
+                encrypted = new_crypter.encrypt_bytes(plain)
+                tmp = path.with_name(path.name + _REKEY_TMP_SUFFIX)
+                tmp.write_bytes(encrypted)
+                staged.append((tmp, path))
+        except Exception:
+            # 准备阶段失败：原文件未动，清掉旁路副本即可完整回滚
+            for tmp, _ in staged:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+            raise
+        # 提交阶段：只剩重命名。标记文件让崩溃后的启动恢复能识别该阶段。
+        commit_flag = target_dir / _REKEY_COMMIT_FLAG
+        with open(commit_flag, 'w', encoding='utf-8') as fh:
+            fh.write(datetime.now().isoformat())
+            fh.flush()
+            os.fsync(fh.fileno())
+        for tmp, path in staged:
             os.replace(tmp, path)
 
     def import_legacy_into(self, account, crypter: PasswordCrypter):
@@ -275,11 +391,34 @@ class AccountManager:
             except Exception:
                 pass
 
-        encrypted = crypter.encrypt_bytes(json.dumps(notes, ensure_ascii=False, indent=2).encode('utf-8'))
+        encrypted = crypter.encrypt_bytes(json.dumps(notes, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
         tmp = (target_dir / 'data.json').with_suffix('.json.tmp')
         tmp.write_bytes(encrypted)
         os.replace(tmp, target_dir / 'data.json')
+        self._archive_legacy_data()
         return True
+
+    def _archive_legacy_data(self):
+        """导入完成后把 app_root 下的旧数据归档。
+
+        旧副本只受本机密钥保护（盐就在旁边的 .fkey 里），原样留在原地会让
+        之后设置的账户密码形同虚设；归档后由界面提示用户确认删除。
+        """
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        archive_dir = self.app_root / f'legacy_backup_{stamp}'
+        moved_any = False
+        for name in ('data.json', 'attachments', 'trash'):
+            src = self.app_root / name
+            if not src.exists():
+                continue
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(archive_dir / name))
+                moved_any = True
+            except Exception:
+                pass
+        if moved_any:
+            self.last_legacy_archive = archive_dir
 
     def _copy_legacy_blob_dir(self, name: str, legacy_crypter: Crypter, crypter: PasswordCrypter, target_dir: Path):
         src_dir = self.app_root / name

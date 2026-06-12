@@ -50,3 +50,17 @@ $RECYCLE.BIN/
 *.tmp
 *.bak
 *.old
+
+# 工具临时目录与运行数据目录（FRESH_Data/ 不带前导路径，同时覆盖仓库根和 dist/ 下，防止 .fkey 和加密数据被提交）
+.codex_tmp/
+FRESH_Data/
+
+# 第三方 Everything CLI 二进制：本地保留供开发/打包使用，不入库
+es.exe
+
+# 数据损坏留底与备份轮换（运行时产生）
+data.corrupt-*.json
+data.json.bak
+legacy_backup_*/
+replaced_*/
+import_tmp_*/

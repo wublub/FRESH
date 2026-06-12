@@ -103,8 +103,6 @@ FRESH_Data\
 └── custom.qss              # 界面样式覆盖
 ```
 
-> 程序会尝试从旧目录 `%APPDATA%\AppleMemo` 迁移已有数据。
-
 ---
 
 ## 🎨 自定义文字和样式

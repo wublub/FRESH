@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_paths import resolve_data_root
+
 
 APP_NAME = 'FRESH'
 TEXT_CONFIG_NAME = 'ui_text.json'
@@ -145,7 +147,6 @@ DEFAULT_TEXTS = {
     '当前搜索“{search}”。': '当前搜索“{search}”。',
     '当前分类为“{category}”。': '当前分类为“{category}”。',
     '清除筛选': '清除筛选',
-    '新建备忘录': '新建备忘录',
     '归档里还没有内容': '归档里还没有内容',
     '截图归档后会出现在这里，也会按分类进入时间线。': '截图归档后会出现在这里，也会按分类进入时间线。',
     '附件或备忘录归档后会出现在这里，也会按分类进入时间线。': '附件或备忘录归档后会出现在这里，也会按分类进入时间线。',
@@ -217,8 +218,6 @@ DEFAULT_TEXTS = {
     '拖入文件或文件夹': '拖入文件或文件夹',
     '+': '+',
     '暂无附件,拖入文件或文件夹': '暂无附件,拖入文件或文件夹',
-    '选择文件...': '选择文件...',
-    '选择文件夹...': '选择文件夹...',
     '选择文件': '选择文件',
     '选择文件夹': '选择文件夹',
     '删除备忘录': '删除备忘录',
@@ -313,7 +312,6 @@ DEFAULT_TEXTS = {
     '这里编辑 custom.qss，会追加在内置样式之后。保存后立即应用。': '这里编辑 custom.qss，会追加在内置样式之后。保存后立即应用。',
     '占位符缺失': '占位符缺失',
     '下面这些文字缺少必要占位符，保存后动态数字或名称可能无法显示：\n\n{items}\n\n仍然保存吗？': '下面这些文字缺少必要占位符，保存后动态数字或名称可能无法显示：\n\n{items}\n\n仍然保存吗？',
-    '保存失败': '保存失败',
     '无法保存配置：{error}': '无法保存配置：{error}',
     '选择一条备忘录': '选择一条备忘录',
     '从左侧列表打开一条备忘录。': '从左侧列表打开一条备忘录。',
@@ -387,19 +385,19 @@ FRESH custom.qss
 class _TextRefreshFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Show and isinstance(obj, QWidget):
+            # 只对顶层窗口调度全树扫描：全局 patch 的 setText 等 setter 在任何
+            # 窗口创建前就已装好，子控件文本在设置时已被翻译，对每个显示出来
+            # 的子控件再做 findChildren 全子树遍历是 O(N×深度) 的重复扫描；
+            # 重载配置的刷新走显式的 apply_text_overrides() 全量调用，不依赖
+            # 这里。
+            if not obj.isWindow():
+                return False
             QTimer.singleShot(0, lambda w=obj: apply_text_overrides(w))
         return False
 
 
 def customization_dir():
-    configured = os.getenv('FRESH_APP_ROOT')
-    if configured:
-        return Path(configured)
-    if getattr(sys, 'frozen', False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-    return base_dir / 'FRESH_Data'
+    return resolve_data_root()
 
 
 def ensure_custom_files():
@@ -551,6 +549,69 @@ def save_custom_qss_text(text):
     custom_qss_path().write_text(text or '', encoding='utf-8')
 
 
+def validate_qss_text(text: str) -> list:
+    """返回警告字符串列表；空列表表示未发现问题。
+
+    纯文本扫描（不依赖 Qt），供保存自定义 QSS 前校验。检查：
+    1) '{' 与 '}' 数量不平衡 —— 报告多/少几个，并给出最后一个不平衡处的
+       大致行号；
+    2) '/*' 注释未闭合 —— 给出注释起始行号。
+    注释内部的花括号会被跳过，不参与配对统计。
+    """
+    warnings = []
+    if not isinstance(text, str) or not text:
+        return warnings
+
+    line = 1
+    in_comment = False
+    comment_start_line = 0
+    open_lines = []        # 尚未配对的 '{' 所在行号（栈）
+    extra_close = 0        # 多余的 '}' 个数
+    extra_close_line = 0   # 最后一个多余 '}' 的行号
+
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\n':
+            line += 1
+            i += 1
+            continue
+        if in_comment:
+            if ch == '*' and i + 1 < n and text[i + 1] == '/':
+                in_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if ch == '/' and i + 1 < n and text[i + 1] == '*':
+            in_comment = True
+            comment_start_line = line
+            i += 2
+            continue
+        if ch == '{':
+            open_lines.append(line)
+        elif ch == '}':
+            if open_lines:
+                open_lines.pop()
+            else:
+                extra_close += 1
+                extra_close_line = line
+        i += 1
+
+    if open_lines:
+        warnings.append(
+            f"第 {open_lines[-1]} 行附近：缺少 {len(open_lines)} 个 '}}'，后续规则可能全部失效"
+        )
+    if extra_close:
+        warnings.append(
+            f"第 {extra_close_line} 行附近：多了 {extra_close} 个 '}}'（缺少对应的 '{{'），请检查配对"
+        )
+    if in_comment:
+        warnings.append(f"第 {comment_start_line} 行的 /* 注释未闭合，其后的样式规则会被当作注释忽略")
+    return warnings
+
+
 def customized_stylesheet(base_style):
     ensure_custom_files()
     try:
@@ -587,7 +648,10 @@ def translate_text(text):
         try:
             return template.format(**match.groupdict())
         except Exception:
-            return template
+            # 模板占位符写错（如把 {count} 抄成 {Count}，或加了不存在的
+            # 占位符）时回退到已格式化的原文，避免界面直接显示带花括号
+            # 的原始模板。
+            return text
     return text
 
 

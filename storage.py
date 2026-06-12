@@ -5,12 +5,15 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import ftrack
-from crypter import Crypter
+from app_paths import resolve_data_root
+from crypter import MAGIC, Crypter
 
 SCREENSHOT_BOARD_ID = '__screenshot_board__'
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'}
@@ -21,6 +24,9 @@ DEFAULT_SCAN_SETTINGS = {
     'scan_roots': [],       # 自定义扫描根目录列表，空 = 全部 NTFS 盘
 }
 
+# 本进程内仍在使用的解密缓存目录（切换账户等场景会同时存在多个 Storage）
+_ACTIVE_CACHE_DIRS = set()
+
 
 def is_attachment_image(attachment):
     if not attachment or attachment.get('type') == 'folder':
@@ -29,19 +35,11 @@ def is_attachment_image(attachment):
 
 
 def default_app_root() -> Path:
-    configured = os.getenv('FRESH_APP_ROOT')
-    if configured:
-        return Path(configured)
-    if getattr(sys, 'frozen', False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-    return base_dir / 'FRESH_Data'
+    return resolve_data_root()
 
 
 class Storage:
-    def __init__(self, app_dir=None, crypter=None, migrate_apple=True):
-        appdata = os.getenv('APPDATA') or str(Path.home())
+    def __init__(self, app_dir=None, crypter=None):
         self.app_dir = Path(app_dir) if app_dir else default_app_root()
         self.attachments_dir = self.app_dir / 'attachments'
         self.trash_dir = self.app_dir / 'trash'
@@ -52,11 +50,20 @@ class Storage:
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         # 加密器：data.json 与 attachments 文件统一加密
         self.crypter = crypter or Crypter(self.app_dir)
-        # 临时解密缓存：UI 读图时透明使用，退出时清理
+        # 数据加载失败时进入只读保护：拒绝任何落盘，避免覆盖仅存的原始文件
+        self.load_failed = False
+        self.load_error = ''
+        self.save_error = ''
+        self.on_save_failed = None  # main 侧注入的回调：保存失败时提示用户
+        self._defer_save = False
+        self._dirty = False
+        self._last_bak_time = 0.0
+        # 临时解密缓存：UI 读图时透明使用，退出时清理。
+        # 先清扫上次崩溃/被强杀留下的明文残留（被占用的文件会清理失败，留待下次）。
+        self._sweep_stale_cache_dirs()
         self.cache_dir = Path(tempfile.mkdtemp(prefix='FRESH-cache-'))
+        _ACTIVE_CACHE_DIRS.add(str(self.cache_dir))
         atexit.register(self._cleanup_cache_dir)
-        if migrate_apple:
-            self._migrate_from_apple_memo(Path(appdata) / 'AppleMemo')
         self.notes = self._load()
         self.scan_settings = self._load_scan_settings()
         # 历史遗留：把现存明文文件加密；已软删除的本地文件移入 trash/
@@ -66,8 +73,21 @@ class Storage:
         self.secure_image_references()
         self._sweep_deleted_files_to_trash()
 
+    @staticmethod
+    def _sweep_stale_cache_dirs():
+        try:
+            tmp_root = Path(tempfile.gettempdir())
+            for stale in tmp_root.glob('FRESH-cache-*'):
+                if str(stale) in _ACTIVE_CACHE_DIRS:
+                    continue
+                if stale.is_dir():
+                    shutil.rmtree(stale, ignore_errors=True)
+        except Exception:
+            pass
+
     def _cleanup_cache_dir(self):
         try:
+            _ACTIVE_CACHE_DIRS.discard(str(self.cache_dir))
             if self.cache_dir.exists():
                 shutil.rmtree(self.cache_dir, ignore_errors=True)
         except Exception:
@@ -97,22 +117,6 @@ class Storage:
             pass
         return merged
 
-    def _migrate_from_apple_memo(self, old_dir):
-        old_data = old_dir / 'data.json'
-        old_attachments = old_dir / 'attachments'
-        if self.data_file.exists() or not old_data.exists():
-            return
-        try:
-            shutil.copy2(old_data, self.data_file)
-            if old_attachments.exists():
-                for src in old_attachments.iterdir():
-                    if src.is_file():
-                        target = self.attachments_dir / src.name
-                        if not target.exists():
-                            shutil.copy2(src, target)
-        except Exception:
-            pass
-
     def _load(self):
         if not self.data_file.exists():
             return []
@@ -121,13 +125,13 @@ class Storage:
             if not raw:
                 return []
             was_plain = not self.crypter.is_encrypted(raw)
-            if was_plain:
-                payload = raw  # 历史明文
-            else:
-                payload = self.crypter.decrypt_bytes(raw)
+            if was_plain and not getattr(self.crypter, 'accepts_plaintext', True):
+                # 密码账户不存在合法明文，出现明文说明文件被篡改或损坏
+                raise ValueError('数据文件为明文，可能被篡改或损坏')
+            payload = raw if was_plain else self.crypter.decrypt_bytes(raw)
             data = json.loads(payload.decode('utf-8'))
             if not isinstance(data, list):
-                return []
+                raise ValueError('数据文件结构异常（根节点不是列表）')
             for note in data:
                 if note.get('archived') and not note.get('archived_at'):
                     note['archived_at'] = note.get('updated_at') or note.get('created_at') or ''
@@ -143,19 +147,84 @@ class Storage:
             if was_plain:
                 self.save()
             return data
-        except Exception:
+        except Exception as exc:
+            # 解密失败（密钥不符）/损坏/解析失败：进入只读保护。
+            # 绝不能返回空列表继续正常运行——随后的任何一次 save() 都会
+            # 用空数据覆盖掉本来可能修复的原始密文。
+            self.load_failed = True
+            self.load_error = str(exc)
+            self._backup_corrupt_data_file()
             return []
 
-    def save(self):
+    def _backup_corrupt_data_file(self):
+        """把无法加载的 data.json 复制留底，原文件保持原样。"""
         try:
-            payload = json.dumps(self.notes, ensure_ascii=False, indent=2).encode('utf-8')
-            blob = self.crypter.encrypt_bytes(payload)
-            # 原子写：先写临时再替换，避免崩溃留下半文件
-            tmp = self.data_file.with_suffix('.json.tmp')
-            tmp.write_bytes(blob)
-            os.replace(tmp, self.data_file)
+            stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+            backup = self.data_file.with_name(f'data.corrupt-{stamp}.json')
+            if not backup.exists():
+                shutil.copy2(self.data_file, backup)
         except Exception:
             pass
+
+    def save(self):
+        if self.load_failed:
+            # 只读保护：数据没有正确加载，拒绝覆盖磁盘上的原始文件
+            return False
+        if self._defer_save:
+            self._dirty = True
+            return True
+        return self._write_data_file()
+
+    def _write_data_file(self):
+        try:
+            payload = json.dumps(self.notes, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            blob = self.crypter.encrypt_bytes(payload)
+            # 原子写：先写临时再替换；fsync 确保断电后不会留下截断文件
+            tmp = self.data_file.with_suffix('.json.tmp')
+            with open(tmp, 'wb') as fh:
+                fh.write(blob)
+                fh.flush()
+                os.fsync(fh.fileno())
+            # 周期性保留上一版备份，便于 data.json 意外损坏时找回
+            now = time.monotonic()
+            if self.data_file.exists() and now - self._last_bak_time > 60:
+                try:
+                    shutil.copy2(self.data_file, self.data_file.with_suffix('.json.bak'))
+                    self._last_bak_time = now
+                except Exception:
+                    pass
+            os.replace(tmp, self.data_file)
+            self._dirty = False
+            self.save_error = ''
+            return True
+        except Exception as exc:
+            # 磁盘满/被锁定/权限问题：必须让用户知道，否则会以为已保存
+            self.save_error = str(exc)
+            callback = self.on_save_failed
+            if callback:
+                try:
+                    callback(str(exc))
+                except Exception:
+                    pass
+            return False
+
+    @contextmanager
+    def batch(self):
+        """批量操作期间暂缓落盘，退出时统一写一次。
+
+        用于"全部彻底删除"、多文件拖入等会触发大量 save() 的路径，
+        避免 N 次全库序列化+加密+写盘。
+        """
+        if self._defer_save:
+            yield self
+            return
+        self._defer_save = True
+        try:
+            yield self
+        finally:
+            self._defer_save = False
+            if self._dirty:
+                self.save()
 
     def create_note(self, category=''):
         now = datetime.now().isoformat()
@@ -437,11 +506,12 @@ class Storage:
                 return attachment
         return None
 
-    def add_screenshot(self, source_path, copy=False):
+    def add_screenshot(self, source_path):
         source = Path(source_path)
         if not source.is_file() or source.suffix.lower() not in IMAGE_EXTS:
             return None
         board = self.get_screenshot_board()
+        # 截图板的图片一律落为账户内加密副本
         return self.add_attachment(board['id'], source_path, copy=True)
 
     def add_child_attachment(self, parent_attachment_id, source_path, copy=False):
@@ -804,21 +874,26 @@ class Storage:
 
     def _decrypted_cache_path(self, enc_path: Path, stored_name: str) -> Path:
         """把加密附件解密到临时缓存目录后，返回缓存路径。明文遗留文件直接返回原路径。"""
-        try:
-            blob = enc_path.read_bytes()
-        except Exception:
-            return enc_path
-        if not self.crypter.is_encrypted(blob):
-            return enc_path
         cache = self.cache_dir / stored_name
         try:
-            # 如果缓存已是最新，复用
-            if cache.exists():
-                try:
-                    if cache.stat().st_mtime >= enc_path.stat().st_mtime:
-                        return cache
-                except Exception:
-                    pass
+            src_mtime = enc_path.stat().st_mtime
+        except Exception:
+            return enc_path
+        # 缓存命中：只做 stat 比较，不再整文件读盘
+        try:
+            if cache.exists() and cache.stat().st_mtime >= src_mtime:
+                return cache
+        except Exception:
+            pass
+        try:
+            with open(enc_path, 'rb') as fh:
+                head = fh.read(len(MAGIC))
+                if not head.startswith(MAGIC):
+                    return enc_path
+                blob = head + fh.read()
+        except Exception:
+            return enc_path
+        try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_bytes(self.crypter.decrypt_bytes(blob))
             return cache
@@ -893,15 +968,18 @@ class Storage:
             return True
         return False
 
-    def attachment_path_matches_tracking(self, attachment):
-        """附件当前 original_path 是否还能和 tracking 对上。"""
+    def attachment_path_matches_tracking(self, attachment, save=True):
+        """附件当前 original_path 是否还能和 tracking 对上。
+
+        save=False 供后台线程（备份导出等）只读调用，避免在工作线程写盘。
+        """
         tracking = attachment.get('tracking') or {}
         original_path = attachment.get('original_path', '')
         if not tracking:
             matched = Path(original_path).exists()
         else:
             matched = self._tracking_matches_path(original_path, tracking)
-        if matched:
+        if matched and save:
             self.sync_external_attachment_name(attachment, original_path)
         return matched
 
@@ -1222,7 +1300,19 @@ class Storage:
             pass
 
     def _migrate_plain_attachments(self):
-        """启动时把 attachments/ 和 trash/ 中的明文文件加密。"""
+        """启动时把 attachments/ 和 trash/ 中的明文文件加密。
+
+        只读前 6 字节判断是否已加密，避免每次启动把几 GB 附件全部读入内存；
+        全部迁移完成后写标记文件，之后启动直接跳过整个目录遍历。
+        """
+        if not getattr(self.crypter, 'accepts_plaintext', True):
+            # 密码账户从创建起全部加密写入，不存在合法明文；
+            # 把来历不明的明文"收编"加密反而会洗白被注入的文件
+            return
+        marker = self.app_dir / '.attachments_encrypted'
+        if marker.exists():
+            return
+        complete = True
         for base in (self.attachments_dir, self.trash_dir):
             try:
                 if not base.exists():
@@ -1232,18 +1322,35 @@ class Storage:
                         continue
                     if f.name.startswith('.'):
                         continue
+                    if f.name.endswith('.enc.tmp'):
+                        # 上次迁移中断留下的半成品
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        with open(f, 'rb') as fh:
+                            head = fh.read(len(MAGIC))
+                    except Exception:
+                        complete = False
+                        continue
+                    if not head:
+                        continue  # 空文件
+                    if head.startswith(MAGIC):
+                        continue  # 已加密
                     try:
                         blob = f.read_bytes()
-                    except Exception:
-                        continue
-                    if self.crypter.is_encrypted(blob):
-                        continue
-                    try:
                         encrypted = self.crypter.encrypt_bytes(blob)
                         tmp = f.with_suffix(f.suffix + '.enc.tmp')
                         tmp.write_bytes(encrypted)
                         os.replace(tmp, f)
                     except Exception:
-                        pass
+                        complete = False
+            except Exception:
+                complete = False
+        if complete:
+            try:
+                marker.write_text(datetime.now().isoformat(), encoding='utf-8')
             except Exception:
                 pass

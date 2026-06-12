@@ -6,6 +6,7 @@ import shutil
 import string
 import subprocess
 import sys
+import time
 from ctypes import byref, wintypes
 from pathlib import Path
 
@@ -201,6 +202,20 @@ def read_tracking_tag(path, stream=ADS_STREAM):
     tag = read_tag(path, stream=stream)
     if tag:
         return tag
+    return read_folder_marker(path)
+
+
+def _read_tracking_tag_known_kind(path, stream, is_dir):
+    """read_tracking_tag 的扫描专用版：is_dir 已由 _iter_disk(os.walk) 得知。
+
+    非目录直接跳过 folder marker 分支，省掉 read_folder_marker 内部对每个文件的
+    exists()/is_dir() 两次多余 stat；目录则与 read_tracking_tag 行为一致。
+    """
+    tag = read_tag(path, stream=stream)
+    if tag:
+        return tag
+    if not is_dir:
+        return None
     return read_folder_marker(path)
 
 
@@ -483,8 +498,8 @@ def _iter_disk(roots=None, drive_hints=None, progress=None, cancel=None, ntfs_on
 
 def scan_for_tag(tag, roots=None, progress=None, cancel=None, stream=ADS_STREAM, drive_hints=None):
     """扫描磁盘查找带指定追踪标记的文件/文件夹。"""
-    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
-        if read_tracking_tag(path, stream) == tag:
+    for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
+        if _read_tracking_tag_known_kind(path, stream, is_dir) == tag:
             return path
     return None
 
@@ -501,10 +516,10 @@ def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None, s
         return {}
     remaining = set(tags)
     found = {}
-    for path, _is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
+    for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
         if not remaining:
             break
-        t = read_tracking_tag(path, stream)
+        t = _read_tracking_tag_known_kind(path, stream, is_dir)
         if t and t in remaining:
             found[t] = path
             remaining.discard(t)
@@ -571,7 +586,8 @@ def scan_for_name(name, roots=None, progress=None, cancel=None, limit=50, drive_
     return matches
 
 
-def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, max_depth=3):
+def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, max_depth=3,
+                                time_budget=0.5):
     """Small-scope name lookup used before slow disk scans.
 
     This intentionally avoids walking whole drive roots. It checks likely
@@ -579,9 +595,17 @@ def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, 
     in all current drive roots. That covers stale records like Desktop/file.pdf
     when the file is actually under Desktop/project/file.pdf, and cross-drive
     cuts to F:\file.pdf, without showing a long "search disk" workflow.
+
+    time_budget: 总时间预算（秒），超时立即返回已收集结果，防止大盘遍历卡住调用方
+    （UI 线程）。None/0 表示不限时。
     """
     if not name:
         return []
+
+    deadline = (time.monotonic() + time_budget) if time_budget else None
+
+    def out_of_time():
+        return deadline is not None and time.monotonic() >= deadline
 
     target = name.lower()
     matches = []
@@ -603,7 +627,7 @@ def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, 
             return
 
     def add_root(root, recursive=True):
-        if len(matches) >= limit or not root:
+        if len(matches) >= limit or not root or out_of_time():
             return
         try:
             root_path = Path(root)
@@ -620,7 +644,7 @@ def find_nearby_name_candidates(name, original_path=None, roots=None, limit=50, 
 
             base_depth = len(root_path.parts)
             for dirpath, dirnames, filenames in os.walk(root_path, onerror=lambda e: None):
-                if len(matches) >= limit:
+                if len(matches) >= limit or out_of_time():
                     return
                 depth = len(Path(dirpath).parts) - base_depth
                 if depth >= max_depth:
@@ -780,25 +804,42 @@ def scan_for_hashes(tag_to_tracking, roots=None, progress=None, cancel=None, on_
 EVERYTHING_DOWNLOAD_URL = 'https://www.voidtools.com/downloads/#cli'
 
 _ES_EXE_CACHE = None  # None = 未探测; '' = 探测过但不存在; 路径字符串 = 已找到
+_ES_EXE_MISS_AT = None  # 负缓存（未找到）的 time.monotonic 时间戳
+_ES_EXE_MISS_TTL = 60.0  # 负缓存有效期（秒）：运行期间装上 Everything 后还能被重新发现
 
 
 def _find_running_everything_dir():
-    """通过 wmic 找运行中的 Everything.exe 的目录。"""
-    if not _IS_WIN:
-        return None
+    """Return None without spawning PowerShell or WMIC.
+
+    Everything IPC is still auto-detected by window class. The CLI fallback is
+    limited to user-provided paths, PATH, app-adjacent files, and common install
+    locations so the packaged app does not look like a shell loader.
+    """
+    return None
+
+
+def find_running_everything_dir():
+    """公开入口：返回运行中的 Everything.exe 所在目录；没有/失败返回 None。
+
+    供 main.py 等外部调用方使用，避免依赖私有函数 _find_running_everything_dir。
+    """
+    return _find_running_everything_dir()
+
+
+def _self_dir_es_candidates():
+    """应用自身目录下的 es.exe 候选（打包发布时随附的 es.exe 优先于系统安装）。"""
+    out = []
     try:
-        out = subprocess.run(
-            ['wmic', 'process', 'where', "name='Everything.exe'", 'get', 'ExecutablePath'],
-            capture_output=True, text=True, timeout=3,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-        )
-        for line in (out.stdout or '').splitlines():
-            line = line.strip()
-            if line.lower().endswith('everything.exe') and os.path.isfile(line):
-                return os.path.dirname(line)
+        if getattr(sys, 'frozen', False):
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                out.append(str(Path(meipass) / 'es.exe'))
+            out.append(str(Path(sys.executable).parent / 'es.exe'))
+        else:
+            out.append(str(Path(__file__).parent / 'es.exe'))
     except Exception:
         pass
-    return None
+    return out
 
 
 def find_es_exe(prefer_path=None):
@@ -806,24 +847,27 @@ def find_es_exe(prefer_path=None):
 
     prefer_path: 用户在设置里指定的路径，优先采用。
     """
-    global _ES_EXE_CACHE
+    global _ES_EXE_CACHE, _ES_EXE_MISS_AT
     if prefer_path and os.path.isfile(prefer_path):
         return prefer_path
 
     if _ES_EXE_CACHE is not None:
-        return _ES_EXE_CACHE or None
+        if _ES_EXE_CACHE:
+            # 正缓存：返回前校验路径仍存在；被删除/卸载则作废重查
+            if os.path.isfile(_ES_EXE_CACHE):
+                return _ES_EXE_CACHE
+            _ES_EXE_CACHE = None
+        elif _ES_EXE_MISS_AT is not None and time.monotonic() - _ES_EXE_MISS_AT < _ES_EXE_MISS_TTL:
+            # 负缓存只在 TTL 内生效，超时后允许重新探测
+            return None
 
-    # 1. PATH
+    # 1. 应用自身目录（frozen: _MEIPASS / exe 同目录；源码: ftrack.py 同目录）
+    candidates = _self_dir_es_candidates()
+
+    # 2. PATH
     p = shutil.which('es')
     if p:
-        _ES_EXE_CACHE = p
-        return p
-
-    # 2. 跟 Everything.exe 同目录
-    everything_dir = _find_running_everything_dir()
-    candidates = []
-    if everything_dir:
-        candidates.append(os.path.join(everything_dir, 'es.exe'))
+        candidates.append(p)
 
     # 3. 常见安装位置
     candidates += [
@@ -831,11 +875,12 @@ def find_es_exe(prefer_path=None):
         r'C:\Program Files (x86)\Everything\es.exe',
     ]
     for c in candidates:
-        if os.path.isfile(c):
+        if c and os.path.isfile(c):
             _ES_EXE_CACHE = c
             return c
 
     _ES_EXE_CACHE = ''
+    _ES_EXE_MISS_AT = time.monotonic()
     return None
 
 
@@ -984,6 +1029,19 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
             paths = everything_search(name, exact_name=True, drive_hint=None, limit=500, es_path=es_path)
             process_paths(paths, tags, seen_paths)
     return found
+
+
+def scan_via_everything(tag_to_name, *, drive_hints=None, on_found=None, cancel=None,
+                        progress=None, phase=None, es_path=None):
+    """公开入口：用 Everything 按原名定位候选并验证追踪标记，返回 {tag: path}。
+
+    语义与 _scan_via_everything 完全一致，但固定使用模块默认的 ADS_STREAM 流，
+    供 main.py 等外部调用方使用，避免依赖私有函数。
+    """
+    return _scan_via_everything(
+        tag_to_name, drive_hints=drive_hints, on_found=on_found, cancel=cancel,
+        progress=progress, phase=phase, stream=ADS_STREAM, es_path=es_path,
+    )
 
 
 def find_candidates_by_name(name, drive_hint=None, size_hint=None, es_path=None, fallback_walk=True, cancel=None, progress=None):
