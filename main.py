@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -19,7 +20,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QRect, QRectF, QUrl, QPoint, QPointF, QThread,
     QFileSystemWatcher, QEvent, QEventLoop, QSettings, QLockFile, QStandardPaths, QDate,
-    QVariantAnimation, QEasingCurve
+    QVariantAnimation, QEasingCurve, QPropertyAnimation
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
@@ -78,6 +79,9 @@ from shell_notify import (
 
 
 DATA_ROOT_SETTINGS = 'data/root_dir'
+DATA_ROOT_ARG = '--data-root'
+AUTOSTART_NAME = 'FRESH'
+AUTOSTART_REG_PATH = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
 logger = logging.getLogger('fresh')
 
@@ -127,7 +131,31 @@ def _copy_initial_data_root(src: Path, dst: Path):
         logger.exception('迁移旧数据目录失败: %s -> %s', src, dst)
 
 
-def configured_data_root(settings: QSettings | None = None) -> Path:
+def parse_startup_args(argv):
+    """Extract FRESH arguments before QApplication sees argv."""
+    data_root = None
+    cleaned = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == DATA_ROOT_ARG:
+            if i + 1 < len(argv):
+                data_root = Path(argv[i + 1]).expanduser()
+                i += 2
+                continue
+            i += 1
+            continue
+        prefix = DATA_ROOT_ARG + '='
+        if arg.startswith(prefix):
+            data_root = Path(arg[len(prefix):]).expanduser()
+            i += 1
+            continue
+        cleaned.append(arg)
+        i += 1
+    return data_root, cleaned
+
+
+def configured_data_root(settings: QSettings | None = None, override: Path | str | None = None) -> Path:
     if settings is None:
         settings = QSettings('FRESH', 'FRESH')
     configured = ''
@@ -135,8 +163,15 @@ def configured_data_root(settings: QSettings | None = None) -> Path:
         configured = settings.value(DATA_ROOT_SETTINGS, '', str) or ''
     except Exception:
         configured = ''
-    root = Path(configured).expanduser() if configured else portable_data_root()
-    if not configured:
+    if override:
+        root = Path(override).expanduser()
+        try:
+            settings.setValue(DATA_ROOT_SETTINGS, str(root))
+        except Exception:
+            pass
+    else:
+        root = Path(configured).expanduser() if configured else portable_data_root()
+    if not configured and not override:
         _copy_initial_data_root(legacy_appdata_root(), root)
     set_data_root(root)
     return root
@@ -483,26 +518,91 @@ def recovery_scan_roots(scan_settings, drive_hints=None):
 
 
 # ============ 开机启动 ============
-#
-# The unsigned packaged build disables registry-startup support. Some scanners
-# classify Python apps that can write login startup entries as shell loaders,
-# even when the feature is user-triggered.
+
+def _current_data_root_for_autostart() -> Path:
+    configured = os.getenv(DATA_ROOT_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return configured_data_root()
+
+
+def _launch_argv_for_current_app(
+    data_root: Path | str,
+    executable: str | None = None,
+    script_path: str | Path | None = None,
+    frozen: bool | None = None,
+):
+    executable = executable or sys.executable
+    if frozen is None:
+        frozen = bool(getattr(sys, 'frozen', False))
+    argv = [str(executable)]
+    if not frozen:
+        argv.append(str(Path(script_path).resolve() if script_path else Path(__file__).resolve()))
+    argv.extend([DATA_ROOT_ARG, str(Path(data_root).expanduser())])
+    return argv
+
+
+def _format_windows_command(argv) -> str:
+    return subprocess.list2cmdline([str(arg) for arg in argv])
+
+
+def _autostart_command(data_root: Path | str | None = None) -> str:
+    return _format_windows_command(
+        _launch_argv_for_current_app(data_root or _current_data_root_for_autostart())
+    )
 
 
 def autostart_supported():
-    return False
+    return sys.platform.startswith('win')
+
+
+def _read_autostart_command():
+    if not autostart_supported():
+        return ''
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_QUERY_VALUE) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+            return str(value or '')
+    except FileNotFoundError:
+        return ''
+    except Exception:
+        logger.exception('读取开机启动设置失败')
+        return ''
 
 
 def is_autostart_enabled():
-    return False
+    return bool(_read_autostart_command())
 
 
 def set_autostart(enable):
-    return False
+    if not autostart_supported():
+        return False
+    try:
+        import winreg
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            AUTOSTART_REG_PATH,
+            0,
+            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE,
+        ) as key:
+            if enable:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        logger.exception('修改开机启动设置失败')
+        return False
 
 
 def refresh_autostart_if_needed():
-    return
+    current = _read_autostart_command()
+    if current and current != _autostart_command():
+        set_autostart(True)
 
 
 # ============ 备忘录列表自定义渲染 ============
@@ -5811,9 +5911,102 @@ class NoteEditor(QWidget):
 
 # ============ 主窗口 ============
 
+
+class CustomTitleBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(40)
+        self.setObjectName("custom_title_bar")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Space for dragging
+        self.drag_area = QLabel()
+        self.drag_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.drag_area)
+
+        # Window controls
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 10, 0)
+        btn_layout.setSpacing(5)
+
+        self.min_btn = QPushButton("—")
+        self.min_btn.setObjectName("win_min_btn")
+        self.min_btn.setFixedSize(30, 30)
+        self.min_btn.setCursor(Qt.PointingHandCursor)
+
+        self.max_btn = QPushButton("□")
+        self.max_btn.setObjectName("win_max_btn")
+        self.max_btn.setFixedSize(30, 30)
+        self.max_btn.setCursor(Qt.PointingHandCursor)
+
+        self.close_btn = QPushButton("×")
+        self.close_btn.setObjectName("win_close_btn")
+        self.close_btn.setFixedSize(30, 30)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+
+        btn_layout.addWidget(self.min_btn)
+        btn_layout.addWidget(self.max_btn)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Connections (parent is expected to be MainWindow)
+        self.min_btn.clicked.connect(self._minimize_window)
+        self.max_btn.clicked.connect(self._maximize_restore_window)
+        self.close_btn.clicked.connect(self._close_window)
+
+        # Drag state
+        self._is_dragging = False
+        self._drag_start_pos = None
+
+    def _minimize_window(self):
+        window = self.window()
+        if window:
+            window.showMinimized()
+
+    def _maximize_restore_window(self):
+        window = self.window()
+        if window:
+            if window.isMaximized():
+                window.showNormal()
+                self.max_btn.setText("□")
+            else:
+                window.showMaximized()
+                self.max_btn.setText("❐")
+
+    def _close_window(self):
+        window = self.window()
+        if window:
+            window.close()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            self._drag_start_pos = event.globalPos() - self.window().frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._is_dragging and event.buttons() & Qt.LeftButton:
+            self.window().move(event.globalPos() - self._drag_start_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = False
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._maximize_restore_window()
+            event.accept()
+
 class MainWindow(QMainWindow):
     def __init__(self, storage, account=None, account_manager=None):
         super().__init__()
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self._sidebar_collapsed = False
         self.storage = storage
         self.account = account or {}
         self.account_manager = account_manager
@@ -6803,6 +6996,48 @@ class MainWindow(QMainWindow):
 
     # ============ 窗口状态 / 快捷键 ============
 
+
+    def _toggle_sidebar(self):
+        self._sidebar_collapsed = not self._sidebar_collapsed
+
+        # Animate width
+        start_width = 64 if not self._sidebar_collapsed else 276
+        end_width = 276 if not self._sidebar_collapsed else 64
+
+        self.sidebar_anim = QPropertyAnimation(self.sidebar, b"minimumWidth")
+        self.sidebar_anim.setDuration(200)
+        self.sidebar_anim.setStartValue(start_width)
+        self.sidebar_anim.setEndValue(end_width)
+
+        self.sidebar_max_anim = QPropertyAnimation(self.sidebar, b"maximumWidth")
+        self.sidebar_max_anim.setDuration(200)
+        self.sidebar_max_anim.setStartValue(start_width)
+        self.sidebar_max_anim.setEndValue(end_width)
+
+        self.sidebar_anim.start()
+        self.sidebar_max_anim.start()
+
+        if self._sidebar_collapsed:
+            self.search_input.hide()
+            if hasattr(self, 'archive_category_filter'):
+                self.archive_category_filter.hide()
+            self.new_btn.setText("+")
+            if hasattr(self, 'workspace_switch'):
+                self.workspace_switch.hide()
+            if hasattr(self, 'view_switch'):
+                self.view_switch.hide()
+            self.more_btn.hide()
+        else:
+            self.search_input.show()
+            if hasattr(self, 'archive_category_filter'):
+                self.archive_category_filter.show()
+            self.new_btn.setText("+  新建记事")
+            if hasattr(self, 'workspace_switch'):
+                self.workspace_switch.show()
+            if hasattr(self, 'view_switch'):
+                self.view_switch.show()
+            self.more_btn.show()
+
     def _restore_window_state(self):
         geometry = self._settings.value('main/geometry')
         if geometry:
@@ -7153,21 +7388,41 @@ class MainWindow(QMainWindow):
         central.setObjectName('app_shell')
         self.setCentralWidget(central)
 
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(10, 10, 10, 10)
+        # Custom Root Layout
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # Add Custom Title Bar
+        self.title_bar = CustomTitleBar(self)
+        root_layout.addWidget(self.title_bar)
+
+        # Original Main Layout
+        main_container = QWidget()
+        main_layout = QHBoxLayout(main_container)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
+        root_layout.addWidget(main_container)
 
         # 左侧栏
-        sidebar = QWidget()
-        sidebar.setObjectName('sidebar')
-        sidebar.setFixedWidth(276)
+        self.sidebar = QWidget()
+        self.sidebar.setObjectName('sidebar')
+        self.sidebar.setFixedWidth(276)
 
-        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout = QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(18, 18, 18, 18)
         sidebar_layout.setSpacing(12)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
+
+        # Toggle Button
+        self.sidebar_toggle_btn = QPushButton("≡")
+        self.sidebar_toggle_btn.setObjectName("sidebar_toggle_btn")
+        self.sidebar_toggle_btn.setFixedSize(30, 30)
+        self.sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
+        top_row.addWidget(self.sidebar_toggle_btn)
         self.new_btn = QPushButton('+  新建记事')
         self.new_btn.setObjectName('new_button')
         self.new_btn.setCursor(Qt.PointingHandCursor)
@@ -7285,7 +7540,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.right_stack, 1)
         right_layout.addWidget(self.attachment_bar)
 
-        main_layout.addWidget(sidebar)
+        main_layout.addWidget(self.sidebar)
         main_layout.addWidget(right, 1)
 
     # ---- 列表 ----
@@ -8416,6 +8671,23 @@ class MainWindow(QMainWindow):
                 self._populate_list()
             else:
                 self._update_item_for_note(note)
+
+    def _flush_pending_editor(self, refresh_list=True):
+        if self.save_timer.isActive():
+            self.save_timer.stop()
+            self._save_current_now(refresh_list=refresh_list)
+
+    def prepare_for_session_end(self):
+        self._session_ending = True
+        self._flush_pending_editor()
+        try:
+            self.storage.save()
+        except Exception:
+            logger.exception('会话结束前保存数据失败')
+        try:
+            self._save_window_state()
+        except Exception:
+            logger.exception('会话结束前保存窗口状态失败')
 
     def _refresh_editor_categories(self):
         if hasattr(self, 'editor'):
@@ -10163,6 +10435,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, '选择数据文件夹', tr('没有进入新数据文件夹，已保留当前数据文件夹。'))
                 return
             self._settings.setValue(DATA_ROOT_SETTINGS, str(new_root))
+            refresh_autostart_if_needed()
             self.statusBar().showMessage(tr('数据文件夹已切换到 {path}', path=new_root), 5000)
         except Exception as exc:
             QMessageBox.critical(self, '切换失败', tr('切换数据文件夹时出错:\n{error}', error=exc))
@@ -10202,12 +10475,15 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event):
-        if self.save_timer.isActive():
-            self.save_timer.stop()
-            self._save_current_now()
+        self._flush_pending_editor()
         self._save_window_state()
         # 关闭按钮 → 隐藏到托盘（除非用户主动选了退出）
-        if not getattr(self, '_real_quit', False) and getattr(self, 'tray_icon', None) and self.tray_icon.isVisible():
+        if (
+            not getattr(self, '_real_quit', False)
+            and not getattr(self, '_session_ending', False)
+            and getattr(self, 'tray_icon', None)
+            and self.tray_icon.isVisible()
+        ):
             event.ignore()
             self.hide()
             if not getattr(self, '_hide_notified', False):
@@ -10221,6 +10497,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             return
+        try:
+            self.storage.save()
+        except Exception:
+            logger.exception('退出前保存数据失败')
         # 真正退出：清理后台扫描线程
         for s in getattr(self, '_targeted_scans', []):
             try:
@@ -10913,7 +11193,8 @@ def select_start_account(account_manager):
 
 
 def main():
-    app = QApplication(sys.argv)
+    data_root_override, qt_argv = parse_startup_args(sys.argv)
+    app = QApplication(qt_argv)
     app.setApplicationName('FRESH')
     app.setOrganizationName('FRESH')
 
@@ -10937,7 +11218,7 @@ def main():
             return
 
     settings = QSettings('FRESH', 'FRESH')
-    data_root = configured_data_root(settings)
+    data_root = configured_data_root(settings, data_root_override)
     setup_logging(data_root)
     logger.info('FRESH 启动，数据目录: %s', data_root)
     ensure_custom_files()
@@ -10962,6 +11243,12 @@ def main():
 
     window = MainWindow(storage, account=account, account_manager=account_manager)
     window.show()
+
+    try:
+        app.commitDataRequest.connect(lambda _manager: window.prepare_for_session_end())
+    except Exception:
+        logger.exception('注册会话结束保存钩子失败')
+    app.aboutToQuit.connect(window.prepare_for_session_end)
 
     # 监听本地 socket 只用于兼容已有启动流程；不再响应 show，避免窗口反复弹出。
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
