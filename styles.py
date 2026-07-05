@@ -1,9 +1,18 @@
 """苹果风格 QSS 样式表"""
 
 COLORS = {
-    'accent': '#2F7BFF',
-    'accent_hover': '#1F6EF4',
-    'accent_pressed': '#185ED4',
+    'accent': '#111111',
+    'accent_hover': '#333333',
+    'accent_pressed': '#000000',
+    'bg_main': '#F7F7F5',
+    'bg_panel': '#FFFFFF',
+    'border_light': '#EBEBEA',
+    'border_dark': '#D1D1D1',
+    'text_primary': '#111111',
+    'text_secondary': '#757575',
+    'text_tertiary': '#A0A0A0',
+    'btn_secondary_bg': '#EFEFEF',
+    'btn_secondary_hover': '#E5E5E5',
 }
 
 STYLE = """
@@ -17,8 +26,9 @@ QMainWindow, QWidget {
 }
 
 #sidebar {
-    background: #F4F4F6;
-    border-right: 1px solid #E6E6EA;
+    background: @bg_main;
+    border: none;
+    border-right: 1px solid @border_light;
 }
 
 #right_panel {
@@ -34,7 +44,7 @@ QMainWindow, QWidget {
     background: @accent;
     color: white;
     border: none;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 9px 14px;
     font-size: 13px;
     font-weight: 600;
@@ -52,7 +62,7 @@ QMainWindow, QWidget {
     background: rgba(255, 255, 255, 180);
     color: #65758B;
     border: 1px solid #DFDFE4;
-    border-radius: 8px;
+    border-radius: 6px;
     font-size: 18px;
     font-weight: 700;
     padding: 0;
@@ -70,9 +80,9 @@ QMainWindow, QWidget {
 
 /* === 搜索框 === */
 #search_box {
-    background: rgba(255, 255, 255, 210);
-    border: 1px solid #E0E0E5;
-    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.04);
+    border: none;
+    border-radius: 6px;
     padding: 8px 12px;
     font-size: 13px;
     color: #263548;
@@ -82,7 +92,7 @@ QMainWindow, QWidget {
 
 #search_box:focus {
     border: 1px solid @accent;
-    background: #FFFFFF;
+    background: rgba(0, 0, 0, 0.04);
 }
 
 /* === 模式切换 (文字/截图) === */
@@ -96,14 +106,14 @@ QMainWindow, QWidget {
 }
 
 #mode_btn_left {
-    border-top-left-radius: 7px;
-    border-bottom-left-radius: 7px;
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
     border-right: none;
 }
 
 #mode_btn_right {
-    border-top-right-radius: 7px;
-    border-bottom-right-radius: 7px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 #mode_btn_left:hover, #mode_btn_right:hover {
@@ -131,14 +141,14 @@ QMainWindow, QWidget {
 }
 
 #view_btn_left {
-    border-top-left-radius: 8px;
-    border-bottom-left-radius: 8px;
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
     border-right: none;
 }
 
 #view_btn_right {
-    border-top-right-radius: 8px;
-    border-bottom-right-radius: 8px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 #view_btn_left:hover, #view_btn_right:hover {
@@ -159,7 +169,7 @@ QMainWindow, QWidget {
 #timeline_category_filter {
     background: rgba(255, 255, 255, 190);
     border: 1px solid #E0E0E5;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 7px 12px;
     color: #263548;
     font-size: 12px;
@@ -189,7 +199,7 @@ QMainWindow, QWidget {
 #timeline_category_filter QAbstractItemView {
     background: #FFFFFF;
     border: 1px solid #E5E5E7;
-    border-radius: 8px;
+    border-radius: 6px;
     selection-background-color: @accent;
     selection-color: white;
     outline: none;
@@ -212,7 +222,7 @@ QMainWindow, QWidget {
     background: #FFFFFF;
     color: #263548;
     border: 1px solid #DFDFE4;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 11px 12px;
     font-size: 13px;
     font-weight: 600;
@@ -253,7 +263,7 @@ QMainWindow, QWidget {
 #note_category_combo {
     background: #FFFFFF;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 12px;
     min-width: 120px;
@@ -282,7 +292,7 @@ QMainWindow, QWidget {
 #note_category_combo QAbstractItemView {
     background: #FFFFFF;
     border: 1px solid #E5E5E7;
-    border-radius: 8px;
+    border-radius: 6px;
     selection-background-color: @accent;
     selection-color: #FFFFFF;
     outline: none;
@@ -334,7 +344,7 @@ QMainWindow, QWidget {
 #empty_panel {
     background: #FFFFFF;
     border: 1px solid #E5ECF7;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 #empty_icon {
@@ -364,7 +374,7 @@ QMainWindow, QWidget {
     background: @accent;
     color: #FFFFFF;
     border: 1px solid @accent;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 8px 16px;
     font-size: 13px;
     font-weight: 600;
@@ -378,7 +388,7 @@ QMainWindow, QWidget {
     background: #FFFFFF;
     color: #263548;
     border: 1px solid #D2D2D7;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 8px 16px;
     font-size: 13px;
     font-weight: 500;
@@ -409,7 +419,7 @@ QMainWindow, QWidget {
     background: @accent;
     color: white;
     border: none;
-    border-radius: 12px;
+    border-radius: 6px;
     font-size: 14px;
     font-weight: 600;
     padding: 0;
@@ -433,7 +443,7 @@ QMainWindow, QWidget {
 #attachment_card {
     background: #FFFFFF;
     border: 1px solid #E8EEF8;
-    border-radius: 10px;
+    border-radius: 6px;
 }
 
 #attachment_card:hover {
@@ -459,7 +469,7 @@ QMainWindow, QWidget {
 #att_category_filter {
     background: #FFFFFF;
     border: 1px solid #D7E4F5;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 3px 22px 3px 8px;
     color: #263548;
     font-size: 11px;
@@ -486,7 +496,7 @@ QMainWindow, QWidget {
 #att_category_badge {
     background: #EAF3FF;
     border: 1px solid #BBD7FF;
-    border-radius: 8px;
+    border-radius: 6px;
     color: @accent_hover;
     font-size: 11px;
     font-weight: 700;
@@ -497,7 +507,7 @@ QMainWindow, QWidget {
     background: rgba(60, 60, 67, 42);
     color: #FFFFFF;
     border: none;
-    border-radius: 11px;
+    border-radius: 6px;
     font-size: 16px;
     font-weight: 700;
     padding: 0;
@@ -533,7 +543,7 @@ QMainWindow, QWidget {
 #screenshot_thumb {
     background: #FFFFFF;
     border: 1px solid #E8EEF8;
-    border-radius: 12px;
+    border-radius: 6px;
 }
 
 #screenshot_thumb:hover {
@@ -571,8 +581,8 @@ QMainWindow, QWidget {
 
 #thumb_image {
     background: #F5F5F7;
-    border-top-left-radius: 11px;
-    border-top-right-radius: 11px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
 }
 
 #thumb_memo {
@@ -587,15 +597,15 @@ QMainWindow, QWidget {
 
 #thumb_memo:focus {
     background: #F5F5F7;
-    border-bottom-left-radius: 11px;
-    border-bottom-right-radius: 11px;
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 #thumb_add_attachment {
     background: rgba(47, 123, 255, 210);
     color: #FFFFFF;
     border: none;
-    border-radius: 12px;
+    border-radius: 6px;
     font-size: 15px;
     font-weight: 700;
     padding: 0;
@@ -650,7 +660,7 @@ QMainWindow, QWidget {
     background: rgba(0, 0, 0, 110);
     color: rgba(255, 255, 255, 220);
     border: none;
-    border-radius: 14px;
+    border-radius: 6px;
     font-size: 15px;
     font-weight: 700;
     padding: 0;
@@ -675,17 +685,18 @@ QMainWindow, QWidget {
 QScrollBar:vertical {
     background: transparent;
     width: 8px;
-    margin: 4px 2px 4px 0;
+    border: none;
+    margin: 0;
 }
 
 QScrollBar::handle:vertical {
-    background: #C7C7CC;
+    background: #D3D3D3;
     border-radius: 4px;
     min-height: 26px;
 }
 
 QScrollBar::handle:vertical:hover {
-    background: #9AA8BA;
+    background: #A0A0A0;
 }
 
 QScrollBar::add-line:vertical,
@@ -702,17 +713,18 @@ QScrollBar::sub-page:vertical {
 QScrollBar:horizontal {
     background: transparent;
     height: 8px;
-    margin: 0 4px 2px 4px;
+    border: none;
+    margin: 0;
 }
 
 QScrollBar::handle:horizontal {
-    background: #C7C7CC;
+    background: #D3D3D3;
     border-radius: 4px;
     min-width: 26px;
 }
 
 QScrollBar::handle:horizontal:hover {
-    background: #9AA8BA;
+    background: #A0A0A0;
 }
 
 QScrollBar::add-line:horizontal,
@@ -730,7 +742,7 @@ QScrollBar::sub-page:horizontal {
 QMenu {
     background: #FFFFFF;
     border: 1px solid #E5E5E7;
-    border-radius: 10px;
+    border-radius: 6px;
     padding: 6px;
     color: #263548;
     font-size: 13px;
@@ -835,7 +847,7 @@ QToolTip {
 #archive_dialog_thumb {
     background: #F5F5F7;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 #archive_dialog_filename {
@@ -854,7 +866,7 @@ QToolTip {
 #archive_dialog_category {
     background: #F7F7F9;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 13px;
     padding: 7px 10px;
@@ -883,7 +895,7 @@ QToolTip {
 #archive_dialog_category QAbstractItemView {
     background: #FFFFFF;
     border: 1px solid #E5E5E7;
-    border-radius: 8px;
+    border-radius: 6px;
     selection-background-color: @accent;
     selection-color: white;
     outline: none;
@@ -893,7 +905,7 @@ QToolTip {
 #archive_dialog_content {
     background: #F7F7F9;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 13px;
     padding: 10px;
@@ -910,7 +922,7 @@ QToolTip {
     background: #FFFFFF;
     color: #263548;
     border: 1px solid #D2D2D7;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 8px 16px;
     font-size: 13px;
     font-weight: 500;
@@ -924,7 +936,7 @@ QToolTip {
     background: @accent;
     color: #FFFFFF;
     border: 1px solid @accent;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 8px 16px;
     font-size: 13px;
     font-weight: 600;
@@ -960,7 +972,7 @@ QToolTip {
 #timeline_filter_combo {
     background: #FFFFFF;
     border: 1px solid #E0E0E5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 12px;
     min-width: 108px;
@@ -989,7 +1001,7 @@ QToolTip {
 #timeline_filter_combo QAbstractItemView {
     background: #FFFFFF;
     border: 1px solid #E5E5E7;
-    border-radius: 8px;
+    border-radius: 6px;
     selection-background-color: @accent;
     selection-color: #FFFFFF;
     outline: none;
@@ -1018,7 +1030,7 @@ QToolTip {
 #timeline_date_edit {
     background: #FFFFFF;
     border: 1px solid #E0E0E5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 12px;
     min-width: 92px;
@@ -1056,7 +1068,7 @@ QToolTip {
 #timeline_stat_card {
     background: #FFFFFF;
     border: 1px solid #E5ECF7;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 #timeline_stat_value {
@@ -1100,7 +1112,7 @@ QToolTip {
 #timeline_item, #timeline_note_item {
     background: #FFFFFF;
     border: 1px solid #E5ECF7;
-    border-radius: 10px;
+    border-radius: 6px;
     margin: 4px 20px;
 }
 
@@ -1171,7 +1183,7 @@ QToolTip {
     background: #FFFFFF;
     border: 1px solid #FFE2B8;
     border-left: 3px solid #FF9F0A;
-    border-radius: 8px;
+    border-radius: 6px;
 }
 
 #timeline_streak_value {
@@ -1183,7 +1195,7 @@ QToolTip {
 #timeline_insight_strip {
     background: #FFFFFF;
     border: 1px solid #E5ECF7;
-    border-radius: 10px;
+    border-radius: 6px;
 }
 
 #timeline_insight_label {
@@ -1201,31 +1213,7 @@ QToolTip {
     border: none;
 }
 
-#timeline_review_scroll QScrollBar:vertical {
-    background: transparent;
-    width: 9px;
-    margin: 2px 1px 2px 0;
-}
 
-#timeline_review_scroll QScrollBar::handle:vertical {
-    background: #D4DCE8;
-    border-radius: 4px;
-    min-height: 32px;
-}
-
-#timeline_review_scroll QScrollBar::handle:vertical:hover {
-    background: #B9C4D4;
-}
-
-#timeline_review_scroll QScrollBar::add-line:vertical,
-#timeline_review_scroll QScrollBar::sub-line:vertical {
-    height: 0;
-}
-
-#timeline_review_scroll QScrollBar::add-page:vertical,
-#timeline_review_scroll QScrollBar::sub-page:vertical {
-    background: transparent;
-}
 
 /* === 最近删除 === */
 #deleted_header_box {
@@ -1254,7 +1242,7 @@ QToolTip {
 #deleted_list::item {
     background: #FFFFFF;
     border: 1px solid #E5ECF7;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     padding: 9px 14px;
     margin: 4px 0;
@@ -1274,7 +1262,7 @@ QToolTip {
 #deleted_restore_btn {
     background: @accent;
     border: 1px solid @accent;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #FFFFFF;
     padding: 8px 16px;
     font-size: 13px;
@@ -1294,7 +1282,7 @@ QToolTip {
 #deleted_delete_btn {
     background: #FFFFFF;
     border: 1px solid #FFB3AD;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #D70015;
     padding: 8px 16px;
     font-size: 13px;
@@ -1318,7 +1306,7 @@ QToolTip {
 
 #customization_tabs::pane {
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     background: #FFFFFF;
 }
 
@@ -1342,7 +1330,7 @@ QToolTip {
 #customization_text_table {
     background: #FFFFFF;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     gridline-color: #EFEFF4;
     selection-background-color: #E8F2FF;
     selection-color: #263548;
@@ -1362,7 +1350,7 @@ QToolTip {
     background: #1F2328;
     color: #F0F3F6;
     border: 1px solid #D8D8DE;
-    border-radius: 8px;
+    border-radius: 6px;
     padding: 12px;
     font-family: "Consolas", "Cascadia Mono", monospace;
     font-size: 12px;
@@ -1394,7 +1382,7 @@ QToolTip {
 #account_field {
     background: #FFFFFF;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 14px;
     padding: 11px 13px;
@@ -1409,7 +1397,7 @@ QToolTip {
 #account_primary {
     background: @accent;
     border: 1px solid @accent;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #FFFFFF;
     font-size: 14px;
     font-weight: 600;
@@ -1423,7 +1411,7 @@ QToolTip {
 #account_secondary, #account_choice {
     background: #FFFFFF;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #263548;
     font-size: 14px;
     font-weight: 500;
@@ -1437,7 +1425,7 @@ QToolTip {
 #account_danger {
     background: #FFFFFF;
     border: 1px solid #FFD5D2;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #D70015;
     font-size: 14px;
     font-weight: 500;
@@ -1483,24 +1471,22 @@ QToolTip {
 }
 
 #sidebar {
-    background: rgba(247, 250, 255, 226);
-    border: 1px solid #E5ECF7;
-    border-top-left-radius: 12px;
-    border-bottom-left-radius: 12px;
-    border-right: 1px solid #D9E3F3;
+    background: @bg_main;
+    border: none;
+    border-right: 1px solid @border_light;
 }
 
 #right_panel, #right_stack, #empty_state {
     background: #FEFEFF;
-    border-top-right-radius: 12px;
-    border-bottom-right-radius: 12px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 #new_button {
     background: @accent;
     color: #FFFFFF;
     border: none;
-    border-radius: 8px;
+    border-radius: 6px;
     min-height: 38px;
     padding: 0 18px;
     font-size: 14px;
@@ -1519,7 +1505,7 @@ QToolTip {
     background: rgba(255, 255, 255, 210);
     color: #8B98AA;
     border: 1px solid #E4EAF4;
-    border-radius: 8px;
+    border-radius: 6px;
     font-size: 20px;
     font-weight: 700;
     padding: 0 0 7px 0;
@@ -1542,14 +1528,14 @@ QToolTip {
 }
 
 #mode_btn_left, #view_btn_left {
-    border-top-left-radius: 8px;
-    border-bottom-left-radius: 8px;
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
     border-right: none;
 }
 
 #mode_btn_right, #view_btn_right {
-    border-top-right-radius: 8px;
-    border-bottom-right-radius: 8px;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
 }
 
 #mode_btn_left:checked, #mode_btn_right:checked,
@@ -1564,9 +1550,9 @@ QToolTip {
 }
 
 #search_box {
-    background: #FFFFFF;
-    border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.04);
+    border: none;
+    border-radius: 6px;
     color: #27364A;
     min-height: 34px;
     padding: 0 12px;
@@ -1574,14 +1560,14 @@ QToolTip {
 }
 
 #search_box:focus {
-    background: #FFFFFF;
-    border: 1px solid #B9D1FF;
+    background: rgba(0, 0, 0, 0.04);
+    border: 1px solid @accent;
 }
 
 #timeline_category_filter {
     background: #FFFFFF;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     color: #65758B;
     min-height: 34px;
     padding: 0 10px;
@@ -1597,7 +1583,7 @@ QToolTip {
     background: #FFFFFF;
     color: #52627A;
     border: 1px solid #E5EBF5;
-    border-radius: 8px;
+    border-radius: 6px;
     min-height: 38px;
     padding: 0 12px;
     font-size: 13px;
@@ -1617,7 +1603,7 @@ QToolTip {
 #drop_hint_card, #empty_panel {
     background: rgba(255, 255, 255, 130);
     border: 1px dashed #BFDAFF;
-    border-radius: 10px;
+    border-radius: 6px;
 }
 
 #drop_hint_icon, #empty_icon {
@@ -1646,12 +1632,12 @@ QToolTip {
 #empty_primary_btn {
     background: @accent;
     border: 1px solid @accent;
-    border-radius: 8px;
+    border-radius: 6px;
     min-height: 34px;
 }
 
 #empty_secondary_btn {
-    border-radius: 8px;
+    border-radius: 6px;
     border: 1px solid #E5EBF5;
     color: #52627A;
     min-height: 34px;
@@ -1673,6 +1659,21 @@ QToolTip {
 
 #content_edit {
     color: #263548;
+}
+
+/* === Title Bar Elements === */
+#win_min_btn, #win_max_btn, #win_close_btn {
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 4px;
+}
+#win_min_btn:hover, #win_max_btn:hover {
+    background: @btn_secondary_hover;
+}
+#win_close_btn:hover {
+    background: #E81123;
+    color: white;
 }
 """
 
