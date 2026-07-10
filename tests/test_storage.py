@@ -20,6 +20,7 @@ from accounts import AccountManager  # noqa: E402
 from crypter import MAGIC, Crypter, PasswordCrypter, SaltFileError  # noqa: E402
 from cryptography.fernet import InvalidToken  # noqa: E402
 from storage import SCREENSHOT_BOARD_ID, Storage, is_attachment_image  # noqa: E402
+import storage as storage_module  # noqa: E402
 
 
 def make_store(tmp_path):
@@ -188,6 +189,125 @@ def test_batch_writes_once(tmp_path):
             store.create_note()
     assert len(calls) == 1, 'batch 内 5 次 save 应合并为一次落盘'
     assert len([n for n in store.notes if n.get('id') != SCREENSHOT_BOARD_ID]) == 5
+
+
+def test_adopt_external_path_can_defer_rebuild_and_clears_backoff(tmp_path):
+    store = make_store(tmp_path)
+    note = store.create_note()
+    src = tmp_path / 'source.txt'
+    dst = tmp_path / 'target.txt'
+    src.write_text('same content', encoding='utf-8')
+    dst.write_text('same content', encoding='utf-8')
+    att = store.add_attachment(note['id'], src, copy=False)
+    att['recovery_failed_at'] = 123.0
+    att['recovery_failed_count'] = 5
+
+    calls = []
+
+    def forbidden_rebuild(_att):
+        calls.append(1)
+        raise AssertionError('rebuild should be deferred')
+
+    store.rebuild_tracking_at_current_path = forbidden_rebuild
+    adopted = store.adopt_external_path(att, dst, rebuild=False)
+
+    assert adopted == dst.resolve()
+    assert calls == []
+    assert att['original_path'] == str(dst.resolve())
+    assert att['original_name'] == 'target.txt'
+    assert 'recovery_failed_at' not in att
+    assert 'recovery_failed_count' not in att
+
+
+def test_refresh_tracking_does_not_rebind_unrelated_replacement_at_old_path(
+        tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    note = store.create_note()
+    path = tmp_path / 'occupied.txt'
+    path.write_text('unrelated replacement', encoding='utf-8')
+    old_tracking = {
+        'tracking_id': 'old-id',
+        'volume_serial': 1,
+        'file_id_high': 2,
+        'file_id_low': 3,
+        'content_hash': 'old-hash',
+        'size_snapshot': 10,
+        'mtime_ns_snapshot': 1,
+    }
+    att = {
+        'id': 'external-1',
+        'type': 'file_ref',
+        'original_path': str(path),
+        'original_name': path.name,
+        'tracking': dict(old_tracking),
+    }
+    note.setdefault('attachments', []).append(att)
+
+    monkeypatch.setattr(
+        storage_module.ftrack,
+        'get_file_info',
+        lambda _path: {'volume_serial': 9, 'file_id_high': 8, 'file_id_low': 7},
+    )
+    monkeypatch.setattr(storage_module.ftrack, 'read_tracking_tag', lambda _path: None)
+    monkeypatch.setattr(storage_module.ftrack, 'try_recover', lambda *_args, **_kwargs: None)
+    builds = []
+    monkeypatch.setattr(
+        storage_module.ftrack,
+        'build_tracking',
+        lambda *_args, **_kwargs: builds.append(1) or {'tracking_id': 'old-id'},
+    )
+
+    assert store.refresh_tracking_if_changed(att) is False
+    assert builds == []
+    assert att['tracking'] == old_tracking
+
+
+def test_refresh_tracking_updates_hash_after_in_place_edit(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    note = store.create_note()
+    path = tmp_path / 'edited.txt'
+    path.write_text('new content', encoding='utf-8')
+    stat = path.stat()
+    att = {
+        'id': 'external-2',
+        'type': 'file_ref',
+        'original_path': str(path),
+        'original_name': path.name,
+        'tracking': {
+            'tracking_id': 'same-id',
+            'volume_serial': 1,
+            'file_id_high': 2,
+            'file_id_low': 3,
+            'content_hash': 'old-hash',
+            'size_snapshot': stat.st_size,
+            'mtime_ns_snapshot': stat.st_mtime_ns - 1,
+        },
+    }
+    note.setdefault('attachments', []).append(att)
+
+    monkeypatch.setattr(
+        storage_module.ftrack,
+        'get_file_info',
+        lambda _path: {'volume_serial': 1, 'file_id_high': 2, 'file_id_low': 3},
+    )
+    monkeypatch.setattr(storage_module.ftrack, 'read_tracking_tag', lambda _path: 'same-id')
+    monkeypatch.setattr(
+        storage_module.ftrack,
+        'build_tracking',
+        lambda *_args, **_kwargs: {
+            'tracking_id': 'same-id',
+            'volume_serial': 1,
+            'file_id_high': 2,
+            'file_id_low': 3,
+            'content_hash': 'new-hash',
+            'size_snapshot': stat.st_size,
+            'mtime_ns_snapshot': stat.st_mtime_ns,
+        },
+    )
+
+    assert store.refresh_tracking_if_changed(att) is True
+    assert att['tracking']['content_hash'] == 'new-hash'
+    assert att['tracking']['mtime_ns_snapshot'] == stat.st_mtime_ns
 
 
 # ---------- 密钥文件保护 ----------

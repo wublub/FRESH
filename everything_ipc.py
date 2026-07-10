@@ -278,6 +278,7 @@ def query(search_text, max_results=200, search_flags=0, timeout_ms=5000):
 
     results = []
     received = [False]
+    parse_failed = [False]
     reply_msg = EVERYTHING_IPC_COPYDATAQUERYW + 100  # 任选
 
     # 自定义 WindowProc，临时替换以接收回复
@@ -295,6 +296,9 @@ def query(search_text, max_results=200, search_flags=0, timeout_ms=5000):
                     received[0] = True
                     return 1
             except Exception:
+                # 解析崩了要报告成"查询失败"(None)而不是"没有结果"([])，
+                # 否则调用方会把它当权威空结果、跳过 es.exe / 全盘扫描兜底
+                parse_failed[0] = True
                 received[0] = True
                 return 1
         return user32.DefWindowProcW(h, msg, wparam, lparam)
@@ -356,7 +360,9 @@ def query(search_text, max_results=200, search_flags=0, timeout_ms=5000):
                 user32.DispatchMessageW(byref(msg))
             else:
                 time.sleep(0.001)
-        return results if received[0] else None
+        if not received[0] or parse_failed[0]:
+            return None
+        return results
     finally:
         user32.DestroyWindow(hwnd)
 

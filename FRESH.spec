@@ -1,10 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+
+optional_binaries = [('es.exe', '.')] if Path('es.exe').exists() else []
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=optional_binaries,
     datas=[],
     hiddenimports=[
         'cryptography',

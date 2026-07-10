@@ -33,10 +33,9 @@ def open_local_path(path):
     p = Path(path)
     if not p.exists():
         return False
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
+    # 不用 resolve()：它会把映射盘/subst/符号链接改写成真实目标（甚至 \\?\ 前缀），
+    # 打开的位置和用户认知的路径对不上。abspath 只做规范化，不解引用。
+    p = Path(os.path.abspath(p))
     if sys.platform == 'win32':
         try:
             os.startfile(str(p))
@@ -50,17 +49,17 @@ def reveal_in_file_manager(path):
     p = Path(path)
     if not p.exists():
         return False
-    try:
-        p = p.resolve()
-    except Exception:
-        pass
+    p = Path(os.path.abspath(p))
     if sys.platform == 'win32':
         try:
             import subprocess
+            # 必须整条命令行以字符串传入、只给路径加引号。
+            # 列表形式会被 list2cmdline 把 "/select,路径" 整个括进引号，
+            # 路径带空格时 Explorer 解析失败，只会打开"文档"且什么都不选中。
             if not _is_root_path(p):
-                subprocess.Popen(['explorer.exe', f'/select,{str(p)}'])
+                subprocess.Popen(f'explorer.exe /select,"{p}"')
             else:
-                subprocess.Popen(['explorer.exe', str(p)])
+                subprocess.Popen(f'explorer.exe "{p}"')
             return True
         except Exception:
             pass
@@ -99,6 +98,10 @@ def explorer_open_folders():
         shell = win32com_client.Dispatch('Shell.Application')
         windows = shell.Windows()
     except Exception:
+        # 失败也要盖时间戳，否则挂在剪贴板/Shell 事件上的调用方会每次都
+        # 重新走一遍慢速 COM 枚举
+        _EXPLORER_FOLDERS_CACHE['at'] = time.monotonic()
+        _EXPLORER_FOLDERS_CACHE['paths'] = []
         return []
     try:
         count = int(windows.Count)
@@ -113,19 +116,20 @@ def explorer_open_folders():
             continue
         if not path:
             continue
+        # 只做形状过滤（真实盘符/UNC），不做 exists()/is_dir()：
+        # 断开的网络位置一次 exists() 就能把 UI 线程卡住几秒
+        if not (len(path) >= 3 and path[1:3] == ':\\') and not path.startswith('\\\\'):
+            continue
         try:
-            p = Path(path)
-            if not p.exists() or not p.is_dir():
-                continue
-            key = os.path.normcase(os.path.normpath(str(p)))
+            key = os.path.normcase(os.path.normpath(path))
         except Exception:
             continue
         if key in seen:
             continue
         seen.add(key)
-        out.append((0 if hwnd and hwnd == foreground else 1, str(p)))
+        out.append((0 if hwnd and hwnd == foreground else 1, path))
     out.sort(key=lambda item: item[0])
     paths = [path for _priority, path in out]
-    _EXPLORER_FOLDERS_CACHE['at'] = now
+    _EXPLORER_FOLDERS_CACHE['at'] = time.monotonic()
     _EXPLORER_FOLDERS_CACHE['paths'] = list(paths)
     return paths

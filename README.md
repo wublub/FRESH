@@ -82,7 +82,8 @@ python main.py
 python -m PyInstaller --noconfirm FRESH.spec
 ```
 
-构建结果输出到 `dist\FRESH.exe`。
+构建结果输出到 `dist\FRESH\FRESH.exe`。这是 onedir 包，分发时需要保留
+整个 `dist\FRESH` 文件夹；建议压缩为 zip 后上传到 GitHub Releases。
 
 ---
 
@@ -252,7 +253,7 @@ styles.py          Qt 样式
 FRESH.spec         PyInstaller 打包配置
 启动.bat           无控制台启动
 调试启动.bat       调试启动
-dist\FRESH.exe     打包后的程序
+dist\FRESH\        打包后的完整程序目录
 ```
 
 ---

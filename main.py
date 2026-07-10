@@ -20,7 +20,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     Qt, QSize, Signal, QTimer, QRect, QRectF, QUrl, QPoint, QPointF, QThread,
     QFileSystemWatcher, QEvent, QEventLoop, QSettings, QLockFile, QStandardPaths, QDate,
-    QVariantAnimation, QEasingCurve, QPropertyAnimation
+    QVariantAnimation, QEasingCurve
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
@@ -51,7 +51,7 @@ from storage import (
     Storage,
     is_attachment_image as is_image_attachment,
 )
-from styles import STYLE
+from styles import COLORS, STYLE
 from customization import (
     DEFAULT_TEXTS,
     apply_text_overrides,
@@ -69,6 +69,7 @@ from customization import (
     validate_qss_text,
 )
 import ftrack
+import win_frame
 from win_shell import open_local_path, reveal_in_file_manager, explorer_open_folders
 from shell_notify import (
     ShellChangeFilter,
@@ -84,6 +85,178 @@ AUTOSTART_NAME = 'FRESH'
 AUTOSTART_REG_PATH = r'Software\Microsoft\Windows\CurrentVersion\Run'
 
 logger = logging.getLogger('fresh')
+
+
+def configure_application_font(app):
+    """Use a Windows-native font stack with reliable Chinese fallback.
+
+    QSS font-family fallback is inconsistent across Qt platform plugins.  In
+    particular, naming an unavailable macOS-only family first can leave CJK
+    glyphs rendered as tofu boxes.  QFont's family list delegates fallback to
+    Qt/DirectWrite and keeps the typography crisp on Windows 10/11.
+    """
+    font = QFont()
+    font.setFamilies([
+        'Segoe UI Variable Text',
+        'Microsoft YaHei UI',
+        'Segoe UI',
+    ])
+    font.setPointSize(10)
+    font.setStyleStrategy(QFont.PreferAntialias)
+    app.setFont(font)
+
+
+def _ui_icon_pixmap(name, color, size=64):
+    """Render a small font-independent line icon on a high-resolution canvas."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color), max(3.5, size * 0.075))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    s = float(size)
+
+    if name == 'plus':
+        painter.drawLine(QPointF(s * .25, s * .5), QPointF(s * .75, s * .5))
+        painter.drawLine(QPointF(s * .5, s * .25), QPointF(s * .5, s * .75))
+    elif name == 'more':
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(color))
+        radius = s * .065
+        for x in (.25, .5, .75):
+            painter.drawEllipse(QPointF(s * x, s * .5), radius, radius)
+    elif name == 'timeline':
+        painter.drawEllipse(QRectF(s * .16, s * .16, s * .68, s * .68))
+        painter.drawLine(QPointF(s * .5, s * .5), QPointF(s * .5, s * .29))
+        painter.drawLine(QPointF(s * .5, s * .5), QPointF(s * .67, s * .59))
+    elif name == 'minus':
+        painter.drawLine(QPointF(s * .27, s * .55), QPointF(s * .73, s * .55))
+    elif name == 'maximize':
+        painter.drawRoundedRect(QRectF(s * .22, s * .22, s * .56, s * .56), s * .05, s * .05)
+    elif name == 'restore':
+        painter.drawRoundedRect(QRectF(s * .29, s * .19, s * .48, s * .48), s * .04, s * .04)
+        painter.drawRoundedRect(QRectF(s * .19, s * .31, s * .48, s * .48), s * .04, s * .04)
+    elif name == 'close':
+        painter.drawLine(QPointF(s * .29, s * .29), QPointF(s * .71, s * .71))
+        painter.drawLine(QPointF(s * .71, s * .29), QPointF(s * .29, s * .71))
+    elif name == 'check':
+        painter.drawLine(QPointF(s * .22, s * .52), QPointF(s * .43, s * .71))
+        painter.drawLine(QPointF(s * .43, s * .71), QPointF(s * .79, s * .30))
+    elif name == 'search':
+        painter.drawEllipse(QRectF(s * .18, s * .17, s * .46, s * .46))
+        painter.drawLine(QPointF(s * .57, s * .57), QPointF(s * .79, s * .79))
+    elif name == 'reset':
+        painter.drawArc(QRectF(s * .18, s * .18, s * .62, s * .62), 35 * 16, 285 * 16)
+        painter.drawLine(QPointF(s * .18, s * .38), QPointF(s * .18, s * .18))
+        painter.drawLine(QPointF(s * .18, s * .18), QPointF(s * .38, s * .18))
+    elif name == 'document':
+        painter.drawRoundedRect(QRectF(s * .23, s * .13, s * .54, s * .74), s * .06, s * .06)
+        for y, right in ((.39, .66), (.53, .66), (.67, .56)):
+            painter.drawLine(QPointF(s * .34, s * y), QPointF(s * right, s * y))
+    painter.end()
+    return pix
+
+
+def build_ui_icon(name, color='#636366', active_color=None):
+    """Create Normal/Active/Disabled icon states without Unicode glyphs."""
+    active_color = active_color or color
+    icon = QIcon()
+    icon.addPixmap(_ui_icon_pixmap(name, color), QIcon.Normal, QIcon.Off)
+    icon.addPixmap(_ui_icon_pixmap(name, active_color), QIcon.Active, QIcon.Off)
+    disabled = QColor(color)
+    disabled.setAlpha(90)
+    icon.addPixmap(_ui_icon_pixmap(name, disabled.name(QColor.HexArgb)), QIcon.Disabled, QIcon.Off)
+    return icon
+
+
+def _path_identity_snapshot(path):
+    """Cheap object/version token used to guard asynchronous tracking work."""
+    try:
+        stat = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_ctime_ns),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        int(stat.st_mode & 0o170000),
+    )
+
+
+def _finalize_tracking_identity(path, tracking, old_tracking_id=''):
+    """Write a guarded ADS/folder marker after background inspection."""
+    data = dict(tracking or {})
+    proposed = old_tracking_id or data.get('tracking_id', '')
+    if not proposed:
+        return data
+    if ftrack.write_tracking_tag(str(path), proposed):
+        data['tracking_id'] = proposed
+    elif old_tracking_id:
+        # Preserve an existing logical ID even when the destination filesystem
+        # cannot store ADS; hash/File-ID recovery can still use the rest.
+        data['tracking_id'] = old_tracking_id
+    else:
+        # A freshly generated ID that was never written is not a real tag.
+        data.pop('tracking_id', None)
+    return data
+
+
+def _build_tracking_snapshot(path, old_tracking_id='', expected_identity=None):
+    """Collect tracking metadata without writes and return its object token.
+
+    ``expected_identity`` is captured when work is scheduled.  Checking it
+    before and after hashing prevents a queued worker from silently switching
+    to a replacement that later appeared at the same path.
+    """
+    before = _path_identity_snapshot(path)
+    if before is None or (expected_identity is not None and before != expected_identity):
+        return None
+    tracking = ftrack.build_tracking(
+        path,
+        tracking_id=old_tracking_id or None,
+        write_identity=False,
+    )
+    after = _path_identity_snapshot(path)
+    if not tracking or after is None or before != after:
+        return None
+    return tracking, after
+
+
+def _attachment_recovery_key(attachment):
+    """Return a worker key for recoverable external attachments.
+
+    Real tracking IDs are used unchanged. Files on FAT/exFAT may fail ADS tag
+    creation but still keep size + content_hash; those get a synthetic key so
+    batch recovery can find them by hash without pretending they have an ADS tag.
+    """
+    tracking = (attachment or {}).get('tracking') or {}
+    tag = tracking.get('tracking_id')
+    if tag:
+        return tag, True
+    if (
+        (attachment or {}).get('type') == 'file_ref'
+        and tracking.get('content_hash')
+        and tracking.get('size_snapshot') is not None
+        and (attachment or {}).get('id')
+    ):
+        return f"hash:{attachment.get('id')}", False
+    return '', False
+
+
+def _clear_recovery_failure(attachment):
+    if not attachment:
+        return False
+    changed = False
+    for key in ('recovery_failed_at', 'recovery_failed_count'):
+        if key in attachment:
+            attachment.pop(key, None)
+            changed = True
+    return changed
 
 
 def setup_logging(data_root: Path):
@@ -254,6 +427,16 @@ _THUMB_CACHE = OrderedDict()
 _THUMB_CACHE_MAX = 600
 
 
+def _screen_dpr():
+    """主屏 devicePixelRatio，供离屏 QPixmap 绘制用（下限 1.0）。"""
+    try:
+        screen = QGuiApplication.primaryScreen()
+        dpr = screen.devicePixelRatio() if screen else 1.0
+    except Exception:
+        dpr = 1.0
+    return max(1.0, float(dpr))
+
+
 def load_scaled_pixmap(path, max_w, max_h, dpr=None):
     """按目标尺寸解码图片并做 LRU 缓存。返回 None 表示不存在或解码失败。
 
@@ -284,14 +467,23 @@ def load_scaled_pixmap(path, max_w, max_h, dpr=None):
     size = reader.size()
     target_w = max(1, int(max_w * dpr))
     target_h = max(1, int(max_h * dpr))
+    scaled = False
     if size.isValid() and size.width() > 0 and size.height() > 0:
         if size.width() > target_w or size.height() > target_h:
             reader.setScaledSize(size.scaled(target_w, target_h, Qt.KeepAspectRatio))
+            scaled = True
     image = reader.read()
     if image.isNull():
         return None
     pixmap = QPixmap.fromImage(image)
-    pixmap.setDevicePixelRatio(dpr)
+    if scaled:
+        pixmap.setDevicePixelRatio(dpr)
+    elif pixmap.width() > target_w or pixmap.height() > target_h:
+        # 读取前探不到尺寸的格式：解码后再缩一次
+        pixmap = pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap.setDevicePixelRatio(dpr)
+    # else: 源图本身比目标还小——保持 1x 按天然逻辑尺寸显示。
+    # 以前这里无条件打 dpr 标记，小图在高分屏会被缩小到 1/dpr 显示。
     _THUMB_CACHE[key] = pixmap
     while len(_THUMB_CACHE) > _THUMB_CACHE_MAX:
         _THUMB_CACHE.popitem(last=False)
@@ -494,6 +686,27 @@ def recovery_scan_roots(scan_settings, drive_hints=None):
     for root in (scan_settings or {}).get('scan_roots', []) or []:
         add(root)
 
+    # 祖先包含的根去重：同时配置 C:\ 和 C:\Users\x 会把后者扫两遍，
+    # 重复命中会让"唯一匹配才自动采纳"的判定失效
+    pruned = []
+    norm_roots = [os.path.normcase(os.path.normpath(r)) for r in roots]
+    for i, root in enumerate(roots):
+        covered = False
+        for j, other in enumerate(norm_roots):
+            if i == j:
+                continue
+            prefix = other.rstrip('\\/') + os.sep
+            if norm_roots[i] != other and norm_roots[i].startswith(prefix):
+                covered = True
+                break
+            if norm_roots[i] == other and j < i:
+                covered = True
+                break
+        if not covered:
+            pruned.append(root)
+    roots = pruned
+    seen = {os.path.normcase(os.path.normpath(r)) for r in roots}
+
     hint_letters = {
         str(h).rstrip(':\\/')
         .upper()
@@ -607,9 +820,19 @@ def refresh_autostart_if_needed():
 
 # ============ 备忘录列表自定义渲染 ============
 
+LIST_SELECTED_BG = QColor(COLORS['selection_bg'])
+LIST_HOVER_BG = QColor('#E8E8ED')
+LIST_TITLE = QColor(COLORS['text_primary'])
+LIST_SECONDARY = QColor(COLORS['text_secondary'])
+LIST_TERTIARY = QColor(COLORS['text_tertiary'])
+LIST_ACCENT = QColor(COLORS['accent'])
+LIST_SELECTED_SECONDARY = QColor('#4F6F92')
+LIST_BADGE_BG = QColor('#E6E6EB')
+LIST_BADGE_FG = QColor('#5F636B')
+
 class NoteListDelegate(QStyledItemDelegate):
-    ITEM_HEIGHT = 68
-    SIDE_MARGIN = 4
+    ITEM_HEIGHT = 72
+    SIDE_MARGIN = 3
     PADDING = 12
 
     def sizeHint(self, option, index):
@@ -623,29 +846,29 @@ class NoteListDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        rect = option.rect.adjusted(self.SIDE_MARGIN, 2, -self.SIDE_MARGIN, -2)
+        rect = option.rect.adjusted(self.SIDE_MARGIN, 3, -self.SIDE_MARGIN, -3)
 
         selected = bool(option.state & QStyle.State_Selected)
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#2F7BFF"))
+            painter.setBrush(LIST_SELECTED_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            c_title = QColor("#FFFFFF")
-            c_time = QColor(255, 255, 255, 220)
-            c_preview = QColor(255, 255, 255, 200)
+            painter.drawRoundedRect(rect, 10, 10)
+            c_title = LIST_ACCENT
+            c_time = LIST_SELECTED_SECONDARY
+            c_preview = LIST_SELECTED_SECONDARY
         elif hovered:
-            painter.setBrush(QColor(47, 123, 255, 20))
+            painter.setBrush(LIST_HOVER_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            c_title = QColor("#263548")
-            c_time = QColor("#8B98AA")
-            c_preview = QColor("#8B98AA")
+            painter.drawRoundedRect(rect, 10, 10)
+            c_title = LIST_TITLE
+            c_time = LIST_SECONDARY
+            c_preview = LIST_SECONDARY
         else:
-            c_title = QColor("#263548")
-            c_time = QColor("#8B98AA")
-            c_preview = QColor("#8B98AA")
+            c_title = LIST_TITLE
+            c_time = LIST_TERTIARY
+            c_preview = LIST_SECONDARY
 
         title = note_display_title(note)
         time_str = format_time_short(note.get('updated_at', ''))
@@ -703,15 +926,15 @@ class NoteListDelegate(QStyledItemDelegate):
                 badge_w, 16
             )
             if selected:
-                painter.setBrush(QColor(255, 255, 255, 70))
+                painter.setBrush(QColor(0, 122, 255, 28))
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(badge_rect, 8, 8)
-                painter.setPen(QColor("#FFFFFF"))
+                painter.setPen(LIST_ACCENT)
             else:
-                painter.setBrush(QColor("#E5E5E7"))
+                painter.setBrush(LIST_BADGE_BG)
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(badge_rect, 8, 8)
-                painter.setPen(QColor("#65758B"))
+                painter.setPen(LIST_BADGE_FG)
             painter.drawText(badge_rect, Qt.AlignCenter, str(att_count))
 
         if pinned:
@@ -722,10 +945,10 @@ class NoteListDelegate(QStyledItemDelegate):
             right_edge = rect.right() - self.PADDING - (badge_w + 6 if badge_w > 0 else 0)
             pin_rect = QRectF(right_edge - pin_w, rect.top() + 12, pin_w, 16)
             if selected:
-                painter.setBrush(QColor(255, 255, 255, 70))
+                painter.setBrush(QColor('#FFF0BF'))
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(pin_rect, 8, 8)
-                painter.setPen(QColor("#FFFFFF"))
+                painter.setPen(QColor('#7A5200'))
             else:
                 painter.setBrush(QColor("#FFF2CC"))
                 painter.setPen(Qt.NoPen)
@@ -758,8 +981,8 @@ class NoteListDelegate(QStyledItemDelegate):
 
 
 class ScreenshotListDelegate(QStyledItemDelegate):
-    ITEM_HEIGHT = 68
-    SIDE_MARGIN = 4
+    ITEM_HEIGHT = 72
+    SIDE_MARGIN = 3
     PADDING = 12
 
     def sizeHint(self, option, index):
@@ -772,25 +995,25 @@ class ScreenshotListDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = option.rect.adjusted(self.SIDE_MARGIN, 2, -self.SIDE_MARGIN, -2)
+        rect = option.rect.adjusted(self.SIDE_MARGIN, 3, -self.SIDE_MARGIN, -3)
         selected = bool(option.state & QStyle.State_Selected)
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#2F7BFF"))
+            painter.setBrush(LIST_SELECTED_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#FFFFFF")
-            sub_color = QColor(255, 255, 255, 210)
+            painter.drawRoundedRect(rect, 10, 10)
+            title_color = LIST_ACCENT
+            sub_color = LIST_SELECTED_SECONDARY
         elif hovered:
-            painter.setBrush(QColor(47, 123, 255, 20))
+            painter.setBrush(LIST_HOVER_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#263548")
-            sub_color = QColor("#8B98AA")
+            painter.drawRoundedRect(rect, 10, 10)
+            title_color = LIST_TITLE
+            sub_color = LIST_SECONDARY
         else:
-            title_color = QColor("#263548")
-            sub_color = QColor("#8B98AA")
+            title_color = LIST_TITLE
+            sub_color = LIST_TERTIARY
 
         title = attachment_display_title(att)
         sub = format_time_short(att.get('archived_at') or att.get('added_at') or '')
@@ -832,8 +1055,8 @@ class ScreenshotListDelegate(QStyledItemDelegate):
 
 
 class ArchiveListDelegate(QStyledItemDelegate):
-    ITEM_HEIGHT = 68
-    SIDE_MARGIN = 4
+    ITEM_HEIGHT = 72
+    SIDE_MARGIN = 3
     PADDING = 12
 
     def sizeHint(self, option, index):
@@ -846,31 +1069,31 @@ class ArchiveListDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = option.rect.adjusted(self.SIDE_MARGIN, 2, -self.SIDE_MARGIN, -2)
+        rect = option.rect.adjusted(self.SIDE_MARGIN, 3, -self.SIDE_MARGIN, -3)
         selected = bool(option.state & QStyle.State_Selected)
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         if selected:
-            painter.setBrush(QColor("#2F7BFF"))
+            painter.setBrush(LIST_SELECTED_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#FFFFFF")
-            sub_color = QColor(255, 255, 255, 210)
-            badge_bg = QColor(255, 255, 255, 70)
-            badge_fg = QColor("#FFFFFF")
+            painter.drawRoundedRect(rect, 10, 10)
+            title_color = LIST_ACCENT
+            sub_color = LIST_SELECTED_SECONDARY
+            badge_bg = QColor(0, 122, 255, 28)
+            badge_fg = LIST_ACCENT
         elif hovered:
-            painter.setBrush(QColor(47, 123, 255, 20))
+            painter.setBrush(LIST_HOVER_BG)
             painter.setPen(Qt.NoPen)
-            painter.drawRoundedRect(rect, 8, 8)
-            title_color = QColor("#263548")
-            sub_color = QColor("#8B98AA")
-            badge_bg = QColor("#E5E5E7")
-            badge_fg = QColor("#65758B")
+            painter.drawRoundedRect(rect, 10, 10)
+            title_color = LIST_TITLE
+            sub_color = LIST_SECONDARY
+            badge_bg = LIST_BADGE_BG
+            badge_fg = LIST_BADGE_FG
         else:
-            title_color = QColor("#263548")
-            sub_color = QColor("#8B98AA")
-            badge_bg = QColor("#E5E5E7")
-            badge_fg = QColor("#65758B")
+            title_color = LIST_TITLE
+            sub_color = LIST_TERTIARY
+            badge_bg = LIST_BADGE_BG
+            badge_fg = LIST_BADGE_FG
 
         note = data.get('note') or {}
         att = data.get('attachment') or {}
@@ -950,10 +1173,19 @@ class ArchiveListDelegate(QStyledItemDelegate):
 SHELL_CREATE_MATCH_WINDOW_SECONDS = 180.0
 SHELL_DELETE_RETRY_WINDOW_SECONDS = 180.0
 AUTO_RECOVERY_COOLDOWN_SECONDS = 30.0
+AUTO_RECOVERY_BACKOFF_SECONDS = (180.0, 600.0, 1800.0, 3600.0)
 WINDOW_ACTIVATE_COOLDOWN_SECONDS = 8.0
 CLIPBOARD_MOVE_MATCH_WINDOW_SECONDS = 180.0
 DROPEFFECT_COPY = 1
 DROPEFFECT_MOVE = 2
+
+
+def _auto_recovery_backoff_seconds(fail_count):
+    try:
+        idx = max(0, int(fail_count or 1) - 1)
+    except Exception:
+        idx = 0
+    return AUTO_RECOVERY_BACKOFF_SECONDS[min(idx, len(AUTO_RECOVERY_BACKOFF_SECONDS) - 1)]
 
 
 def attachment_kind_label(att):
@@ -970,9 +1202,14 @@ def attachment_display_title(att):
     return att.get('archive_content') or att.get('memo') or att.get('original_name') or attachment_kind_label(att)
 
 
-def build_folder_icon(size=36):
+def build_folder_icon(size=36, dpr=None):
     height = max(size, int(size * 44 / 36))
-    pix = QPixmap(size, height)
+    if dpr is None:
+        dpr = _screen_dpr()
+    # 先按 dpr 放大画布并打标记再开 QPainter：painter 自动落在逻辑坐标系，
+    # 下面的绘制代码保持逻辑尺寸不变，高分屏不再发虚
+    pix = QPixmap(int(size * dpr), int(height * dpr))
+    pix.setDevicePixelRatio(dpr)
     pix.fill(Qt.transparent)
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
@@ -996,12 +1233,15 @@ def build_folder_icon(size=36):
     return pix
 
 
-def build_file_icon(path, size=36, colors=None):
+def build_file_icon(path, size=36, colors=None, dpr=None):
     height = max(size, int(size * 44 / 36))
     ext = Path(path).suffix.lower()
     color = QColor((colors or {}).get(ext, '#8E8E93'))
 
-    pix = QPixmap(size, height)
+    if dpr is None:
+        dpr = _screen_dpr()
+    pix = QPixmap(int(size * dpr), int(height * dpr))
+    pix.setDevicePixelRatio(dpr)
     pix.fill(Qt.transparent)
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1027,6 +1267,19 @@ def build_file_icon(path, size=36, colors=None):
     painter.drawText(QRectF(0, 8 * sy, size, height - 8 * sy), Qt.AlignCenter, label)
     painter.end()
     return pix
+
+
+def scale_icon_to_box(pix, box_w, box_h):
+    """把图标等比缩进 box_w×box_h 逻辑尺寸的盒子。
+
+    QPixmap.scaled 的目标尺寸是设备像素且结果沿用源 dpr 标记，直接
+    .scaled(16,16) 会把高分屏图标缩成 16 设备像素（≈10.7 逻辑像素）显示变小。
+    """
+    dpr = pix.devicePixelRatio() or 1.0
+    return pix.scaled(
+        max(1, int(box_w * dpr)), max(1, int(box_h * dpr)),
+        Qt.KeepAspectRatio, Qt.SmoothTransformation,
+    )
 
 
 def clipboard_drop_effect(mime):
@@ -1237,6 +1490,8 @@ class ModeSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName('mode_switch')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._mode = 'text'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1290,6 +1545,8 @@ class ViewSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName('view_switch')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._view = 'active'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1346,6 +1603,8 @@ class TextFormatSwitch(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setObjectName('text_format_switch')
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._format = 'rich'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1439,6 +1698,9 @@ class ScreenshotThumbnail(QFrame):
 
     THUMB_W = 220
     THUMB_H = 150
+    # QSS 里 #screenshot_thumb 各状态 border+padding 每侧恒为 2px，
+    # 子控件必须按内容区宽度排，否则会盖住卡片边框（选中态右侧描边消失）
+    CONTENT_W = THUMB_W - 4
     CHILD_ROW_H = 42
     CARD_H = THUMB_H + CHILD_ROW_H + 38
 
@@ -1463,7 +1725,7 @@ class ScreenshotThumbnail(QFrame):
 
         self.image_label = QLabel()
         self.image_label.setObjectName('thumb_image')
-        self.image_label.setFixedSize(self.THUMB_W, self.THUMB_H)
+        self.image_label.setFixedSize(self.CONTENT_W, self.THUMB_H)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setPixmap(self._build_thumbnail())
 
@@ -1472,7 +1734,7 @@ class ScreenshotThumbnail(QFrame):
         self.check_btn.setObjectName('thumb_check')
         self.check_btn.setProperty('done', self.is_archived)
         self.check_btn.setFixedSize(28, 28)
-        self.check_btn.move(self.THUMB_W - 36, 8)
+        self.check_btn.move(self.CONTENT_W - 36, 8)
         self.check_btn.setCursor(Qt.PointingHandCursor)
         self.check_btn.setFocusPolicy(Qt.NoFocus)
         self.check_btn.setAttribute(Qt.WA_NoMousePropagation, True)
@@ -1482,7 +1744,7 @@ class ScreenshotThumbnail(QFrame):
         self.add_child_btn = QPushButton('+', self.image_label)
         self.add_child_btn.setObjectName('thumb_add_attachment')
         self.add_child_btn.setFixedSize(24, 24)
-        self.add_child_btn.move(self.THUMB_W - 66, 10)
+        self.add_child_btn.move(self.CONTENT_W - 66, 10)
         self.add_child_btn.setCursor(Qt.PointingHandCursor)
         self.add_child_btn.setFocusPolicy(Qt.NoFocus)
         self.add_child_btn.setAttribute(Qt.WA_NoMousePropagation, True)
@@ -1522,15 +1784,20 @@ class ScreenshotThumbnail(QFrame):
             row.addWidget(empty)
             row.addStretch()
             return row
-        for child in children[:3]:
+        visible_count = 2 if len(children) > 3 else 3
+        for child in children[:visible_count]:
             chip = ScreenshotChildAttachmentChip(child, self._child_path(child))
             chip.open_requested.connect(self.child_open_requested.emit)
             chip.delete_requested.connect(self.child_delete_requested.emit)
             chip.category_change_requested.connect(self.child_category_change_requested.emit)
             row.addWidget(chip)
-        if len(children) > 3:
-            more = QLabel(f'+{len(children) - 3}')
+        if len(children) > visible_count:
+            more_text = f'+{len(children) - visible_count}'
+            more = QLabel(more_text)
             more.setObjectName('thumb_attachment_more')
+            more.setAlignment(Qt.AlignCenter)
+            more.setFixedHeight(30)
+            more.setMinimumWidth(max(32, QFontMetrics(more.font()).horizontalAdvance(more_text) + 18))
             row.addWidget(more)
         row.addStretch()
         return row
@@ -1544,26 +1811,27 @@ class ScreenshotThumbnail(QFrame):
         if not self.is_image:
             return self._build_attachment_thumbnail()
         if not self.file_path.exists():
-            pix = QPixmap(self.THUMB_W, self.THUMB_H)
-            pix.fill(QColor("#F5F5F7"))
-            painter = QPainter(pix)
-            painter.setPen(QColor("#8B98AA"))
-            painter.drawText(pix.rect(), Qt.AlignCenter, tr('图片不存在'))
-            painter.end()
-            return pix
-        pixmap = load_scaled_pixmap(self.file_path, self.THUMB_W, self.THUMB_H)
+            return self._build_placeholder(tr('图片不存在'))
+        pixmap = load_scaled_pixmap(self.file_path, self.CONTENT_W, self.THUMB_H)
         if pixmap is None:
-            pix = QPixmap(self.THUMB_W, self.THUMB_H)
-            pix.fill(QColor("#F5F5F7"))
-            painter = QPainter(pix)
-            painter.setPen(QColor("#8B98AA"))
-            painter.drawText(pix.rect(), Qt.AlignCenter, tr('无法加载'))
-            painter.end()
-            return pix
+            return self._build_placeholder(tr('无法加载'))
         return pixmap
 
+    def _build_placeholder(self, text):
+        dpr = _screen_dpr()
+        pix = QPixmap(int(self.CONTENT_W * dpr), int(self.THUMB_H * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QColor("#F5F5F7"))
+        painter = QPainter(pix)
+        painter.setPen(QColor("#8B98AA"))
+        painter.drawText(QRect(0, 0, self.CONTENT_W, self.THUMB_H), Qt.AlignCenter, text)
+        painter.end()
+        return pix
+
     def _build_attachment_thumbnail(self):
-        pix = QPixmap(self.THUMB_W, self.THUMB_H)
+        dpr = _screen_dpr()
+        pix = QPixmap(int(self.CONTENT_W * dpr), int(self.THUMB_H * dpr))
+        pix.setDevicePixelRatio(dpr)
         pix.fill(QColor("#F5F5F7"))
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1572,7 +1840,9 @@ class ScreenshotThumbnail(QFrame):
             icon = build_folder_icon(46)
         else:
             icon = build_file_icon(self.file_path, 46, AttachmentCard.EXT_COLORS)
-        icon_rect = QRect((self.THUMB_W - icon.width()) // 2, 36, icon.width(), icon.height())
+        icon_w = int(icon.width() / (icon.devicePixelRatio() or 1.0))
+        icon_h = int(icon.height() / (icon.devicePixelRatio() or 1.0))
+        icon_rect = QRect((self.CONTENT_W - icon_w) // 2, 36, icon_w, icon_h)
         painter.drawPixmap(icon_rect, icon)
 
         name = self.attachment.get('original_name', '') or attachment_kind_label(self.attachment)
@@ -1581,7 +1851,7 @@ class ScreenshotThumbnail(QFrame):
         font.setWeight(QFont.DemiBold)
         painter.setFont(font)
         painter.setPen(QColor("#263548"))
-        text_rect = QRect(18, 98, self.THUMB_W - 36, 20)
+        text_rect = QRect(18, 98, self.CONTENT_W - 36, 20)
         painter.drawText(
             text_rect,
             Qt.AlignCenter,
@@ -1596,7 +1866,7 @@ class ScreenshotThumbnail(QFrame):
         sub = attachment_kind_label(self.attachment)
         if self.attachment.get('type') == 'file_ref':
             sub = format_size(self.attachment.get('size', 0))
-        painter.drawText(QRect(18, 120, self.THUMB_W - 36, 18), Qt.AlignCenter, sub)
+        painter.drawText(QRect(18, 120, self.CONTENT_W - 36, 18), Qt.AlignCenter, sub)
         painter.end()
         return pix
 
@@ -1653,9 +1923,11 @@ class ScreenshotThumbnail(QFrame):
                 QMessageBox.critical(self, '保存失败', str(e))
 
     def _reveal(self):
-        if not self.file_path.exists():
-            return
-        reveal_in_file_manager(self.file_path)
+        if not self.file_path.exists() or not reveal_in_file_manager(self.file_path):
+            QMessageBox.warning(
+                self, '无法定位',
+                tr('文件已被移动或删除，无法在资源管理器中显示：\n{path}',
+                   path=str(self.file_path)))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1690,6 +1962,7 @@ class ScreenshotChildAttachmentChip(QFrame):
         self.setProperty('categorized', bool((attachment.get('archive_category') or attachment.get('category') or '').strip()))
         self.setFixedSize(60, 30)
         self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_NoMousePropagation, True)
         category = (attachment.get('archive_category') or attachment.get('category') or '').strip()
         tooltip = tr('{name}\n双击打开 · 右键更多', name=attachment.get('original_name', ''))
         if category:
@@ -1703,30 +1976,32 @@ class ScreenshotChildAttachmentChip(QFrame):
         icon = QLabel()
         icon.setObjectName('thumb_attachment_icon')
         icon.setFixedSize(16, 16)
+        icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         if is_image_attachment(attachment) and self.file_path.exists():
             # 之前整图解码只为做 16x16 图标
             pixmap = load_scaled_pixmap(self.file_path, 16, 16)
             if pixmap is not None:
                 icon.setPixmap(pixmap)
             else:
-                icon.setPixmap(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+                icon.setPixmap(scale_icon_to_box(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS), 16, 16))
         elif attachment.get('type') == 'folder':
-            icon.setPixmap(build_folder_icon(16).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+            icon.setPixmap(scale_icon_to_box(build_folder_icon(16), 16, 16))
         else:
-            icon.setPixmap(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS).scaled(16, 16, Qt.KeepAspectRatio, Qt.FastTransformation))
+            icon.setPixmap(scale_icon_to_box(build_file_icon(file_path, 16, AttachmentCard.EXT_COLORS), 16, 16))
 
         name_text = f'#{category}' if category else (attachment.get('original_name', '') or attachment_kind_label(attachment))
         name = QLabel()
         name.setObjectName('thumb_attachment_name')
-        name.setFixedWidth(30)
-        name.setText(QFontMetrics(name.font()).elidedText(name_text, Qt.ElideRight, 30))
+        name.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        name.setFixedWidth(28)
+        name.setText(QFontMetrics(name.font()).elidedText(name_text, Qt.ElideRight, 28))
 
         layout.addWidget(icon)
         layout.addWidget(name, 1)
 
     def mouseDoubleClickEvent(self, event):
         self.open_requested.emit(self.attachment.get('id', ''))
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -1746,6 +2021,8 @@ class ScreenshotGridCanvas(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName('screenshot_grid_inner')
+        # 自定义 QWidget 子类默认不画 QSS 背景，必须显式启用
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self._empty_art = True
 
     def set_empty_art(self, empty):
@@ -1999,6 +2276,8 @@ class ImageViewerDialog(QDialog):
         self.view.setFrameShape(QFrame.NoFrame)
         self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.view.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.view.viewport().installEventFilter(self)
 
         layout.addWidget(self.view)
 
@@ -2049,13 +2328,22 @@ class ImageViewerDialog(QDialog):
     def _scale_by(self, factor):
         self.view.scale(factor, factor)
 
-    def wheelEvent(self, event):
+    def _handle_wheel_zoom(self, event):
         delta = event.angleDelta().y()
         if delta > 0:
             self._scale_by(1.15)
         else:
             self._scale_by(1 / 1.15)
         event.accept()
+
+    def eventFilter(self, obj, event):
+        if obj is self.view.viewport() and event.type() == QEvent.Wheel:
+            self._handle_wheel_zoom(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def wheelEvent(self, event):
+        self._handle_wheel_zoom(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -2095,13 +2383,13 @@ class ArchivePhotoDialog(QDialog):
         if is_image:
             pixmap = load_scaled_pixmap(file_path, 120, 82) or QPixmap()
         else:
-            pixmap = build_folder_icon(58) if attachment.get('type') == 'folder' else build_file_icon(file_path, 58, AttachmentCard.EXT_COLORS)
+            # 直接按盒子高度出图（图标固定 36:44 比例，82 高对应 67 宽），
+            # 免二次放大缩小，高分屏下也锐利
+            pixmap = build_folder_icon(67) if attachment.get('type') == 'folder' else build_file_icon(file_path, 67, AttachmentCard.EXT_COLORS)
         if pixmap.isNull():
             thumb.setText('无法预览')
-        elif is_image:
-            thumb.setPixmap(pixmap)
         else:
-            thumb.setPixmap(pixmap.scaled(120, 82, Qt.KeepAspectRatio, Qt.FastTransformation))
+            thumb.setPixmap(pixmap)
 
         name_box = QVBoxLayout()
         name_box.setContentsMargins(0, 0, 0, 0)
@@ -2246,6 +2534,8 @@ class EmptyState(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName('empty_state')
+        # 自定义 QWidget 子类默认不画 QSS 背景，必须显式启用
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 20, 20, 20)
@@ -2260,9 +2550,10 @@ class EmptyState(QWidget):
         panel_layout.setSpacing(12)
         panel_layout.addStretch()
 
-        self.icon = QLabel('▤')
+        self.icon = QLabel()
         self.icon.setObjectName('empty_icon')
         self.icon.setAlignment(Qt.AlignCenter)
+        self._set_icon('document')
 
         self.title = QLabel('')
         self.title.setObjectName('empty_title')
@@ -2298,9 +2589,13 @@ class EmptyState(QWidget):
 
         outer.addWidget(panel, 0, Qt.AlignCenter)
 
+    def _set_icon(self, name):
+        color = '#248A3D' if name == 'check' else '#636366'
+        self.icon.setPixmap(build_ui_icon(name, color).pixmap(24, 24))
+
     def configure(self, view='active', filtered=False, search='', category='', has_rows=False):
         if has_rows:
-            self.icon.setText('▤')
+            self._set_icon('document')
             self.title.setText('选择一条备忘录')
             self.message.setText('从左侧列表打开一条备忘录。')
             self.secondary_btn.hide()
@@ -2308,7 +2603,7 @@ class EmptyState(QWidget):
             return
 
         if filtered:
-            self.icon.setText('⌕')
+            self._set_icon('search')
             self.title.setText('没有匹配的备忘录')
             detail = '换一个关键词或清除分类筛选。'
             if search and category:
@@ -2325,7 +2620,7 @@ class EmptyState(QWidget):
             return
 
         if view == 'archived':
-            self.icon.setText('✓')
+            self._set_icon('check')
             self.title.setText('归档里还没有内容')
             self.message.setText('附件或备忘录归档后会出现在这里，也会按分类进入时间线。')
             self.secondary_btn.setText('查看时间线')
@@ -2334,7 +2629,7 @@ class EmptyState(QWidget):
             self.primary_btn.show()
             return
 
-        self.icon.setText('▤')
+        self._set_icon('document')
         self.title.setText('点击“新建记事”或拖拽文件到此处')
         self.message.setText('支持 .txt .md 等文本文件')
         self.secondary_btn.hide()
@@ -2398,20 +2693,31 @@ def period_label(key, granularity):
         return key
 
 
+def heatmap_end_date(latest, today, weeks):
+    """Keep recent heatmaps anchored to today and historical ones on their data."""
+    if latest is None:
+        return today
+    if today is None:
+        return latest
+    visible_days = max(1, int(weeks or 1)) * 7
+    delta = (today - latest).days
+    return today if 0 <= delta < visible_days else latest
+
+
 class TimelineReviewChart(QWidget):
     category_selected = Signal(str)
 
     # —— 配色（QPainter 硬编码色无法被 QSS 覆盖，集中为类常量便于一处主题化）——
-    BLUE = '#2F7BFF'; BLUE_LIGHT = '#5C9BFF'
+    BLUE = '#007AFF'; BLUE_LIGHT = '#5AC8FA'
     GREEN = '#34C759'; GREEN_LIGHT = '#5AD27A'
     GOLD = '#FF9F0A'; GOLD_LIGHT = '#FFB340'
     SILVER = '#AEB8C6'; SILVER_LIGHT = '#C9D2DE'
     BRONZE = '#CD7F45'; BRONZE_LIGHT = '#E0A87E'
-    TEXT = '#263548'; MUTED = '#65758B'; FAINT = '#8B98AA'
-    GRID = '#EEF2F8'; CARD_BORDER = '#E8E8ED'
+    TEXT = '#1D1D1F'; MUTED = '#6E6E73'; FAINT = '#8E8E93'
+    GRID = '#EFEFF4'; CARD_BORDER = '#E5E5EA'
     DIM = '#C7C7CC'; DIM_LIGHT = '#D6DEEA'
-    HOVER = '#F7FAFF'; BADGE_BG = '#EAF2FF'
-    PEAK_BLUE = '#1E5FD6'; PEAK_GREEN = '#1F9D4E'
+    HOVER = '#F5F5F7'; BADGE_BG = '#E7F1FF'
+    PEAK_BLUE = '#0068D9'; PEAK_GREEN = '#248A3D'
     HEAT_EMPTY = '#EBEDF0'
     HEAT_SCALE = ['#C8EBD3', '#86D6A1', '#52C07D', '#2C9E55']
     def __init__(self, chart_type, title, parent=None):
@@ -2433,7 +2739,7 @@ class TimelineReviewChart(QWidget):
             self._anim = QVariantAnimation(self)
             self._anim.setStartValue(0.0)
             self._anim.setEndValue(1.0)
-            self._anim.setDuration(520)
+            self._anim.setDuration(320)
             self._anim.setEasingCurve(QEasingCurve.OutCubic)
             self._anim.valueChanged.connect(self._on_grow)
         except Exception:
@@ -2533,12 +2839,12 @@ class TimelineReviewChart(QWidget):
         card = QRectF(rect.left(), rect.top(), rect.width(), max(10.0, rect.height() - 3))
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(QColor(40, 70, 110, 13), 1))
-        painter.drawRoundedRect(card.adjusted(0.5, 2.0, -0.5, 2.0), 9, 9)
+        painter.drawRoundedRect(card.adjusted(0.5, 2.0, -0.5, 2.0), 12, 12)
         painter.setPen(QPen(QColor(40, 70, 110, 6), 1))
-        painter.drawRoundedRect(card.adjusted(0.0, 3.2, 0.0, 3.2), 9, 9)
+        painter.drawRoundedRect(card.adjusted(0.0, 3.2, 0.0, 3.2), 12, 12)
         painter.setPen(QPen(QColor(self.CARD_BORDER), 1))
         painter.setBrush(QColor('#FFFFFF'))
-        painter.drawRoundedRect(card, 9, 9)
+        painter.drawRoundedRect(card, 12, 12)
         return card
 
     def _draw_empty(self, painter, rect):
@@ -2656,8 +2962,9 @@ class TimelineReviewChart(QWidget):
             category = record.get('category') or '未分类'
             groups[category]['total'] += record.get('duration_seconds') or 0
             groups[category]['count'] += 1
-        use_duration = any(data['total'] > 0 for data in groups.values())
-        metric_key = 'total' if use_duration else 'count'
+        # 这里展示归档数量分布。duration_seconds 是创建到归档的自然周期，
+        # 不能相加后称为某个分类的“投入”。
+        metric_key = 'count'
         items = sorted(groups.items(), key=lambda item: item[1][metric_key], reverse=True)
         if self.selected_category and self.selected_category in groups:
             head = items[:7]
@@ -2698,7 +3005,7 @@ class TimelineReviewChart(QWidget):
                 painter.fontMetrics().elidedText(category, Qt.ElideRight, int(label_w - 10)),
             )
             pct = round(metric / all_total * 100)
-            value_text = duration_text(data['total']) if use_duration else f"{data['count']} 项"
+            value_text = f"{data['count']} 项"
             painter.setPen(QColor(self.FAINT) if dim else QColor(self.MUTED))
             painter.drawText(
                 QRectF(track.right() + 8, y, 84, row_h),
@@ -2710,17 +3017,11 @@ class TimelineReviewChart(QWidget):
     def _draw_ranking(self, painter, rect):
         reverse = self.rank_order != 'fast'
         if self.selected_category:
-            selected_records = sorted(
+            records = sorted(
                 [record for record in self.records if record.get('category') == self.selected_category],
                 key=lambda r: r.get('duration_seconds') or 0,
                 reverse=reverse,
-            )
-            other_records = sorted(
-                [record for record in self.records if record.get('category') != self.selected_category],
-                key=lambda r: r.get('duration_seconds') or 0,
-                reverse=reverse,
-            )
-            records = (selected_records + other_records)[:8]
+            )[:8]
         else:
             records = sorted(self.records, key=lambda r: r.get('duration_seconds') or 0, reverse=reverse)[:8]
         if not records:
@@ -2821,17 +3122,16 @@ class TimelineReviewChart(QWidget):
         if not counts:
             self._draw_empty(painter, rect)
             return
-        try:
-            today = datetime.now().date()
-        except Exception:
-            today = latest
-        end = today if (today and today >= latest) else latest
-
         top_pad, left_pad, legend_h, gap = 16.0, 22.0, 16.0, 3.0
         grid = QRectF(rect.left() + left_pad, rect.top() + top_pad,
                       rect.width() - left_pad, rect.height() - top_pad - legend_h)
         weeks = int((grid.width() + gap) // (13.0 + gap))
         weeks = max(8, min(27, weeks))
+        try:
+            today = datetime.now().date()
+        except Exception:
+            today = latest
+        end = heatmap_end_date(latest, today, weeks)
         cell = (grid.width() - gap * (weeks - 1)) / weeks
         cell = max(6.0, min(15.0, cell))
         cell = min(cell, (grid.height() - gap * 6) / 7)
@@ -2899,7 +3199,7 @@ class TimelineReviewChart(QWidget):
                 tooltip = (
                     f'{title}\n'
                     f'分类：{category}\n'
-                    f'耗时：{duration_text(hovered.get("duration_seconds") or 0)}\n'
+                    f'归档周期：{duration_text(hovered.get("duration_seconds") or 0)}\n'
                     f'创建：{self._format_record_dt(hovered.get("created_dt")) or "未知"}\n'
                     f'完成：{self._format_record_dt(hovered.get("completed_dt")) or "未知"}'
                 )
@@ -3060,10 +3360,11 @@ class TimelineNoteItem(QFrame):
         layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(14)
 
-        icon = QLabel('✓')
+        icon = QLabel()
         icon.setObjectName('timeline_note_icon')
         icon.setAlignment(Qt.AlignCenter)
         icon.setFixedSize(42, 42)
+        icon.setPixmap(build_ui_icon('document', '#248A3D').pixmap(22, 22))
 
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
@@ -3192,9 +3493,10 @@ class TimelineDialog(QDialog):
 
         header_layout.addLayout(top_row)
 
-        filter_row = QHBoxLayout()
+        filter_row = QGridLayout()
         filter_row.setContentsMargins(0, 0, 0, 0)
-        filter_row.setSpacing(8)
+        filter_row.setHorizontalSpacing(8)
+        filter_row.setVerticalSpacing(8)
 
         self.range_filter = QComboBox()
         self.range_filter.setObjectName('timeline_filter_combo')
@@ -3256,16 +3558,25 @@ class TimelineDialog(QDialog):
 
         self.rank_filter = QComboBox()
         self.rank_filter.setObjectName('timeline_filter_combo')
-        self.rank_filter.addItem('耗时最多', 'slow')
-        self.rank_filter.addItem('耗时最少', 'fast')
+        self.rank_filter.addItem('周期最长', 'slow')
+        self.rank_filter.addItem('周期最短', 'fast')
         self.rank_filter.currentIndexChanged.connect(lambda _: self._populate())
 
-        filter_row.addWidget(self.range_filter)
-        filter_row.addWidget(self.custom_range_widget)
-        filter_row.addWidget(self.granularity_filter)
-        filter_row.addWidget(self.category_filter)
-        filter_row.addWidget(self.rank_filter)
-        filter_row.addStretch()
+        self.reset_filter_btn = QPushButton('重置筛选')
+        self.reset_filter_btn.setObjectName('timeline_reset_btn')
+        self.reset_filter_btn.setCursor(Qt.PointingHandCursor)
+        self.reset_filter_btn.setFocusPolicy(Qt.NoFocus)
+        self.reset_filter_btn.setIcon(build_ui_icon('reset', '#636366', '#1D1D1F'))
+        self.reset_filter_btn.setIconSize(QSize(15, 15))
+        self.reset_filter_btn.clicked.connect(self._reset_filters)
+
+        filter_row.addWidget(self.range_filter, 0, 0)
+        filter_row.addWidget(self.category_filter, 0, 1)
+        filter_row.addWidget(self.reset_filter_btn, 0, 2)
+        filter_row.addWidget(self.custom_range_widget, 1, 0, 1, 2)
+        filter_row.addWidget(self.granularity_filter, 1, 2)
+        filter_row.addWidget(self.rank_filter, 1, 3)
+        filter_row.setColumnStretch(4, 1)
         header_layout.addLayout(filter_row)
         self._sync_custom_range_visibility()
 
@@ -3275,19 +3586,22 @@ class TimelineDialog(QDialog):
         review_layout.setContentsMargins(18, 16, 18, 14)
         review_layout.setSpacing(12)
 
-        stats_row = QHBoxLayout()
-        stats_row.setSpacing(10)
+        stats_grid = QGridLayout()
+        stats_grid.setHorizontalSpacing(10)
+        stats_grid.setVerticalSpacing(10)
         self.count_value, self.count_sub, count_card = self._make_stat('完成', '0')
         self.streak_value, self.streak_sub, streak_card = self._make_stat('连续打卡', '0', accent=True)
         self.avg_value, self.avg_sub, avg_card = self._make_stat('活跃天数', '0')
-        self.total_value, self.total_sub, total_card = self._make_stat('总投入', '0')
+        self.total_value, self.total_sub, total_card = self._make_stat('平均归档周期', '0')
         self.span_value, self.span_sub, span_card = self._make_stat('跨度', '0')
-        stats_row.addWidget(count_card)
-        stats_row.addWidget(streak_card)
-        stats_row.addWidget(avg_card)
-        stats_row.addWidget(total_card)
-        stats_row.addWidget(span_card)
-        review_layout.addLayout(stats_row)
+        stats_grid.addWidget(count_card, 0, 0, 1, 2)
+        stats_grid.addWidget(streak_card, 0, 2, 1, 2)
+        stats_grid.addWidget(avg_card, 0, 4, 1, 2)
+        stats_grid.addWidget(total_card, 1, 0, 1, 3)
+        stats_grid.addWidget(span_card, 1, 3, 1, 3)
+        for column in range(6):
+            stats_grid.setColumnStretch(column, 1)
+        review_layout.addLayout(stats_grid)
         review_layout.addWidget(self._make_insight_strip())
 
         chart_grid = QGridLayout()
@@ -3296,8 +3610,8 @@ class TimelineDialog(QDialog):
         chart_grid.setVerticalSpacing(10)
         self.heatmap_chart = TimelineReviewChart('heatmap', '活跃热力图')
         self.trend_chart = TimelineReviewChart('trend', '创建 / 完成')
-        self.category_chart = TimelineReviewChart('category', '分类投入')
-        self.ranking_chart = TimelineReviewChart('ranking', '耗时排行')
+        self.category_chart = TimelineReviewChart('category', '分类分布')
+        self.ranking_chart = TimelineReviewChart('ranking', '归档周期排行')
         self.category_chart.category_selected.connect(self._select_category_from_chart)
         self.charts = [self.heatmap_chart, self.trend_chart, self.category_chart, self.ranking_chart]
         self.heatmap_chart.setMinimumHeight(120)
@@ -3314,8 +3628,8 @@ class TimelineDialog(QDialog):
         chart_grid.addWidget(self.ranking_chart, 2, 0, 1, 2)
         review_layout.addLayout(chart_grid)
 
-        detail_title = QLabel('归档明细')
-        detail_title.setObjectName('timeline_detail_title')
+        self.detail_title = QLabel('归档明细')
+        self.detail_title.setObjectName('timeline_detail_title')
 
         self.list = QListWidget()
         self.list.setObjectName('timeline_list')
@@ -3334,7 +3648,7 @@ class TimelineDialog(QDialog):
 
         layout.addWidget(header_box)
         layout.addWidget(review_scroll)
-        layout.addWidget(detail_title)
+        layout.addWidget(self.detail_title)
         layout.addWidget(self.list, 1)
 
         self._populate()
@@ -3352,6 +3666,8 @@ class TimelineDialog(QDialog):
         sub_label = QLabel(sub)
         sub_label.setObjectName('timeline_stat_sub')
         sub_label.setTextFormat(Qt.RichText)
+        sub_label.setWordWrap(True)
+        sub_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout.addWidget(value_label)
         layout.addWidget(label_widget)
         layout.addWidget(sub_label)
@@ -3369,7 +3685,8 @@ class TimelineDialog(QDialog):
             lab = QLabel('')
             lab.setObjectName('timeline_insight_label')
             lab.setTextFormat(Qt.RichText)
-            lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            lab.setWordWrap(True)
+            lab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             strip_layout.addWidget(lab, 1)
             self.insight_labels.append(lab)
             if idx < 2:
@@ -3400,8 +3717,11 @@ class TimelineDialog(QDialog):
             return self._sub_html(f'较上期 {delta}', '#8B98AA')
         return self._sub_html('与上期相当', '#8B98AA')
 
-    def _compute_insights(self, all_records, summary_records, range_bounds, granularity):
+    def _compute_insights(
+            self, all_records, summary_records, range_bounds, granularity,
+            comparison_records=None):
         info = {}
+        comparison_records = all_records if comparison_records is None else comparison_records
         try:
             today = datetime.now().date()
         except Exception:
@@ -3436,7 +3756,7 @@ class TimelineDialog(QDialog):
                 span = end_eff - start
                 prev_start = start - span
                 info['prev_count'] = sum(
-                    1 for r in all_records
+                    1 for r in comparison_records
                     if r.get('completed_dt') and prev_start <= r['completed_dt'] < start
                 )
                 info['period_delta'] = len(summary_records) - info['prev_count']
@@ -3454,21 +3774,11 @@ class TimelineDialog(QDialog):
             day, cnt = max(per_day.items(), key=lambda kv: kv[1])
             info['peak_day'] = day
             info['peak_day_count'] = cnt
-        cat_total = defaultdict(float)
         cat_count = defaultdict(int)
-        total_dur = 0.0
         for r in summary_records:
-            seconds = r.get('duration_seconds') or 0
             category = r.get('category') or '未分类'
-            cat_total[category] += seconds
             cat_count[category] += 1
-            total_dur += seconds
-        if cat_total and total_dur > 0:
-            cat, seconds = max(cat_total.items(), key=lambda kv: kv[1])
-            info['top_category'] = cat
-            info['top_category_pct'] = round(seconds / total_dur * 100)
-            info['top_category_metric'] = '时长'
-        elif cat_count:
+        if cat_count:
             cat, count = max(cat_count.items(), key=lambda kv: kv[1])
             info['top_category'] = cat
             info['top_category_pct'] = round(count / max(1, sum(cat_count.values())) * 100)
@@ -3500,21 +3810,20 @@ class TimelineDialog(QDialog):
         life = insights.get('life_total', 0)
         if nxt:
             rem = insights.get('milestone_remaining', 0)
-            msgs.append(f'🏆 累计完成 <b>{life}</b> 件 · 距 {nxt} 件还差 <b>{rem}</b> 件')
+            msgs.append(f'里程碑 · 累计完成 <b>{life}</b> 件，距 {nxt} 件还差 <b>{rem}</b> 件')
         elif life:
-            msgs.append(f'🏆 累计完成 <b>{life}</b> 件，已越过所有里程碑')
+            msgs.append(f'里程碑 · 累计完成 <b>{life}</b> 件')
         peak_day = insights.get('peak_day')
         peak_count = insights.get('peak_day_count')
         if peak_day and peak_count:
-            msgs.append(f'⚡ 最高产的一天：{peak_day.month}月{peak_day.day}日，完成 <b>{peak_count}</b> 件')
+            msgs.append(f'高峰 · {peak_day.month}月{peak_day.day}日完成 <b>{peak_count}</b> 件')
         top_cat = insights.get('top_category')
         top_pct = insights.get('top_category_pct')
         if top_cat and top_pct:
-            metric = '时长' if insights.get('top_category_metric') == '时长' else '数量'
-            msgs.append(f'🎯 最多来自 <b>#{html_escape(str(top_cat))}</b>，占 {top_pct}% {metric}')
+            msgs.append(f'分类 · <b>#{html_escape(str(top_cat))}</b> 占归档数量的 {top_pct}%')
         peak_hour = insights.get('peak_hour')
         if peak_hour is not None and len(msgs) < 3:
-            msgs.append(f'🕒 {peak_hour} 点前后是你的高产时刻')
+            msgs.append(f'时段 · {peak_hour} 点前后是你的高产时刻')
         labels = getattr(self, 'insight_labels', [])
         any_shown = False
         for idx, lab in enumerate(labels):
@@ -3546,6 +3855,29 @@ class TimelineDialog(QDialog):
         self.custom_range_widget.setVisible((self.range_filter.currentData() or 'all') == 'custom')
 
     def _on_range_changed(self):
+        self._sync_custom_range_visibility()
+        self._populate()
+
+    def _reset_filters(self):
+        widgets = (
+            self.range_filter,
+            self.granularity_filter,
+            self.category_filter,
+            self.rank_filter,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.range_filter.setCurrentIndex(0)
+            self.granularity_filter.setCurrentIndex(0)
+            self.category_filter.setCurrentIndex(0)
+            editor = self.category_filter.lineEdit()
+            if editor:
+                editor.clear()
+            self.rank_filter.setCurrentIndex(0)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
         self._sync_custom_range_visibility()
         self._populate()
 
@@ -3690,12 +4022,15 @@ class TimelineDialog(QDialog):
         return [record for record in records if self._category_matches(record.get('category'), category_query)]
 
     def _timeline_records_for_list(self, records, active_records):
-        category_query = self._category_query()
-        selected_category = self._exact_category(records, category_query)
-        return records if selected_category else active_records
+        return active_records
 
-    def _chart_records(self, records, active_records, selected_category, category_query):
-        return records if selected_category or not category_query else active_records
+    def _chart_records(self, records, active_records, selected_category, category_query, chart_type):
+        if not category_query:
+            return records
+        # 分类图保留全局分布作为上下文；趋势、排行和热力图遵循当前筛选。
+        if chart_type == 'category' and selected_category:
+            return records
+        return active_records
 
     def _select_category_from_chart(self, category):
         current = self._category_query()
@@ -3713,7 +4048,14 @@ class TimelineDialog(QDialog):
     def _update_summary(self, records, active_records, all_records, range_bounds, granularity):
         category_query = self._category_query()
         summary_records = active_records if category_query else records
-        insights = self._compute_insights(all_records, summary_records, range_bounds, granularity)
+        comparison_records = self._active_records(all_records, category_query) if category_query else all_records
+        insights = self._compute_insights(
+            all_records,
+            summary_records,
+            range_bounds,
+            granularity,
+            comparison_records=comparison_records,
+        )
         count = len(summary_records)
         total = sum(record.get('duration_seconds') or 0 for record in summary_records)
         active_days = insights.get('active_days', 0)
@@ -3734,16 +4076,16 @@ class TimelineDialog(QDialog):
         best = insights.get('best_streak', 0)
         self.streak_value.setText(f'{streak} 天')
         if streak > 0 and insights.get('today_done'):
-            self.streak_sub.setText(self._sub_html(f'🔥 最长 {best} 天', '#FF9F0A'))
+            self.streak_sub.setText(self._sub_html(f'今日已完成 · 最长 {best} 天', '#FF9F0A'))
         elif streak > 0:
             self.streak_sub.setText(self._sub_html(f'今天再完成 1 条续上 · 最长 {best} 天', '#8B98AA'))
         else:
-            self.streak_sub.setText(self._sub_html('归档 1 条开启连续记录 🔥', '#8B98AA'))
+            self.streak_sub.setText(self._sub_html('归档 1 条开启连续记录', '#8B98AA'))
 
         self.avg_value.setText(f'{active_days} 天' if count else '—')
         if span_days and active_days:
             pct = round(active_days / span_days * 100)
-            tail = ' 👏' if pct >= 80 else ''
+            tail = ' · 很稳定' if pct >= 80 else ''
             self.avg_sub.setText(self._sub_html(f'{span_days} 天里活跃 {pct}%{tail}', '#8B98AA'))
         else:
             self.avg_sub.setText('')
@@ -3752,13 +4094,10 @@ class TimelineDialog(QDialog):
             self.total_value.setText('—')
             self.total_sub.setText('')
         elif total > 0:
-            self.total_value.setText(duration_text(total))
-            if active_days:
-                self.total_sub.setText(self._sub_html(f'日均投入 {duration_text(total / active_days)}', '#8B98AA'))
-            else:
-                self.total_sub.setText('')
+            self.total_value.setText(duration_text(total / count))
+            self.total_sub.setText(self._sub_html(f'从创建到归档 · {count} 项平均', '#8B98AA'))
         else:
-            self.total_value.setText(f'{count} 项')
+            self.total_value.setText('—')
             self.total_sub.setText(self._sub_html(f'附件 {shot_count} · 备忘 {note_count}', '#8B98AA'))
 
         self.span_value.setText(f'{span_days} 天' if count else '—')
@@ -3784,10 +4123,16 @@ class TimelineDialog(QDialog):
         selected_category = self._exact_category(records, category_query)
         granularity = self.granularity_filter.currentData() or 'month'
         rank_order = self.rank_filter.currentData() or 'slow'
-        chart_records = self._chart_records(records, active_records, selected_category, category_query)
-
         for chart in self.charts:
-            chart.set_records(chart_records, selected_category, granularity, rank_order)
+            chart_records = self._chart_records(
+                records,
+                active_records,
+                selected_category,
+                category_query,
+                chart.chart_type,
+            )
+            highlight_category = selected_category if chart.chart_type == 'category' else ''
+            chart.set_records(chart_records, highlight_category, granularity, rank_order)
         self._update_summary(records, active_records, all_records, self._range_bounds(), granularity)
 
         list_records = self._timeline_records_for_list(records, active_records)
@@ -3805,6 +4150,7 @@ class TimelineDialog(QDialog):
         if note_count:
             parts.append(tr('{count} 条归档备忘录', count=note_count))
         self.subtitle.setText(prefix + (' · '.join(parts) if parts else tr('暂无归档内容')))
+        self.detail_title.setText(tr('归档明细 · {count} 项', count=len(list_records)))
 
         if not list_records:
             empty_text = tr('还没有归档内容\n\n归档附件或备忘录后会出现在这里')
@@ -3860,10 +4206,6 @@ class TimelineDialog(QDialog):
                 tw.category_change_requested.connect(self._change_attachment_category)
                 tw.unarchive_requested.connect(self._unarchive_attachment)
                 item_height = TimelineItem.HEIGHT
-            if selected_category and record.get('category') != selected_category:
-                effect = QGraphicsOpacityEffect(tw)
-                effect.setOpacity(0.34)
-                tw.setGraphicsEffect(effect)
             it = QListWidgetItem()
             it.setFlags(Qt.NoItemFlags)
             it.setSizeHint(QSize(0, item_height))
@@ -4263,40 +4605,28 @@ class FtrackScanWorker(QThread):
                     self.finished_with_result.emit(result)
                     return
 
-            # 2. Everything（如果可用）按 tag + name 定位
-            if tag and name and ftrack.everything_mode(es_path) and self.scan_settings.get('use_everything', True):
-                self.phase_changed.emit('用 Everything 查找带标签的文件')
-                found_map = ftrack.scan_via_everything(
-                    {tag: name},
-                    drive_hints=[hint] if hint else None,
-                    on_found=None,
-                    cancel=self._is_cancelled,
-                    progress=lambda d: self.progress.emit(d),
-                    phase=lambda p: self.phase_changed.emit(p),
-                    es_path=es_path,
-                )
-                if found_map.get(tag):
-                    result['path'] = found_map[tag]
-                    self.finished_with_result.emit(result)
-                    return
-
-            # 3. os.walk ADS 全盘扫描（兜底）
+            # 2. ADS 全盘扫描。Everything 的按旧文件名查询可能漏掉“已改名的
+            # 标签副本”，因此不能据其单个命中直接采纳；完整收集后才知道是否唯一。
             if not self._cancel and tag:
                 self.phase_changed.emit('按追踪标记全盘扫描')
                 scan_roots = recovery_scan_roots(self.scan_settings, [hint] if hint else None)
-                p = ftrack.scan_for_tag(
+                tag_candidates = ftrack.scan_for_tag_candidates(
                     tag,
                     roots=scan_roots,
                     progress=lambda d: self.progress.emit(d),
                     cancel=self._is_cancelled,
                     drive_hints=[hint] if hint else None,
                 )
-                if p:
-                    result['path'] = p
+                if len(tag_candidates) == 1:
+                    result['path'] = tag_candidates[0]
+                    self.finished_with_result.emit(result)
+                    return
+                if len(tag_candidates) > 1:
+                    result['candidates'] = tag_candidates
                     self.finished_with_result.emit(result)
                     return
 
-            # 4. 按名兜底 (Everything 优先 / os.walk)。
+            # 3. 按名兜底 (Everything 优先 / os.walk)。
             # 文件夹有 .fresh_folder_id 时不能再按旧名兜底，否则改名后会扫旧目录名。
             if name and not self._cancel and not (self.is_folder and tag):
                 self.phase_changed.emit('按文件名查找候选')
@@ -4320,9 +4650,12 @@ class FtrackScanWorker(QThread):
                         result['candidates'] = hash_matches
                         self.finished_with_result.emit(result)
                         return
+                    # 有 hash 但没有一个候选对得上：这些只是同名文件，
+                    # 不能被上层当成"已验证"自动采纳
+                    result['unverified'] = True
                 result['candidates'] = cands or []
 
-            # 5. 内容 hash 全盘兜底（覆盖跨盘复制、ADS 丢失、改名）
+            # 4. 内容 hash 全盘兜底（覆盖跨盘复制、ADS 丢失、改名）
             if not self._cancel and self.tracking.get('content_hash'):
                 self.phase_changed.emit('按内容 hash 扫描')
                 scan_roots = recovery_scan_roots(self.scan_settings, [hint] if hint else None)
@@ -4343,6 +4676,9 @@ class FtrackScanWorker(QThread):
             # 扫描出错和"未找到"必须可区分，否则任何编码/权限问题都被伪装成文件不存在
             logger.exception('重点扫描失败')
             result['error'] = str(exc)
+        if self._cancel and not result.get('path'):
+            # 用户主动取消：不要再弹"未找到"或候选选择框
+            result['cancelled'] = True
         self.finished_with_result.emit(result)
 
 
@@ -4352,11 +4688,15 @@ class AutoRecoveryWorker(QThread):
     found_one = Signal(str, str)  # (tracking_id, path)
     finished_clean = Signal(int)  # 已扫目录数
 
-    def __init__(self, tag_to_name, tag_to_tracking=None, drive_hints=None, scan_settings=None, tag_to_is_folder=None, parent=None):
+    def __init__(
+        self, tag_to_name, tag_to_tracking=None, drive_hints=None, scan_settings=None,
+        tag_to_is_folder=None, tag_to_has_tag=None, parent=None,
+    ):
         super().__init__(parent)
         self.tag_to_name = dict(tag_to_name)
         self.tag_to_tracking = dict(tag_to_tracking or {})
         self.tag_to_is_folder = dict(tag_to_is_folder or {})
+        self.tag_to_has_tag = dict(tag_to_has_tag or {})
         self.drive_hints = list(drive_hints or [])
         self.scan_settings = scan_settings or {}
         self._cancel = False
@@ -4389,7 +4729,10 @@ class AutoRecoveryWorker(QThread):
             # 与文件夹当前名无关，所以一条 Everything 查询就能批量定位；没装/没开 Everything
             # 时退化到只读目录 marker 的全盘扫描（scan_for_folder_markers，不依赖 Everything）。
             # 只有唯一命中才自动采纳，复制出多个副本（同一标记）的情况留给用户手动选择。
-            folder_tags = {t for t in remaining if self.tag_to_is_folder.get(t)}
+            folder_tags = {
+                t for t in remaining
+                if self.tag_to_is_folder.get(t) and self.tag_to_has_tag.get(t, True)
+            }
             if folder_tags and not self._cancel:
                 groups = {}
                 if self.scan_settings.get('use_everything', True) and ftrack.everything_mode(es_path):
@@ -4429,78 +4772,23 @@ class AutoRecoveryWorker(QThread):
                         remaining.discard(tag)
 
             if remaining and not self._cancel:
-                on_phase('按文件名快速验证剩余文件')
-                for tag in list(remaining):
-                    tracking = self.tag_to_tracking.get(tag, {})
-                    name = self.tag_to_name.get(tag, '')
-                    if not name or not tracking.get('content_hash'):
-                        continue
-                    paths = ftrack.find_nearby_name_candidates(
-                        name,
-                        roots=quick_roots,
-                        limit=100,
+                real_tag_remaining = {
+                    tag for tag in remaining
+                    if self.tag_to_has_tag.get(tag, True) and not self.tag_to_is_folder.get(tag)
+                }
+                if real_tag_remaining:
+                    on_phase('按追踪标记扫描并排除重复副本')
+                    found_by_tag = ftrack.scan_for_tags(
+                        real_tag_remaining,
+                        roots=scan_roots,
+                        drive_hints=self.drive_hints,
+                        on_found=on_found,
+                        cancel=lambda: self._cancel,
+                        progress=on_progress,
+                        unique_only=True,
                     )
-                    if ftrack.everything_mode(es_path):
-                        paths.extend(
-                            ftrack.everything_search(
-                                name,
-                                exact_name=True,
-                                drive_hint=None,
-                                limit=500,
-                                es_path=es_path,
-                            ) or []
-                        )
-                    # 两个来源会命中同一个文件（快速根目录 + Everything 索引），
-                    # 不去重会让"唯一命中"判定失败，还把同一文件 hash 两遍
-                    deduped = {}
-                    for p in (paths or []):
-                        try:
-                            key = os.path.normcase(os.path.normpath(p))
-                        except Exception:
-                            key = p
-                        deduped.setdefault(key, p)
-                    hash_matches = [
-                        p for p in deduped.values()
-                        if ftrack.path_matches_hash(p, tracking)
-                    ]
-                    if len(hash_matches) == 1:
-                        found[tag] = hash_matches[0]
-                        remaining.discard(tag)
-                        on_found(tag, hash_matches[0])
-                    if self._cancel:
-                        break
-
-            everything_name_targets = {
-                tag: self.tag_to_name.get(tag, '')
-                for tag in remaining
-                if not self.tag_to_is_folder.get(tag)
-            }
-            if everything_name_targets and not self._cancel and ftrack.everything_mode(es_path):
-                on_phase(f'用 Everything ({ftrack.everything_mode(es_path)}) 加速查找')
-                found_by_tag = ftrack.scan_via_everything(
-                    everything_name_targets,
-                    drive_hints=self.drive_hints,
-                    on_found=on_found,
-                    cancel=lambda: self._cancel,
-                    progress=on_progress,
-                    phase=on_phase,
-                    es_path=es_path,
-                )
-                found.update(found_by_tag or {})
-                remaining -= set((found_by_tag or {}).keys())
-
-            if remaining and not self._cancel:
-                on_phase('按追踪标记扫描剩余文件')
-                found_by_tag = ftrack.scan_for_tags(
-                    remaining,
-                    roots=scan_roots,
-                    drive_hints=self.drive_hints,
-                    on_found=on_found,
-                    cancel=lambda: self._cancel,
-                    progress=on_progress,
-                )
-                found.update(found_by_tag or {})
-                remaining -= set((found_by_tag or {}).keys())
+                    found.update(found_by_tag or {})
+                    remaining -= set((found_by_tag or {}).keys())
 
             hash_targets = {
                 tag: self.tag_to_tracking[tag]
@@ -4591,7 +4879,8 @@ class ScanSettingsDialog(QDialog):
         roots_layout = QVBoxLayout(roots_group)
         roots_layout.setSpacing(8)
 
-        hint = QLabel('留空时自动扫描所有 NTFS 盘。指定后只在这些位置中查找（仅影响 os.walk 兜底；Everything 总是查询全盘索引）。')
+        hint = QLabel('指定的位置会被优先扫描；为覆盖跨盘剪切，找不到时仍会继续扫描全部本地磁盘'
+                      '（含移动硬盘，不限 NTFS）。Everything 总是查询全盘索引。')
         hint.setWordWrap(True)
         hint.setStyleSheet('color: #8E8E93;')
         roots_layout.addWidget(hint)
@@ -4751,7 +5040,8 @@ class CustomizationDialog(QDialog):
         directory = ensure_custom_files()
         text_config_path()
         custom_qss_path()
-        open_local_path(directory)
+        if not open_local_path(directory):
+            QMessageBox.warning(self, '打开失败', f'文件夹不存在或无法打开:\n{directory}')
 
     def _build_text_tab(self):
         page = QWidget()
@@ -5293,11 +5583,14 @@ class AttachmentBar(QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName('attachment_bar')
-        self.setFixedHeight(120)
+        # 自定义 QWidget 子类默认不画 QSS 背景/边框：不开这个属性，
+        # #attachment_bar 的底色和 border-top 分隔线整条都不会渲染
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedHeight(128)
         self.setAcceptDrops(True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 10, 40, 14)
+        layout.setContentsMargins(48, 12, 48, 16)
         layout.setSpacing(6)
 
         header = QHBoxLayout()
@@ -5329,6 +5622,7 @@ class AttachmentBar(QWidget):
         self.scroll.setFrameShape(QFrame.NoFrame)
 
         self.scroll_content = QWidget()
+        self.scroll_content.setObjectName('att_scroll_content')
         self.scroll_layout = QHBoxLayout(self.scroll_content)
         self.scroll_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll_layout.setSpacing(10)
@@ -5337,6 +5631,7 @@ class AttachmentBar(QWidget):
         self.empty_label = QLabel('')
         self.empty_label.setObjectName('att_empty')
         self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.scroll.setWidget(self.scroll_content)
 
@@ -5431,6 +5726,11 @@ class AttachmentBar(QWidget):
         elif self._attachments:
             self.empty_label.setText(tr('这个分类下没有附件'))
             self.scroll_layout.addWidget(self.empty_label)
+            self.empty_label.show()
+        else:
+            self.empty_label.setText(tr('暂无附件'))
+            self.scroll_layout.addWidget(self.empty_label)
+            self.empty_label.show()
         self.scroll_layout.addStretch()
 
     def browse_file(self):
@@ -5526,8 +5826,8 @@ class NoteEditor(QWidget):
         self._content_format = 'rich'
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 28, 40, 24)
-        layout.setSpacing(6)
+        layout.setContentsMargins(48, 30, 48, 28)
+        layout.setSpacing(8)
 
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
@@ -5603,6 +5903,8 @@ class NoteEditor(QWidget):
         layout.addLayout(self.format_toolbar)
         layout.addWidget(self.divider)
         layout.addWidget(self.content_stack, 1)
+        # 让 acceptRichText 等 UI 状态与初始 _content_format 保持同步
+        self._sync_content_format_ui()
 
     def _build_format_toolbar(self):
         toolbar = QHBoxLayout()
@@ -5872,6 +6174,10 @@ class NoteEditor(QWidget):
 
     def _sync_content_format_ui(self):
         markdown = self._content_format == 'markdown'
+        # Markdown 模式必须拒收富文本粘贴：否则浏览器/Word 复制来的加粗、
+        # 颜色在编辑器里以富格式显示，保存却只落纯文本，重开笔记后格式
+        # 全部消失（所见非所存）。降级为纯文本让丢失在粘贴瞬间即可见。
+        self.content_edit.setAcceptRichText(not markdown)
         for btn in (
             getattr(self, 'bold_btn', None),
             getattr(self, 'italic_btn', None),
@@ -5913,38 +6219,49 @@ class NoteEditor(QWidget):
 
 
 class CustomTitleBar(QWidget):
+    HEIGHT = 44
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(40)
+        self.setFixedHeight(self.HEIGHT)
         self.setObjectName("custom_title_bar")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Space for dragging
-        self.drag_area = QLabel()
+        # A quiet document-style title keeps the chrome visually balanced while
+        # leaving the whole empty area available for native window dragging.
+        self.drag_area = QLabel('FRESH')
+        self.drag_area.setObjectName('window_title')
+        self.drag_area.setAlignment(Qt.AlignCenter)
         self.drag_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.drag_area)
 
         # Window controls
         btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(0, 0, 10, 0)
-        btn_layout.setSpacing(5)
+        btn_layout.setContentsMargins(0, 0, 12, 0)
+        btn_layout.setSpacing(2)
 
-        self.min_btn = QPushButton("—")
+        self.min_btn = QPushButton('')
         self.min_btn.setObjectName("win_min_btn")
-        self.min_btn.setFixedSize(30, 30)
+        self.min_btn.setFixedSize(32, 28)
         self.min_btn.setCursor(Qt.PointingHandCursor)
+        self.min_btn.setIcon(build_ui_icon('minus', '#636366', '#1D1D1F'))
+        self.min_btn.setIconSize(QSize(14, 14))
 
-        self.max_btn = QPushButton("□")
+        self.max_btn = QPushButton('')
         self.max_btn.setObjectName("win_max_btn")
-        self.max_btn.setFixedSize(30, 30)
+        self.max_btn.setFixedSize(32, 28)
         self.max_btn.setCursor(Qt.PointingHandCursor)
+        self.max_btn.setIcon(build_ui_icon('maximize', '#636366', '#1D1D1F'))
+        self.max_btn.setIconSize(QSize(13, 13))
 
-        self.close_btn = QPushButton("×")
+        self.close_btn = QPushButton('')
         self.close_btn.setObjectName("win_close_btn")
-        self.close_btn.setFixedSize(30, 30)
+        self.close_btn.setFixedSize(32, 28)
         self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setIcon(build_ui_icon('close', '#636366', '#FFFFFF'))
+        self.close_btn.setIconSize(QSize(13, 13))
 
         btn_layout.addWidget(self.min_btn)
         btn_layout.addWidget(self.max_btn)
@@ -5968,13 +6285,41 @@ class CustomTitleBar(QWidget):
 
     def _maximize_restore_window(self):
         window = self.window()
-        if window:
-            if window.isMaximized():
-                window.showNormal()
-                self.max_btn.setText("□")
-            else:
-                window.showMaximized()
-                self.max_btn.setText("❐")
+        if not window:
+            return
+        # 原生框架生效时必须走原生状态机（ShowWindow），并以 IsZoomed 为分支
+        # 判据：贴边/Win+Up/双击走 DefWindowProc 的原生 SC_MAXIMIZE 后，Qt 的
+        # showNormal() 是彻底 no-op 且 isMaximized() 会与真实 zoomed 位脱钩，
+        # 按 Qt 状态分支会让还原按钮点了没反应。
+        if getattr(window, '_native_frame_applied', False):
+            try:
+                hwnd = int(window.winId())
+            except Exception:
+                hwnd = 0
+            if hwnd:
+                if win_frame.is_zoomed(hwnd):
+                    if win_frame.restore_window(hwnd):
+                        self.sync_max_button(window.isMaximized())
+                        return
+                else:
+                    if win_frame.maximize_window(hwnd):
+                        self.sync_max_button(window.isMaximized())
+                        return
+        if window.isMaximized():
+            window.showNormal()
+        else:
+            window.showMaximized()
+        self.sync_max_button(window.isMaximized())
+
+    def sync_max_button(self, maximized):
+        """由 MainWindow.changeEvent 在任何状态变化时调用（含启动恢复、
+        托盘还原、原生贴边最大化），保证图标不滞留在旧状态。"""
+        self.max_btn.setIcon(build_ui_icon(
+            'restore' if maximized else 'maximize',
+            '#636366',
+            '#1D1D1F',
+        ))
+        self.max_btn.setToolTip('还原' if maximized else '最大化')
 
     def _close_window(self):
         window = self.window()
@@ -5982,14 +6327,25 @@ class CustomTitleBar(QWidget):
             window.close()
 
     def mousePressEvent(self, event):
+        # 正常情况下拖动/双击由 win_frame 的 WM_NCHITTEST(HTCAPTION) 原生接管，
+        # 这里只是原生集成失败时的兜底。startSystemMove 让系统跑移动循环：
+        # 支持 Aero Snap 贴边，最大化状态下拖动也会按系统惯例先还原。
         if event.button() == Qt.LeftButton:
-            self._is_dragging = True
-            self._drag_start_pos = event.globalPos() - self.window().frameGeometry().topLeft()
+            handle = self.window().windowHandle() if self.window() else None
+            if handle is not None:
+                try:
+                    if handle.startSystemMove():
+                        event.accept()
+                        return
+                except Exception:
+                    pass
+            self._is_dragging = not self.window().isMaximized()
+            self._drag_start_pos = event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self._is_dragging and event.buttons() & Qt.LeftButton:
-            self.window().move(event.globalPos() - self._drag_start_pos)
+        if self._is_dragging and self._drag_start_pos is not None and event.buttons() & Qt.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_start_pos)
             event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -6003,10 +6359,12 @@ class CustomTitleBar(QWidget):
             event.accept()
 
 class MainWindow(QMainWindow):
+    SIDEBAR_WIDTH = 288
+
     def __init__(self, storage, account=None, account_manager=None):
         super().__init__()
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self._sidebar_collapsed = False
+        self._native_frame_applied = False
         self.storage = storage
         self.account = account or {}
         self.account_manager = account_manager
@@ -6020,6 +6378,7 @@ class MainWindow(QMainWindow):
         self._settings = QSettings('FRESH', 'FRESH')
 
         refresh_autostart_if_needed()
+        self._sync_everything_flag()
 
         self.setWindowTitle('FRESH')
         self.resize(1080, 700)
@@ -6114,7 +6473,10 @@ class MainWindow(QMainWindow):
                     if not att.get('tracking'):
                         p = att.get('original_path', '')
                         if p and Path(p).exists():
-                            need_build.append((att.get('id'), str(Path(p).resolve())))
+                            resolved = str(Path(p).resolve())
+                            identity = _path_identity_snapshot(resolved)
+                            if identity is not None:
+                                need_build.append((att.get('id'), resolved, identity))
                     else:
                         if self.storage.refresh_tracking_if_changed(att):
                             self._tagging_changed = True
@@ -6129,12 +6491,18 @@ class MainWindow(QMainWindow):
         # 主线程只回填结果（之前是在 UI 线程哈希且每个附件落盘一次）
         def job(worker):
             out = []
-            for att_id, path in need_build:
+            for att_id, path, expected_identity in need_build:
                 try:
-                    out.append((att_id, ftrack.build_tracking(path)))
+                    if worker.cancelled:
+                        break
+                    snapshot = _build_tracking_snapshot(
+                        path,
+                        expected_identity=expected_identity,
+                    )
+                    out.append((att_id, path, snapshot))
                 except Exception:
                     logger.exception('后台补打追踪标签失败: %s', path)
-                    out.append((att_id, None))
+                    out.append((att_id, path, None))
             return out
 
         tag_worker = FuncWorker(job)
@@ -6146,17 +6514,128 @@ class MainWindow(QMainWindow):
             if getattr(self, '_tagging_worker', None) is tag_worker:
                 self._tagging_worker = None
             with self.storage.batch():
-                for att_id, tr_data in results:
-                    if not tr_data:
+                for att_id, path, snapshot in results:
+                    if not snapshot:
                         continue
+                    tr_data, identity = snapshot
                     note, att = self.storage.find_attachment(att_id)
-                    if note and att and not att.get('tracking'):
-                        att['tracking'] = tr_data
-                        self.storage.save()
+                    if not note or not att or att.get('tracking'):
+                        continue
+                    try:
+                        current = os.path.normcase(os.path.normpath(att.get('original_path', '')))
+                        expected = os.path.normcase(os.path.normpath(path))
+                    except Exception:
+                        current = att.get('original_path', '')
+                        expected = path
+                    if current != expected or _path_identity_snapshot(path) != identity:
+                        continue
+                    finalized = _finalize_tracking_identity(path, tr_data)
+                    if not finalized:
+                        continue
+                    att['tracking'] = finalized
+                    self.storage.save()
+                    self._tagging_changed = True
             QTimer.singleShot(80, self._tag_next_batch)
 
         tag_worker.finished.connect(_apply)
         tag_worker.start()
+
+    def _schedule_tracking_rebuilds(self, jobs):
+        """Rebuild tracking in the background after fast shell-path adoption.
+
+        jobs: iterable of (attachment_id, adopted_path, old_tracking_id). The
+        worker only hashes/builds tracking data; applying results stays on the
+        UI thread and is guarded by the current original_path so stale worker
+        results cannot overwrite a later move.
+        """
+        clean_jobs = []
+        seen = set()
+        for att_id, path, old_uuid in jobs or []:
+            if not att_id or not path:
+                continue
+            try:
+                norm = os.path.normcase(os.path.normpath(str(path)))
+            except Exception:
+                norm = str(path)
+            key = (att_id, norm)
+            if key in seen:
+                continue
+            seen.add(key)
+            identity = _path_identity_snapshot(path)
+            if identity is None:
+                continue
+            clean_jobs.append((att_id, str(path), old_uuid or '', identity))
+        if not clean_jobs:
+            return
+
+        def job(worker):
+            out = []
+            for att_id, path, old_uuid, expected_identity in clean_jobs:
+                try:
+                    if worker.cancelled:
+                        break
+                    snapshot = _build_tracking_snapshot(
+                        path,
+                        old_tracking_id=old_uuid,
+                        expected_identity=expected_identity,
+                    )
+                    out.append((att_id, path, old_uuid, snapshot))
+                except Exception:
+                    logger.exception('后台重建追踪信息失败: %s', path)
+                    out.append((att_id, path, old_uuid, None))
+            return out
+
+        worker = FuncWorker(job, self)
+        workers = getattr(self, '_tracking_rebuild_workers', None)
+        if workers is None:
+            workers = set()
+            self._tracking_rebuild_workers = workers
+        workers.add(worker)
+
+        def _apply():
+            try:
+                results = worker.result or []
+                changed = False
+                with self.storage.batch():
+                    for att_id, path, old_uuid, snapshot in results:
+                        if not snapshot:
+                            continue
+                        tr_data, identity = snapshot
+                        note, att = self.storage.find_attachment(att_id)
+                        if not att:
+                            continue
+                        try:
+                            current = os.path.normcase(os.path.normpath(att.get('original_path', '')))
+                            expected = os.path.normcase(os.path.normpath(path))
+                        except Exception:
+                            current = att.get('original_path', '')
+                            expected = path
+                        if current != expected:
+                            continue
+                        if _path_identity_snapshot(path) != identity:
+                            continue
+                        current_uuid = (att.get('tracking') or {}).get('tracking_id', '')
+                        if current_uuid != old_uuid:
+                            continue
+                        finalized = _finalize_tracking_identity(
+                            path,
+                            tr_data,
+                            old_tracking_id=old_uuid,
+                        )
+                        if not finalized:
+                            continue
+                        att['tracking'] = finalized
+                        self.storage.save()
+                        changed = True
+                if changed and hasattr(self, '_tracked_watcher'):
+                    self._setup_tracking_watchers()
+            finally:
+                workers = getattr(self, '_tracking_rebuild_workers', set())
+                workers.discard(worker)
+                worker.deleteLater()
+
+        worker.finished.connect(_apply)
+        worker.start()
 
     def _setup_tracking_watchers(self):
         """为每个已跟踪附件的父目录加监听；同时也直接监听文件本身，
@@ -6218,7 +6697,7 @@ class MainWindow(QMainWindow):
             if str(p.parent) in dirs or str(p) in dirs:
                 affected = True
                 try:
-                    if self.storage.refresh_tracking_if_changed(att):
+                    if self.storage.refresh_tracking_if_changed(att, allow_path_rebind=True):
                         changed = True
                 except Exception:
                     pass
@@ -6239,15 +6718,17 @@ class MainWindow(QMainWindow):
             missing_folder = False
             missing_other = False
             for _note, att in self.storage.all_external_attachments():
-                trk = att.get('tracking') or {}
-                if not trk.get('tracking_id'):
+                recovery_key, has_real_tag = _attachment_recovery_key(att)
+                if not recovery_key:
                     continue
                 old_name = att.get('original_name', '')
-                if self.storage.refresh_tracking_if_changed(att):
+                if has_real_tag and self.storage.refresh_tracking_if_changed(att):
                     changed = True
                     continue
                 if self.storage.attachment_path_matches_tracking(att):
                     if att.get('original_name', '') != old_name:
+                        changed = True
+                    if _clear_recovery_failure(att):
                         changed = True
                     continue
                 p = Path(att.get('original_path', ''))
@@ -6264,13 +6745,13 @@ class MainWindow(QMainWindow):
             # 文件夹被改名/移动找不到时，在后台静默用 .fresh_folder_id 标记自动找回，
             # 不弹窗、不阻塞 UI。受 30s 冷却 + 单项 180s 抑制保护，不会反复扫盘。
             # 这样"改名后需要手动重新扫描"变成"后台自动识别"，与文件的自愈体验一致。
-            if missing_folder:
+            if missing_folder or missing_other:
                 self._start_auto_recovery(reason='auto')
-            elif missing_other:
-                # 永久失效的文件不再每 60 秒重复唠叨，本次会话只提醒一次
-                if not getattr(self, '_missing_attachment_notified', False):
+                # 永久失效的文件不再每 60 秒重复唠叨，本次会话只提醒一次；
+                # 真正的自动扫描由 _start_auto_recovery 的单项退避限流。
+                if missing_other and not missing_folder and not getattr(self, '_missing_attachment_notified', False):
                     self._missing_attachment_notified = True
-                    self.statusBar().showMessage(tr('有附件路径失效，可在更多菜单手动查找'), 5000)
+                    self.statusBar().showMessage(tr('有附件路径失效，正在后台尝试查找'), 5000)
             else:
                 self._missing_attachment_notified = False
         except Exception:
@@ -6323,25 +6804,64 @@ class MainWindow(QMainWindow):
         if not queue or queue[-1] != item:
             queue.append(item)
         if len(queue) >= 500:
-            timer.stop()
-            self._flush_shell_events()
+            timer.start(0)
             return
         if not timer.isActive():
             timer.start()
 
+    def _collect_shell_missing_attachments(self):
+        """Return attachments that are worth probing against CREATE events.
+
+        The expensive identity check used to run once per CREATE event. Building
+        this small candidate set once per shell batch keeps ordinary copy storms
+        cheap when no tracked attachment is actually missing.
+        """
+        missing = []
+        for note, att in self.storage.all_external_attachments():
+            if not att.get('tracking'):
+                continue
+            cur = att.get('original_path', '')
+            try:
+                cur_norm = os.path.normcase(os.path.normpath(cur)) if cur else ''
+            except Exception:
+                cur_norm = ''
+            try:
+                if cur and self.storage.attachment_path_matches_tracking(att, save=False):
+                    continue
+            except Exception:
+                pass
+            missing.append((note, att, cur_norm))
+        return missing
+
     def _flush_shell_events(self):
         queue = getattr(self, '_shell_event_queue', None) or []
-        self._shell_event_queue = None
+        if not queue:
+            self._shell_event_queue = None
+            return
+        batch = queue[:80]
+        rest = queue[80:]
+        self._shell_event_queue = rest or None
         seen = set()
-        for code, p1, p2 in queue:
-            key = (code, p1, p2)
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                self._process_shell_event(code, p1, p2)
-            except Exception:
-                logger.exception('处理 Shell 事件失败')
+        self._shell_cached_explorer_folders = explorer_open_folders()
+        needs_create_probe = any(code in (SHCNE_CREATE, SHCNE_MKDIR) for code, _p1, _p2 in batch)
+        self._shell_missing_attachment_cache = (
+            self._collect_shell_missing_attachments() if needs_create_probe else []
+        )
+        try:
+            for code, p1, p2 in batch:
+                key = (code, p1, p2)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    self._process_shell_event(code, p1, p2)
+                except Exception:
+                    logger.exception('处理 Shell 事件失败')
+        finally:
+            self._shell_cached_explorer_folders = None
+            self._shell_missing_attachment_cache = None
+        if rest:
+            QTimer.singleShot(0, self._flush_shell_events)
 
     def _process_shell_event(self, event_code, path1, path2):
         """Shell 通知回调：检查 path1 是否匹配某个跟踪附件，匹配就改成 path2。"""
@@ -6354,14 +6874,14 @@ class MainWindow(QMainWindow):
             return
 
         # 重命名/移动：path1 -> path2
-        if event_code in (SHCNE_RENAMEITEM, SHCNE_RENAMEFOLDER) and old_norm and new_norm:
+        if event_code & (SHCNE_RENAMEITEM | SHCNE_RENAMEFOLDER) and old_norm and new_norm:
             self._apply_shell_move(old_norm, new_norm)
             return
 
         # 跨盘剪切（尤其到 exFAT/FAT 移动硬盘）常见事件顺序是：
         # 先在目标盘 CREATE，复制完成后才在源盘 DELETE。先记住目标候选，
         # 等源路径删除时再用 hash / 类型验证并采纳。
-        if event_code in (SHCNE_CREATE, SHCNE_MKDIR) and old_norm:
+        if event_code & (SHCNE_CREATE | SHCNE_MKDIR) and old_norm:
             self._note_shell_create(old_norm)
             if self._try_match_clipboard_target_dirs([old_norm, os.path.dirname(old_norm)]):
                 return
@@ -6372,20 +6892,20 @@ class MainWindow(QMainWindow):
 
         # 删除事件：可能是剪切操作的源端被清理，先记下来；如果短时间内有
         # CREATE 同名的就当作移动；否则启动一次轻量 recovery 兜底。
-        if event_code in (SHCNE_DELETE, SHCNE_RMDIR) and old_norm:
+        if event_code & (SHCNE_DELETE | SHCNE_RMDIR) and old_norm:
             self._note_shell_delete(old_norm)
             return
 
         # 目标文件夹被更新：跨盘剪切时有时只收到目标父目录更新，
         # 用 pending delete 里的原名拼出新位置。
-        if event_code == SHCNE_UPDATEDIR and old_norm:
+        if event_code & SHCNE_UPDATEDIR and old_norm:
             if self._try_match_clipboard_target_dirs([old_norm]):
                 return
             if self._try_match_pending_paste_target(old_norm):
                 return
 
         # 文件被原地编辑（atomic save 等）→ 立刻刷新当前视图
-        if event_code in (SHCNE_UPDATEITEM, SHCNE_UPDATEDIR) and old_norm:
+        if event_code & (SHCNE_UPDATEITEM | SHCNE_UPDATEDIR) and old_norm:
             if self._try_match_clipboard_target_dirs([old_norm, os.path.dirname(old_norm)]):
                 return
             self._maybe_refresh_for_path(old_norm)
@@ -6496,7 +7016,8 @@ class MainWindow(QMainWindow):
             return False
         hints = list(target_hints or [])
         hints.extend(self._recent_shell_target_hints())
-        hints.extend(explorer_open_folders())
+        cached_explorer = getattr(self, '_shell_cached_explorer_folders', None)
+        hints.extend(cached_explorer if cached_explorer is not None else explorer_open_folders())
 
         seen_hints = set()
         unique_hints = []
@@ -6519,6 +7040,18 @@ class MainWindow(QMainWindow):
             note, att = self.storage.find_attachment(att_id) if att_id else (None, None)
             if not att:
                 continue
+            # 源路径仍与 tracking 对得上 → 附件根本没丢，绝不能被磁盘上某个
+            # 同内容副本（备份目录、以前复制过的一份）抢走身份。剪切(is_cut)
+            # 同样要做这一检查：Ctrl+X 之后、粘贴完成之前源文件一直健在，此时
+            # 的任何 hash 命中都只能是旧副本；源真被删除后守卫自然放行，跨盘
+            # 剪切的采纳本就发生在源删除之后，不受影响。每个 item 只查一次，
+            # 不放进 hint×candidate 双层循环里反复读盘。
+            try:
+                if self.storage.attachment_path_matches_tracking(att, save=False):
+                    remaining.append(item)
+                    continue
+            except Exception:
+                pass
             name = item.get('name') or att.get('original_name') or ''
             source_norm = item.get('source_norm') or ''
             matched_path = ''
@@ -6530,19 +7063,12 @@ class MainWindow(QMainWindow):
                         continue
                     if cand_norm == source_norm or not candidate.exists():
                         continue
-                    if not item.get('is_cut'):
-                        try:
-                            if self.storage.attachment_path_matches_tracking(att):
-                                continue
-                        except Exception:
-                            pass
                     if self._clipboard_target_matches(att, item, candidate):
                         matched_path = str(candidate)
                         break
                 if matched_path:
                     break
             if matched_path:
-                self.storage.adopt_external_path(att, matched_path)
                 adopted.append((att, matched_path, note))
             else:
                 remaining.append(item)
@@ -6550,6 +7076,14 @@ class MainWindow(QMainWindow):
         self._clipboard_move_candidates = remaining
         if not adopted:
             return False
+
+        rebuild_jobs = []
+        with self.storage.batch():
+            for att, matched_path, _note in adopted:
+                old_uuid = (att.get('tracking') or {}).get('tracking_id', '')
+                self.storage.adopt_external_path(att, matched_path, rebuild=False)
+                rebuild_jobs.append((att.get('id'), matched_path, old_uuid))
+        self._schedule_tracking_rebuilds(rebuild_jobs)
 
         self._refresh_external_attachment_views()
         if hasattr(self, '_tracked_watcher'):
@@ -6587,7 +7121,7 @@ class MainWindow(QMainWindow):
             source_exists = False
         if source_exists:
             try:
-                if self.storage.attachment_path_matches_tracking(att):
+                if self.storage.attachment_path_matches_tracking(att, save=False):
                     return False
             except Exception:
                 pass
@@ -6617,7 +7151,8 @@ class MainWindow(QMainWindow):
                 size = tracking.get('size_snapshot') or att.get('size')
                 return size is None or p.stat().st_size == int(size)
             except Exception:
-                return True
+                # stat 都失败说明对这个候选一无所知，宁可漏配不可错配
+                return False
         if att.get('type') == 'folder':
             if not p.is_dir():
                 return False
@@ -6637,8 +7172,14 @@ class MainWindow(QMainWindow):
         if not p.exists() or not p.is_dir():
             return False
         tag = (att.get('tracking') or {}).get('tracking_id')
-        if tag and ftrack.read_tracking_tag(str(p)) == tag:
-            return True
+        if tag:
+            candidate_tag = ftrack.read_tracking_tag(str(p))
+            if candidate_tag == tag:
+                return True
+            if candidate_tag:
+                # 候选文件夹带着别人的标签——是另一个被追踪的文件夹，
+                # 绝不能因为"旧路径没了"就认领
+                return False
         try:
             return bool(old_norm) and not Path(old_norm).exists()
         except Exception:
@@ -6678,6 +7219,8 @@ class MainWindow(QMainWindow):
 
     def _note_shell_create(self, new_norm):
         """记录最近创建的路径，用于处理“先复制到目标盘、后删除源文件”的剪切流程。"""
+        if ftrack.is_recycled_path(new_norm):
+            return
         if not hasattr(self, '_recent_shell_creates'):
             self._recent_shell_creates = []
         import time as _time
@@ -6693,32 +7236,38 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_recent_create_match_timer'):
             self._recent_create_match_timer.start(1500)
 
-    def _adopt_shell_created_path(self, new_norm):
+    def _adopt_shell_created_path(self, new_norm, missing_attachments=None):
         """用新建路径直接修复已失效的引用附件。
 
         这覆盖一种真实场景：FRESH 里记录的 original_path 已经旧了，用户从
         当前真实位置剪切到 F: 时，DELETE 事件路径和记录路径对不上；此时只能
         从目标盘 CREATE 事件按文件名 + 内容 hash 反向匹配。
         """
+        if missing_attachments is None:
+            missing_attachments = getattr(self, '_shell_missing_attachment_cache', None)
+        if missing_attachments is None:
+            missing_attachments = self._collect_shell_missing_attachments()
+        if not missing_attachments:
+            return False
         try:
             p = Path(new_norm)
         except Exception:
             return False
-        if not p.exists():
+        if not p.exists() or ftrack.is_recycled_path(new_norm):
             return False
 
         new_base = os.path.basename(new_norm).lower()
         matches = []
-        for _note, att in self.storage.all_external_attachments():
+        for _note, att, cached_cur_norm in missing_attachments:
             cur = att.get('original_path', '')
-            if cur and os.path.normcase(os.path.normpath(cur)) == new_norm:
-                continue
             try:
-                if self.storage.attachment_path_matches_tracking(att):
-                    continue
+                cur_norm = os.path.normcase(os.path.normpath(cur)) if cur else ''
             except Exception:
-                pass
-
+                cur_norm = ''
+            if cur_norm and cached_cur_norm and cur_norm != cached_cur_norm:
+                continue
+            if cur_norm == new_norm:
+                continue
             tracking = att.get('tracking') or {}
             expected = (att.get('original_name') or os.path.basename(cur or '')).lower()
             if expected and expected != new_base and not tracking.get('content_hash'):
@@ -6730,7 +7279,10 @@ class MainWindow(QMainWindow):
             return False
 
         att = matches[0]
-        self.storage.adopt_external_path(att, new_norm)
+        old_uuid = (att.get('tracking') or {}).get('tracking_id', '')
+        with self.storage.batch():
+            self.storage.adopt_external_path(att, new_norm, rebuild=False)
+        self._schedule_tracking_rebuilds([(att.get('id'), new_norm, old_uuid)])
         self._refresh_external_attachment_views()
         if hasattr(self, '_tracked_watcher'):
             self._setup_tracking_watchers()
@@ -6751,14 +7303,15 @@ class MainWindow(QMainWindow):
         import time as _time
         now = _time.time()
         fresh = []
+        missing = self._collect_shell_missing_attachments()
         should_retry = False
         for item in creates:
             if now - item.get('ts', 0) > SHELL_CREATE_MATCH_WINDOW_SECONDS:
                 continue
-            fresh.append(item)
-            if self._adopt_shell_created_path(item.get('path', '')):
+            if missing and self._adopt_shell_created_path(item.get('path', ''), missing):
                 continue
-            should_retry = True
+            fresh.append(item)
+            should_retry = bool(missing)
         self._recent_shell_creates = fresh
         if should_retry and fresh and hasattr(self, '_recent_create_match_timer'):
             self._recent_create_match_timer.start(2500)
@@ -6795,17 +7348,39 @@ class MainWindow(QMainWindow):
 
     def _apply_shell_move(self, old_norm, new_norm):
         """把 old_norm 命中的跟踪附件 original_path 改成 new_norm，刷新 UI。"""
+        if ftrack.is_recycled_path(new_norm):
+            # "删除到回收站"就是一次 RENAMEITEM——绝不能把附件同步成
+            # $Recycle.Bin\$Rxxxx，那等于替用户把附件改名成乱码
+            return
         moved = []
-        for _note, att in self.storage.all_external_attachments():
-            cur = att.get('original_path', '')
-            if not cur:
-                continue
-            cur_norm = os.path.normcase(os.path.normpath(cur))
-            if cur_norm == old_norm:
-                self.storage.adopt_external_path(att, new_norm)
+        rebuild_jobs = []
+        old_prefix = old_norm.rstrip('\\/') + os.sep
+        with self.storage.batch():
+            for _note, att in self.storage.all_external_attachments():
+                cur = att.get('original_path', '')
+                if not cur:
+                    continue
+                cur_norm = os.path.normcase(os.path.normpath(cur))
+                adopted_path = ''
+                if cur_norm == old_norm:
+                    adopted_path = new_norm
+                elif cur_norm.startswith(old_prefix):
+                    # 附件在被改名/移动的文件夹里面：按前缀改写，
+                    # 否则文件夹一改名里面的附件全部失联。
+                    # 后缀取自 normcase 后的路径（小写），adopt 里的 resolve()
+                    # 会把它还原成盘上的真实大小写
+                    candidate = os.path.join(new_norm, cur_norm[len(old_prefix):])
+                    if os.path.exists(candidate):
+                        adopted_path = candidate
+                if not adopted_path:
+                    continue
+                old_uuid = (att.get('tracking') or {}).get('tracking_id', '')
+                self.storage.adopt_external_path(att, adopted_path, rebuild=False)
                 moved.append(att)
+                rebuild_jobs.append((att.get('id'), adopted_path, old_uuid))
         if not moved:
             return
+        self._schedule_tracking_rebuilds(rebuild_jobs)
         # 即时刷新预览 + 把新父目录挂进 watcher
         self._refresh_external_attachment_views()
         if hasattr(self, '_tracked_watcher'):
@@ -6965,7 +7540,13 @@ class MainWindow(QMainWindow):
             if now - last_recovery_ts >= 10.0:
                 if isinstance(state, dict):
                     state['last_recovery_ts'] = now
-                should_recover = True
+                    # 同一个路径只提示一次，别每 10 秒骚扰一遍——
+                    # 用户主动删除文件时这条提示毫无意义
+                    if not state.get('notified'):
+                        state['notified'] = True
+                        should_recover = True
+                else:
+                    should_recover = True
 
         if should_recover:
             try:
@@ -6987,7 +7568,7 @@ class MainWindow(QMainWindow):
             cur_norm = os.path.normcase(os.path.normpath(cur))
             if cur_norm == norm_path or os.path.dirname(cur_norm) == norm_path:
                 try:
-                    if self.storage.refresh_tracking_if_changed(att):
+                    if self.storage.refresh_tracking_if_changed(att, allow_path_rebind=True):
                         changed = True
                 except Exception:
                     pass
@@ -6997,46 +7578,52 @@ class MainWindow(QMainWindow):
     # ============ 窗口状态 / 快捷键 ============
 
 
-    def _toggle_sidebar(self):
-        self._sidebar_collapsed = not self._sidebar_collapsed
+    def showEvent(self, event):
+        super().showEvent(event)
+        # FramelessWindowHint 会把 WS_THICKFRAME/WS_CAPTION 一起去掉：
+        # 边缘无法拉伸、没有贴边分屏、没有 Win11 圆角阴影。
+        # win_frame 补回这些样式并用 WM_NCCALCSIZE 吞掉原生标题栏。
+        if not self._native_frame_applied:
+            try:
+                self._native_frame_applied = win_frame.apply_native_frame(int(self.winId()))
+            except Exception:
+                self._native_frame_applied = False
 
-        # Animate width
-        start_width = 64 if not self._sidebar_collapsed else 276
-        end_width = 276 if not self._sidebar_collapsed else 64
+    def nativeEvent(self, eventType, message):
+        if self._native_frame_applied and eventType in (b'windows_generic_MSG', 'windows_generic_MSG'):
+            try:
+                dpr = self.devicePixelRatioF() or 1.0
+            except Exception:
+                dpr = 1.0
+            handled, result = win_frame.handle_native_message(
+                int(message),
+                int(CustomTitleBar.HEIGHT * dpr),
+                lambda x, y, _dpr=dpr: self._caption_hit_test(x, y, _dpr),
+            )
+            if handled:
+                return True, result
+        return super().nativeEvent(eventType, message)
 
-        self.sidebar_anim = QPropertyAnimation(self.sidebar, b"minimumWidth")
-        self.sidebar_anim.setDuration(200)
-        self.sidebar_anim.setStartValue(start_width)
-        self.sidebar_anim.setEndValue(end_width)
+    def _caption_hit_test(self, x_px, y_px, dpr):
+        """窗口顶部条带内该点是否算"标题栏空白"（可拖动/双击最大化）。
+        坐标为相对窗口左上角的物理像素。命中按钮/输入框时交还给控件。"""
+        pos = QPoint(int(x_px / dpr), int(y_px / dpr))
+        child = self.childAt(pos)
+        if child is None:
+            return True
+        if child is getattr(self, 'title_bar', None) or child is getattr(self.title_bar, 'drag_area', None):
+            return True
+        if child is getattr(self, 'sidebar', None):
+            return True
+        return isinstance(child, QLabel)
 
-        self.sidebar_max_anim = QPropertyAnimation(self.sidebar, b"maximumWidth")
-        self.sidebar_max_anim.setDuration(200)
-        self.sidebar_max_anim.setStartValue(start_width)
-        self.sidebar_max_anim.setEndValue(end_width)
+    def _set_new_button_text(self):
+        if hasattr(self, 'new_btn'):
+            self.new_btn.setText('新建记事')
 
-        self.sidebar_anim.start()
-        self.sidebar_max_anim.start()
-
-        if self._sidebar_collapsed:
-            self.search_input.hide()
-            if hasattr(self, 'archive_category_filter'):
-                self.archive_category_filter.hide()
-            self.new_btn.setText("+")
-            if hasattr(self, 'workspace_switch'):
-                self.workspace_switch.hide()
-            if hasattr(self, 'view_switch'):
-                self.view_switch.hide()
-            self.more_btn.hide()
-        else:
-            self.search_input.show()
-            if hasattr(self, 'archive_category_filter'):
-                self.archive_category_filter.show()
-            self.new_btn.setText("+  新建记事")
-            if hasattr(self, 'workspace_switch'):
-                self.workspace_switch.show()
-            if hasattr(self, 'view_switch'):
-                self.view_switch.show()
-            self.more_btn.show()
+    def _set_archive_filter_visible(self, visible):
+        if hasattr(self, 'archive_category_filter'):
+            self.archive_category_filter.setVisible(bool(visible))
 
     def _restore_window_state(self):
         geometry = self._settings.value('main/geometry')
@@ -7045,6 +7632,9 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(geometry)
             except Exception:
                 pass
+
+        if hasattr(self, 'title_bar'):
+            self.title_bar.sync_max_button(self.isMaximized())
 
         view = self._settings.value('main/view', 'active')
         if view not in ('active', 'archived'):
@@ -7055,7 +7645,7 @@ class MainWindow(QMainWindow):
         if mode == 'text':
             self.workspace_mode = 'text'
             self.workspace_switch.set_mode('text', emit=False)
-            self.new_btn.setText('+  新建记事')
+            self._set_new_button_text()
             self.search_input.setPlaceholderText('搜索记录')
             self._set_list_delegate('note')
             self.current_note_id = None
@@ -7074,7 +7664,7 @@ class MainWindow(QMainWindow):
 
         self.workspace_mode = 'screenshot'
         self.workspace_switch.set_mode('screenshot', emit=False)
-        self.new_btn.setText('+  新建记事')
+        self._set_new_button_text()
         self.search_input.setPlaceholderText('搜索记录')
         self._set_list_delegate('shot')
         self.current_note_id = self.screenshot_board['id']
@@ -7349,6 +7939,10 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            # 覆盖所有最大化/还原路径：按钮、双击、原生贴边、启动恢复、托盘还原
+            if hasattr(self, 'title_bar'):
+                self.title_bar.sync_max_button(self.isMaximized())
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             # 切回 FRESH：30 秒内只触发一次，避免来回切换刷屏
             now = time.time()
@@ -7388,49 +7982,45 @@ class MainWindow(QMainWindow):
         central.setObjectName('app_shell')
         self.setCentralWidget(central)
 
-        # Custom Root Layout
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
+        # 状态栏提前创建：懒创建会在第一条消息弹出时把整个内容区顶起来一跳，
+        # 而且原生拉伸角标(size grip)在无边框窗口里非常突兀
+        status = self.statusBar()
+        status.setSizeGripEnabled(False)
 
-        # Add Custom Title Bar
-        self.title_bar = CustomTitleBar(self)
-        root_layout.addWidget(self.title_bar)
-
-        # Original Main Layout
-        main_container = QWidget()
-        main_layout = QHBoxLayout(main_container)
+        # 侧栏通到窗口顶部，标题栏只盖右栏（Notion/Linear 布局）；
+        # 窗口拖动由 win_frame 的 HTCAPTION 命中测试接管，标题栏和
+        # 侧栏顶部的空白处都可拖。
+        main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        root_layout.addWidget(main_container)
+
+        self.title_bar = CustomTitleBar(self)
 
         # 左侧栏
         self.sidebar = QWidget()
         self.sidebar.setObjectName('sidebar')
-        self.sidebar.setFixedWidth(276)
+        self.sidebar.setFixedWidth(self.SIDEBAR_WIDTH)
 
         sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(18, 18, 18, 18)
-        sidebar_layout.setSpacing(12)
+        sidebar_layout.setContentsMargins(16, 16, 16, 14)
+        sidebar_layout.setSpacing(10)
+        self.sidebar_layout = sidebar_layout
 
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        # Toggle Button
-        self.sidebar_toggle_btn = QPushButton("≡")
-        self.sidebar_toggle_btn.setObjectName("sidebar_toggle_btn")
-        self.sidebar_toggle_btn.setFixedSize(30, 30)
-        self.sidebar_toggle_btn.setCursor(Qt.PointingHandCursor)
-        self.sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
-        top_row.addWidget(self.sidebar_toggle_btn)
-        self.new_btn = QPushButton('+  新建记事')
+        self.new_btn = QPushButton('新建记事')
         self.new_btn.setObjectName('new_button')
         self.new_btn.setCursor(Qt.PointingHandCursor)
+        self.new_btn.setIcon(build_ui_icon('plus', '#FFFFFF'))
+        self.new_btn.setIconSize(QSize(16, 16))
         self.new_btn.clicked.connect(self._new_primary_action)
-        self.more_btn = QPushButton('⋯')
+        self.more_btn = QPushButton('')
         self.more_btn.setObjectName('more_button')
         self.more_btn.setCursor(Qt.PointingHandCursor)
-        self.more_btn.setFixedSize(38, 38)
+        self.more_btn.setFixedSize(36, 36)
+        self.more_btn.setIcon(build_ui_icon('more', '#636366', '#1D1D1F'))
+        self.more_btn.setIconSize(QSize(18, 18))
         self.more_btn.setToolTip('更多')
         self.more_btn.clicked.connect(self._show_more_menu)
         top_row.addWidget(self.new_btn, 1)
@@ -7485,10 +8075,12 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.list_widget, 1)
 
         # 底部时间线按钮
-        self.timeline_btn = QPushButton('时间线')
+        self.timeline_btn = QPushButton('回顾时间线')
         self.timeline_btn.setObjectName('timeline_btn')
         self.timeline_btn.setCursor(Qt.PointingHandCursor)
         self.timeline_btn.setFocusPolicy(Qt.NoFocus)
+        self.timeline_btn.setIcon(build_ui_icon('timeline', '#007AFF', '#0066D6'))
+        self.timeline_btn.setIconSize(QSize(17, 17))
         self.timeline_btn.setToolTip('查看所有已完成的事项')
         self.timeline_btn.clicked.connect(self._show_timeline)
         sidebar_layout.addWidget(self.timeline_btn)
@@ -7537,6 +8129,7 @@ class MainWindow(QMainWindow):
         self.right_stack.addWidget(self.editor)
         self.right_stack.addWidget(self.empty_state)
 
+        right_layout.addWidget(self.title_bar)
         right_layout.addWidget(self.right_stack, 1)
         right_layout.addWidget(self.attachment_bar)
 
@@ -7601,7 +8194,7 @@ class MainWindow(QMainWindow):
         self.current_note_id = None
         self.list_widget.clearSelection()
         if self.view_switch.current_view() == 'archived':
-            self.new_btn.setText('+  新建记事')
+            self._set_new_button_text()
             self.search_input.setPlaceholderText('搜索记录')
             self.editor.clear()
             self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
@@ -7609,16 +8202,16 @@ class MainWindow(QMainWindow):
             self._populate_archive_items()
             return
         if mode == 'screenshot':
-            self.new_btn.setText('+  新建记事')
+            self._set_new_button_text()
             self.search_input.setPlaceholderText('搜索记录')
             self._set_list_delegate('shot')
             self.current_note_id = self.screenshot_board['id']
             self._refresh_screenshot_board()
             return
 
-        self.new_btn.setText('+  新建记事')
+        self._set_new_button_text()
         self.search_input.setPlaceholderText('搜索记录')
-        self.archive_category_filter.setVisible(False)
+        self._set_archive_filter_visible(False)
         self._set_list_delegate('note')
         self.editor.clear()
         self.attachment_bar.set_attachments([], self.storage.path_for, lambda x: None)
@@ -7746,7 +8339,7 @@ class MainWindow(QMainWindow):
             selected_id = current_att.get('id') if current_att else None
         view = self.view_switch.current_view()
         self._refresh_archive_category_filter()
-        self.archive_category_filter.setVisible(view == 'archived')
+        self._set_archive_filter_visible(view == 'archived')
         category = self._archive_exact_category() if view == 'archived' else ''
         search = self.search_input.text().strip()
         items = self.storage.screenshot_items(view=view, category=category, search=search)
@@ -7833,7 +8426,7 @@ class MainWindow(QMainWindow):
 
         self._set_list_delegate('archive')
         self._refresh_archive_category_filter()
-        self.archive_category_filter.setVisible(True)
+        self._set_archive_filter_visible(True)
         self.search_input.setPlaceholderText('搜索记录')
 
         category_query = self._archive_category_query()
@@ -7906,7 +8499,7 @@ class MainWindow(QMainWindow):
         search = self.search_input.text().strip().lower()
         view = self.view_switch.current_view()
         self._refresh_archive_category_filter()
-        self.archive_category_filter.setVisible(view == 'archived')
+        self._set_archive_filter_visible(view == 'archived')
         category = self._archive_exact_category() if view == 'archived' else ''
         category_query = self._archive_category_query() if view == 'archived' else ''
         active_count = 0
@@ -8300,7 +8893,7 @@ class MainWindow(QMainWindow):
         if self.workspace_mode != 'screenshot':
             self.workspace_mode = 'screenshot'
             self.workspace_switch.set_mode('screenshot', emit=False)
-            self.new_btn.setText('+  新建记事')
+            self._set_new_button_text()
             self.search_input.setPlaceholderText('搜索记录')
             self._set_list_delegate('shot')
             self.current_note_id = self.screenshot_board['id']
@@ -8312,7 +8905,7 @@ class MainWindow(QMainWindow):
                 self.search_input.clear()
                 self.search_input.blockSignals(False)
             self._clear_archive_category_filter_text()
-        self.archive_category_filter.setVisible(self.view_switch.current_view() == 'archived')
+        self._set_archive_filter_visible(self.view_switch.current_view() == 'archived')
         self.current_note_id = self.screenshot_board['id']
         self._refresh_screenshot_board()
 
@@ -8438,9 +9031,9 @@ class MainWindow(QMainWindow):
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
         self._set_list_delegate('note')
-        self.new_btn.setText('+  新建记事')
+        self._set_new_button_text()
         self.search_input.setPlaceholderText('搜索记录')
-        self.archive_category_filter.setVisible(False)
+        self._set_archive_filter_visible(False)
         if self.view_switch.current_view() != 'active':
             self.view_switch.set_view('active', emit=False)
         if self.search_input.text():
@@ -8591,7 +9184,10 @@ class MainWindow(QMainWindow):
     def _on_view_changed(self, view):
         if self.save_timer.isActive():
             self.save_timer.stop()
-            self._save_current_now()
+            # refresh_list=False：此刻列表即将按新视图整体重建，带默认刷新的
+            # 保存会提前填充归档列表并自动选中，编辑器残留一条未选中的归档
+            # 笔记（与 _on_workspace_changed 的处理一致）
+            self._save_current_now(refresh_list=False)
 
         if self.workspace_mode == 'screenshot':
             self._refresh_screenshot_board()
@@ -8831,6 +9427,8 @@ class MainWindow(QMainWindow):
         note, att = self.storage.find_attachment(att_id)
         if not att:
             return
+        if (result or {}).get('cancelled'):
+            return
         found = result.get('path') if result else None
         if not found:
             error = (result or {}).get('error')
@@ -8842,16 +9440,30 @@ class MainWindow(QMainWindow):
                     f'详细信息见数据目录下的 fresh.log。')
                 return
             candidates = (result or {}).get('candidates') or []
+            candidates = [c for c in candidates if not ftrack.is_recycled_path(c)]
             if not candidates:
                 QMessageBox.warning(self, '未找到', f'未在磁盘上找到与 "{name}" 匹配的文件。')
                 return
-            if len(candidates) == 1:
+            if len(candidates) == 1 and not (result or {}).get('unverified'):
                 found = candidates[0]
             else:
+                # 唯一候选但内容 hash 对不上时也交给用户确认，不能静默采纳
                 picker = CandidatePickerDialog(candidates, name, size_hint=size_hint, parent=self)
                 if picker.exec() != QDialog.Accepted:
                     return
                 found = picker.selected_path
+        # 扫描/候选框停留的几分钟里文件可能又被移走，Everything 索引滞后也会
+        # 给出旧路径；adopt 里的 resolve() 对不存在路径不报错，会把死路径写进
+        # original_path，还弹"已找到"——采纳前必须做一次存在性校验。
+        try:
+            found_exists = Path(found).exists()
+        except OSError:
+            found_exists = False
+        if not found_exists:
+            QMessageBox.warning(
+                self, '位置已变化',
+                f'"{name}" 的位置在扫描完成后又发生了变化，请重新查找。')
+            return
         self.storage.adopt_external_path(att, found)
         if note and note.get('id') == self.current_note_id:
             self._refresh_attachments_for(note)
@@ -8869,39 +9481,57 @@ class MainWindow(QMainWindow):
         tag_to_att = {}
         tag_to_tracking = {}
         tag_to_is_folder = {}
+        tag_to_has_tag = {}
         drive_hints = []
         changed_without_worker = False
         for _note, att in self.storage.all_external_attachments():
             trk = att.get('tracking') or {}
-            tag = trk.get('tracking_id')
+            tag, has_real_tag = _attachment_recovery_key(att)
             if not tag:
                 continue
             old_name = att.get('original_name', '')
             if self.storage.attachment_path_matches_tracking(att):
                 if att.get('original_name', '') != old_name:
                     changed_without_worker = True
-                att.pop('recovery_failed_at', None)
+                if _clear_recovery_failure(att):
+                    changed_without_worker = True
                 continue
             original = Path(att.get('original_path', ''))
             if original.exists():
                 continue
+            if force and _clear_recovery_failure(att):
+                changed_without_worker = True
             failed_at = float(att.get('recovery_failed_at') or 0.0)
-            if not force and failed_at and now - failed_at < AUTO_RECOVERY_COOLDOWN_SECONDS * 6:
-                continue
+            if not force and failed_at:
+                # 连续失败按档位退避：永久丢失的附件（Shift+Del、所在盘拔掉）
+                # 不该每 3 分钟唤醒一次全盘扫描。成功找回或手动“立即查找”
+                # (force=True) 会清零计数。
+                fail_count = int(att.get('recovery_failed_count') or 1)
+                backoff = _auto_recovery_backoff_seconds(fail_count)
+                if now - failed_at < backoff:
+                    continue
             new_path, changed = self.storage.resolve_external_path(att, scan=False)
             if new_path and Path(new_path).exists():
                 if self.storage.attachment_path_matches_tracking(att):
-                    if changed:
+                    cleared = _clear_recovery_failure(att)
+                    if changed or cleared:
                         changed_without_worker = True
-                    att.pop('recovery_failed_at', None)
                     continue
             tag_to_name[tag] = att.get('original_name', '')
-            tag_to_att[tag] = att['id']
+            att_ids = tag_to_att.setdefault(tag, [])
+            if att['id'] not in att_ids:
+                att_ids.append(att['id'])
             tag_to_tracking[tag] = trk
             tag_to_is_folder[tag] = (att.get('type') == 'folder')
+            tag_to_has_tag[tag] = has_real_tag
             hint = trk.get('drive_hint')
             if hint and hint not in drive_hints:
                 drive_hints.append(hint)
+        if changed_without_worker:
+            try:
+                self.storage.save()
+            except Exception:
+                pass
         if not tag_to_name:
             if changed_without_worker:
                 self._refresh_external_attachment_views()
@@ -8913,6 +9543,7 @@ class MainWindow(QMainWindow):
         worker = AutoRecoveryWorker(
             tag_to_name, tag_to_tracking=tag_to_tracking, drive_hints=drive_hints,
             scan_settings=self.storage.scan_settings, tag_to_is_folder=tag_to_is_folder,
+            tag_to_has_tag=tag_to_has_tag,
             parent=self,
         )
         self._auto_recovery_total = len(tag_to_name)
@@ -8939,15 +9570,17 @@ class MainWindow(QMainWindow):
             recovered_tags = set(getattr(self, '_auto_recovered_tags', set()))
             self._auto_recovery_worker = None
             self._auto_recovered_tags = set()
-            for tag, att_id in tag_to_att.items():
+            for tag, att_ids in tag_to_att.items():
                 if tag in recovered_tags:
                     continue
-                note, att = self.storage.find_attachment(att_id)
-                if not att:
-                    continue
-                # 只记录失败时间做冷却，不改 updated_at——
-                # 之前找回失败反而把便笺顶到列表最上面
-                att['recovery_failed_at'] = time.time()
+                for att_id in att_ids:
+                    note, att = self.storage.find_attachment(att_id)
+                    if not att:
+                        continue
+                    # 只记录失败时间做冷却，不改 updated_at——
+                    # 之前找回失败反而把便笺顶到列表最上面
+                    att['recovery_failed_at'] = time.time()
+                    att['recovery_failed_count'] = int(att.get('recovery_failed_count') or 0) + 1
             if tag_to_att:
                 try:
                     self.storage.save()
@@ -8971,24 +9604,29 @@ class MainWindow(QMainWindow):
         )
 
     def _on_auto_recovery_found(self, tag, path, tag_to_att):
-        att_id = tag_to_att.get(tag)
-        if not att_id:
+        att_ids = tag_to_att.get(tag) or []
+        if isinstance(att_ids, str):
+            att_ids = [att_ids]
+        if not att_ids:
             return
         if not hasattr(self, '_auto_recovered_tags'):
             self._auto_recovered_tags = set()
         self._auto_recovered_tags.add(tag)
-        note, att = self.storage.find_attachment(att_id)
-        if not att:
-            return
-        self.storage.adopt_external_path(att, path)
-        att.pop('recovery_failed_at', None)
-        if note and note.get('id') == self.current_note_id:
+        refresh_current = False
+        for att_id in att_ids:
+            note, att = self.storage.find_attachment(att_id)
+            if not att:
+                continue
+            self.storage.adopt_external_path(att, path)
+            _clear_recovery_failure(att)
+            if note and note.get('id') == self.current_note_id:
+                refresh_current = True
+        if refresh_current:
             self._refresh_external_attachment_views()
-        else:
-            # 即使当前没看着这条笔记，也把新位置的父目录挂上监听，
-            # 下次它再被移走也能立即触发自动同步
-            if hasattr(self, '_tracked_watcher'):
-                self._setup_tracking_watchers()
+        # 无论是否正看着这条笔记，都把新位置的父目录挂上监听，
+        # 下次它再被移走也能立即触发自动同步
+        if hasattr(self, '_tracked_watcher'):
+            self._setup_tracking_watchers()
 
     def _on_mode_changed(self, mode):
         if not self.current_note_id:
@@ -9100,10 +9738,16 @@ class MainWindow(QMainWindow):
             path = self._path_for_opening_attachment(att)
             if not path:
                 if att.get('tracking'):
-                    self.statusBar().showMessage(tr('该附件已被移动或删除，正在查找当前位置...'), 5000)
+                    message = tr('该附件已被移动或删除，正在查找当前位置...')
                     self._start_targeted_scan(att)
                 else:
-                    self.statusBar().showMessage(tr('该附件已被移动或删除。'), 5000)
+                    message = tr('该附件已被移动或删除。')
+                self.statusBar().showMessage(message, 5000)
+                # 从时间线等模态窗口里双击时主窗口状态栏被挡住，看起来
+                # 像“点了没反应”——直接在模态窗口上提示
+                modal = QApplication.activeModalWidget()
+                if modal is not None and modal is not self:
+                    QMessageBox.information(modal, tr('附件不可用'), message)
                 return
             if is_image_attachment(att):
                 dlg = ImageViewerDialog(str(path), self)
@@ -9382,6 +10026,16 @@ class MainWindow(QMainWindow):
     def _show_scan_settings(self):
         dlg = ScanSettingsDialog(self.storage, parent=self)
         dlg.exec()
+        self._sync_everything_flag()
+
+    def _sync_everything_flag(self):
+        """把"启用 Everything 加速"的设置同步给 ftrack 总开关。
+        之前只把 es_path 置 None，IPC 直连完全不受设置控制。"""
+        try:
+            enabled = bool((self.storage.scan_settings or {}).get('use_everything', True))
+        except Exception:
+            enabled = True
+        ftrack.set_everything_enabled(enabled)
 
     def _show_account_settings(self):
         if not self.account_manager:
@@ -9524,17 +10178,31 @@ class MainWindow(QMainWindow):
     def _manual_recover_now(self):
         """用户主动触发的"立即查找"。统计失踪数量，提示是否启动扫描。"""
         missing = []
+        cleared = False
         for _note, att in self.storage.all_external_attachments():
-            trk = att.get('tracking') or {}
-            if not trk.get('tracking_id'):
+            recovery_key, _has_tag = _attachment_recovery_key(att)
+            if not recovery_key:
                 continue
             if self.storage.attachment_path_matches_tracking(att):
+                if _clear_recovery_failure(att):
+                    cleared = True
                 continue
             p = Path(att.get('original_path', ''))
             if not p.exists():
                 missing.append(att.get('original_name', '(未命名)'))
+        if cleared:
+            try:
+                self.storage.save()
+            except Exception:
+                pass
         if not missing:
             QMessageBox.information(self, '一切正常', '所有跟踪的文件都在原位，无需查找。')
+            return
+        self._ensure_scan_state()
+        if self._auto_recovery_worker is not None and self._auto_recovery_worker.isRunning():
+            QMessageBox.information(
+                self, '正在查找',
+                f'后台扫描已在进行中（待找 {len(missing)} 个），请留意底部状态栏。')
             return
         preview = '\n'.join(missing[:8])
         more = f'\n... 共 {len(missing)} 个' if len(missing) > 8 else ''
@@ -9564,10 +10232,10 @@ class MainWindow(QMainWindow):
         self.workspace_mode = 'text'
         self.workspace_switch.set_mode('text', emit=False)
         self._set_list_delegate('note')
-        self.new_btn.setText('+  新建记事')
+        self._set_new_button_text()
         self.search_input.setPlaceholderText('搜索记录')
         self.view_switch.set_view('archived', emit=False)
-        self.archive_category_filter.setVisible(True)
+        self._set_archive_filter_visible(True)
         if self.search_input.text():
             self.search_input.blockSignals(True)
             self.search_input.clear()
@@ -9603,7 +10271,8 @@ class MainWindow(QMainWindow):
         directory = ensure_custom_files()
         text_config_path()
         custom_qss_path()
-        open_local_path(directory)
+        if not open_local_path(directory):
+            QMessageBox.warning(self, '打开失败', f'文件夹不存在或无法打开:\n{directory}')
 
     def _show_customization_dialog(self):
         dlg = CustomizationDialog(self)
@@ -10387,7 +11056,8 @@ class MainWindow(QMainWindow):
 
     def _open_data_folder(self):
         path = self.account_manager.app_root if self.account_manager else self.storage.app_dir
-        open_local_path(path)
+        if not open_local_path(path):
+            QMessageBox.warning(self, '打开失败', f'文件夹不存在或无法打开:\n{path}')
 
     def _choose_data_folder(self):
         if not self.account_manager:
@@ -10522,9 +11192,25 @@ class MainWindow(QMainWindow):
         tagw = getattr(self, '_tagging_worker', None)
         if tagw is not None:
             try:
+                tagw.cancel()
                 tagw.wait(2000)
             except Exception:
                 pass
+        for worker in list(getattr(self, '_tracking_rebuild_workers', set())):
+            try:
+                worker.cancel()
+                worker.wait(2000)
+            except Exception:
+                pass
+        # Shell 通知只在托盘退出路径注销过；系统会话结束等其他退出路径
+        # 也要注销，避免留下悬空的通知注册
+        if getattr(self, '_shell_filter', None) is not None:
+            try:
+                self._shell_filter.uninstall()
+                QApplication.instance().removeNativeEventFilter(self._shell_filter)
+            except Exception:
+                pass
+            self._shell_filter = None
         if getattr(self, 'tray_icon', None):
             self.tray_icon.hide()
         super().closeEvent(event)
@@ -10563,24 +11249,29 @@ class MainWindow(QMainWindow):
         self.tray_icon.show()
 
     def _make_app_icon(self):
-        # 高分屏：用 256px 画布渲染再交给 QIcon 缩放，64px 固定画布在
-        # 150%/200% 缩放下托盘图标会发糊
+        # 纯路径“便笺 + 勾”标志，不依赖字体，确保托盘、标题栏和 EXE
+        # 在不同 DPI/字体环境中保持一致。
         size = 256
         pix = QPixmap(size, size)
         pix.fill(Qt.transparent)
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        # 圆角方块底色
-        painter.setBrush(QColor('#34C759'))
+        bg = QLinearGradient(0, 0, size, size)
+        bg.setColorAt(0.0, QColor('#5AC8FA'))
+        bg.setColorAt(1.0, QColor('#007AFF'))
+        painter.setBrush(bg)
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(8, 8, size - 16, size - 16, 48, 48)
-        # F 字母（按画布比例用像素字号，避免点字号随 DPI 漂移溢出）
-        painter.setPen(QColor('#FFFFFF'))
-        font = QFont(painter.font())
-        font.setPixelSize(int(size * 0.56))
-        font.setWeight(QFont.Bold)
-        painter.setFont(font)
-        painter.drawText(pix.rect(), Qt.AlignCenter, 'F')
+        painter.setBrush(QColor('#FFFFFF'))
+        painter.drawRoundedRect(QRectF(55, 42, 146, 172), 24, 24)
+        ink = QPen(QColor('#007AFF'), 13)
+        ink.setCapStyle(Qt.RoundCap)
+        ink.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(ink)
+        painter.drawLine(QPointF(82, 86), QPointF(174, 86))
+        painter.drawLine(QPointF(82, 119), QPointF(151, 119))
+        painter.drawLine(QPointF(83, 163), QPointF(109, 187))
+        painter.drawLine(QPointF(109, 187), QPointF(174, 145))
         painter.end()
         return QIcon(pix)
 
@@ -10594,7 +11285,10 @@ class MainWindow(QMainWindow):
             return
         self._last_window_activation = now
         if self.isMinimized():
-            self.showNormal()
+            # 最大化状态下最小化/进托盘后，showNormal 会把最大化也丢掉；
+            # 只清掉 Minimized 位才能还原到之前的状态
+            self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            self.show()
         else:
             self.show()
         self.raise_()
@@ -11197,6 +11891,7 @@ def main():
     app = QApplication(qt_argv)
     app.setApplicationName('FRESH')
     app.setOrganizationName('FRESH')
+    configure_application_font(app)
 
     # 单实例：已有实例运行时静默退出，避免外部重复启动时不断把窗口拉到前台。
     runtime_dir = QStandardPaths.writableLocation(QStandardPaths.GenericDataLocation) or tempfile.gettempdir()

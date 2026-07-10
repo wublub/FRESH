@@ -184,7 +184,12 @@ class ShellChangeFilter(QAbstractNativeEventFilter):
                     except Exception:
                         pass
                 try:
-                    self.callback(int(event_code.value), path1, path2)
+                    # 文件系统层(Interrupt)事件带 SHCNE_INTERRUPT 高位标志，
+                    # 不剥掉的话调用方按事件码精确比较会全部匹配失败——
+                    # 非 Explorer 发起的移动/删除（命令行、其他程序）就全丢了
+                    code = int(event_code.value) & 0xFFFFFFFF
+                    code &= ~0x80000000  # SHCNE_INTERRUPT
+                    self.callback(code, path1, path2)
                 except Exception:
                     pass
             finally:

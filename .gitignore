@@ -64,3 +64,7 @@ data.json.bak
 legacy_backup_*/
 replaced_*/
 import_tmp_*/
+
+# 本地审计/提交草稿，不属于项目源码
+audit_result.json
+commit_msg.txt

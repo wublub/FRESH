@@ -21,7 +21,7 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'}
 DEFAULT_SCAN_SETTINGS = {
     'es_path': '',          # es.exe 手动路径，空 = 自动检测
     'use_everything': True, # 检测到 es.exe 时是否启用
-    'scan_roots': [],       # 自定义扫描根目录列表，空 = 全部 NTFS 盘
+    'scan_roots': [],       # 自定义扫描根目录列表（优先扫描；兜底仍会追加全部本地盘）
 }
 
 # 本进程内仍在使用的解密缓存目录（切换账户等场景会同时存在多个 Storage）
@@ -459,7 +459,11 @@ class Storage:
                 'original_path': str(source.resolve()),
                 'added_at': datetime.now().isoformat(),
             }
-            attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+            # 同一文件夹可能已被其他便笺附加过：沿用盘上已有的标签，
+            # 否则新 UUID 会覆盖旧标签，先前那个附件的标签恢复就断了
+            existing_tag = ftrack.read_tracking_tag(str(source.resolve()))
+            attachment['tracking'] = ftrack.build_tracking(
+                str(source.resolve()), tracking_id=existing_tag or None)
         elif source.is_file():
             encrypt_local_copy = copy or source.suffix.lower() in IMAGE_EXTS
             if encrypt_local_copy:
@@ -493,7 +497,9 @@ class Storage:
                     'size': size,
                     'added_at': datetime.now().isoformat(),
                 }
-                attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+                existing_tag = ftrack.read_tracking_tag(str(source.resolve()))
+                attachment['tracking'] = ftrack.build_tracking(
+                    str(source.resolve()), tracking_id=existing_tag or None)
         else:
             return None
 
@@ -535,7 +541,11 @@ class Storage:
                 'original_path': str(source.resolve()),
                 'added_at': datetime.now().isoformat(),
             }
-            attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+            # 同一文件夹可能已被其他便笺附加过：沿用盘上已有的标签，
+            # 否则新 UUID 会覆盖旧标签，先前那个附件的标签恢复就断了
+            existing_tag = ftrack.read_tracking_tag(str(source.resolve()))
+            attachment['tracking'] = ftrack.build_tracking(
+                str(source.resolve()), tracking_id=existing_tag or None)
         elif source.is_file():
             try:
                 size = source.stat().st_size
@@ -549,7 +559,9 @@ class Storage:
                 'size': size,
                 'added_at': datetime.now().isoformat(),
             }
-            attachment['tracking'] = ftrack.build_tracking(str(source.resolve()))
+            existing_tag = ftrack.read_tracking_tag(str(source.resolve()))
+            attachment['tracking'] = ftrack.build_tracking(
+                str(source.resolve()), tracking_id=existing_tag or None)
         else:
             return None
 
@@ -1007,7 +1019,7 @@ class Storage:
             return matches[0]
         return None
 
-    def adopt_external_path(self, attachment, new_path):
+    def adopt_external_path(self, attachment, new_path, rebuild=True):
         new_path = str(Path(new_path).resolve())
         note, att = self.find_attachment(attachment['id'])
         if not note or not att:
@@ -1015,16 +1027,19 @@ class Storage:
         new_path_obj = Path(new_path)
         att['original_path'] = new_path
         att['original_name'] = new_path_obj.name or att.get('original_name', '')
+        att.pop('recovery_failed_at', None)
+        att.pop('recovery_failed_count', None)
         if att.get('type') == 'file_ref':
             try:
                 att['size'] = new_path_obj.stat().st_size
             except Exception:
                 pass
         self.save()
-        try:
-            self.rebuild_tracking_at_current_path(att)
-        except Exception:
-            pass
+        if rebuild:
+            try:
+                self.rebuild_tracking_at_current_path(att)
+            except Exception:
+                pass
         return Path(new_path)
 
     def resolve_external_path(self, attachment, scan=False, progress=None, cancel=None):
@@ -1121,9 +1136,13 @@ class Storage:
         attachment['tracking'] = new_tr
         return True
 
-    def refresh_tracking_if_changed(self, attachment):
+    def refresh_tracking_if_changed(self, attachment, *, allow_path_rebind=False):
         """检测 atomic save：文件仍在 original_path，但 File ID 与记录不同。
         重新打标时**保留原 UUID**，并把它写到新文件的 ADS。
+
+        ``allow_path_rebind`` 只应由明确的文件系统变更事件传入。启动、
+        聚焦和周期轮询无法区分 atomic save 与“原文件已移走、旧路径被无关
+        文件占用”，因此默认绝不把旧 UUID 写给路径上的陌生对象。
         返回 True 表示发生了刷新。"""
         t = attachment.get('type', 'file')
         if t not in ('folder', 'file_ref'):
@@ -1154,6 +1173,26 @@ class Storage:
             # File ID 没变，但 ADS 可能被覆盖（部分编辑器会清掉 ADS）
             if old_uuid and ftrack.read_tracking_tag(str(p)) != old_uuid:
                 ftrack.write_tracking_tag(str(p), old_uuid)
+            # 原地写入不会改变 File ID，但旧 hash 会失效。只在文件版本
+            # （mtime/size）变化时重算，避免每次聚焦都哈希大文件。
+            try:
+                stat = p.stat() if p.is_file() else None
+                content_changed = bool(stat) and (
+                    old.get('size_snapshot') != stat.st_size
+                    or old.get('mtime_ns_snapshot') != stat.st_mtime_ns
+                )
+            except OSError:
+                content_changed = False
+            if content_changed:
+                new_tr = ftrack.build_tracking(str(p.resolve()), tracking_id=old_uuid or None)
+                if new_tr:
+                    if old_uuid:
+                        new_tr['tracking_id'] = old_uuid
+                    note, att = self.find_attachment(attachment['id'])
+                    if note and att:
+                        att['tracking'] = new_tr
+                        self.save()
+                        return True
             return name_changed
 
         if old_uuid and ftrack.read_tracking_tag(str(p)) == old_uuid:
@@ -1178,6 +1217,22 @@ class Storage:
             except Exception:
                 pass
 
+        # 走到这里：文件仍在记录的路径上，但 File ID 变了、ADS 也没了
+        # （典型：VSCode/Office 的原子保存写新文件再替换，ADS 不会跟过来）。
+        # 只要盘上的标签没被别的附件占用，就按"路径即身份"原地重建跟踪，
+        # 否则这条附件的 File ID / ADS / hash 三条恢复线从此全部失效。
+        current_tag = ftrack.read_tracking_tag(str(p))
+        if allow_path_rebind and not current_tag:
+            new_tr = ftrack.build_tracking(str(p.resolve()), tracking_id=old_uuid or None)
+            if new_tr:
+                if old_uuid:
+                    new_tr['tracking_id'] = old_uuid
+                note, att = self.find_attachment(attachment['id'])
+                if note and att:
+                    att['tracking'] = new_tr
+                    self.save()
+                    return True
+
         return name_changed
 
     def _recover_external_in_original_parent(self, attachment, tracking):
@@ -1186,6 +1241,23 @@ class Storage:
         parent = original.parent
         if not parent.exists() or not parent.is_dir():
             return None
+
+        # 负结果缓存：上次扫过且父目录 mtime 没变就不再逐子项开 ADS 句柄。
+        # 这条路径挂在 60s 轮询/watcher/焦点恢复等 UI 线程热路径上，原路径
+        # 永久失效 + 大目录（如 Downloads）时每轮都是上万次文件句柄操作。
+        # NTFS 下子项改名/新建/删除必然更新目录 mtime，改名自愈的时效性不受影响。
+        cache = getattr(self, '_parent_scan_neg_cache', None)
+        if cache is None:
+            cache = self._parent_scan_neg_cache = {}
+        att_id = attachment.get('id') or ''
+        try:
+            parent_key = os.path.normcase(os.path.normpath(str(parent)))
+            parent_mtime = parent.stat().st_mtime
+        except OSError:
+            return None
+        if att_id and cache.get(att_id) == (parent_key, parent_mtime):
+            return None
+
         tag = (tracking or {}).get('tracking_id')
         att_type = attachment.get('type')
         try:
@@ -1204,14 +1276,23 @@ class Storage:
                 elif att_type == 'file_ref':
                     if not child.is_file():
                         continue
-                    if tag and ftrack.read_tracking_tag(str(child)) == tag:
+                    # 已知是文件：folder marker 分支必为空，read_tag 就够，
+                    # 省掉 read_tracking_tag 里对每个文件的两次多余 stat
+                    if tag and ftrack.read_tag(str(child)) == tag:
                         matches.append(child)
                     elif ftrack.path_matches_hash(str(child), tracking):
                         matches.append(child)
             except OSError:
                 continue
+            if len(matches) > 1:
+                # 多个命中结果注定是 None，不必扫完剩余子项
+                break
         if len(matches) == 1:
+            if att_id:
+                cache.pop(att_id, None)
             return matches[0]
+        if att_id:
+            cache[att_id] = (parent_key, parent_mtime)
         return None
 
     def all_external_attachments(self):

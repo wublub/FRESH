@@ -1,28 +1,43 @@
 """苹果风格 QSS 样式表"""
 
 COLORS = {
-    'accent': '#111111',
-    'accent_hover': '#333333',
-    'accent_pressed': '#000000',
-    'bg_main': '#F7F7F5',
+    'accent': '#007AFF',
+    'accent_hover': '#0068D9',
+    'accent_pressed': '#0057B8',
+    'bg_main': '#F2F2F7',
     'bg_panel': '#FFFFFF',
-    'border_light': '#EBEBEA',
-    'border_dark': '#D1D1D1',
-    'text_primary': '#111111',
-    'text_secondary': '#757575',
-    'text_tertiary': '#A0A0A0',
-    'btn_secondary_bg': '#EFEFEF',
-    'btn_secondary_hover': '#E5E5E5',
+    'bg_window': '#F5F5F7',
+    'surface_secondary': '#F7F7FA',
+    'selection_bg': '#DCEBFF',
+    'selection_hover': '#E8F2FF',
+    'border_light': '#E5E5EA',
+    'border_dark': '#D1D1D6',
+    'text_primary': '#1D1D1F',
+    'text_secondary': '#6E6E73',
+    'text_tertiary': '#8E8E93',
+    'btn_secondary_bg': '#F2F2F7',
+    'btn_secondary_hover': '#E8E8ED',
 }
 
 STYLE = """
 * {
-    font-family: "PingFang SC", "Microsoft YaHei UI", "Segoe UI", "SF Pro Display", sans-serif;
     outline: none;
 }
 
-QMainWindow, QWidget {
-    background: #FBFBFD;
+QMainWindow, QDialog {
+    background: @bg_window;
+    color: @text_primary;
+}
+
+QWidget {
+    color: @text_primary;
+}
+
+/* 上面的全局背景会把每个 QLabel/QCheckBox 都刷成不透明的 #FBFBFD，
+   叠在彩色面板（蓝色侧栏、深色看图器、白色卡片）上就是一块块灰白色补丁。
+   文本类控件一律透明，需要底色的由各自的 objectName 规则单独给。 */
+QLabel, QCheckBox, QRadioButton {
+    background: transparent;
 }
 
 #sidebar {
@@ -299,10 +314,11 @@ QMainWindow, QWidget {
     padding: 4px;
 }
 
+/* 注意：QSS 的 margin 在控件自身几何内收缩，1px 固定高度的分隔线加竖直
+   margin 会把可画区域压成负数导致整条线消失，间距交给布局。 */
 #divider {
     background: #E8EEF8;
     border: none;
-    margin: 8px 0 10px 0;
 }
 
 #content_edit {
@@ -434,6 +450,10 @@ QMainWindow, QWidget {
     border: none;
 }
 
+#att_scroll_content {
+    background: transparent;
+}
+
 #att_empty {
     color: #C7C7CC;
     font-size: 12px;
@@ -533,17 +553,13 @@ QMainWindow, QWidget {
     background: #FAFAFA;
 }
 
-#grid_empty {
-    color: #C7C7CC;
-    font-size: 14px;
-    padding: 80px 20px;
-}
-
 /* === 截图缩略图 === */
+/* 选中态边框 1px→2px，用 padding 反向补偿，避免卡片内容位移 1px */
 #screenshot_thumb {
     background: #FFFFFF;
     border: 1px solid #E8EEF8;
     border-radius: 6px;
+    padding: 1px;
 }
 
 #screenshot_thumb:hover {
@@ -554,16 +570,19 @@ QMainWindow, QWidget {
 #screenshot_thumb[selected="true"] {
     border: 2px solid @accent;
     background: #F4F9FF;
+    padding: 0;
 }
 
 #screenshot_thumb[archived="true"] {
     background: #F1F8F2;
     border: 1px solid #C8E6CC;
+    padding: 1px;
 }
 
 #screenshot_thumb[archived="true"][selected="true"] {
     border: 2px solid @accent;
     background: #EFF8F2;
+    padding: 0;
 }
 
 #screenshot_thumb[archived="true"]:hover {
@@ -1471,9 +1490,36 @@ QToolTip {
 }
 
 #sidebar {
-    background: @bg_main;
+    background: #EAF3FF;
     border: none;
-    border-right: 1px solid @border_light;
+    border-right: 1px solid #C9DCFF;
+}
+
+#sidebar[collapsed="true"] {
+    background: #DDEBFF;
+    border-right: 1px solid #B8D1FF;
+}
+
+#sidebar_toggle_btn {
+    background: rgba(255, 255, 255, 170);
+    color: #1F65D6;
+    border: 1px solid #BBD3FF;
+    border-radius: 6px;
+    font-size: 18px;
+    font-weight: 700;
+    padding: 0;
+}
+
+#sidebar_toggle_btn:hover {
+    background: #FFFFFF;
+    border: 1px solid #8FB7FF;
+    color: #174EA6;
+}
+
+#sidebar_toggle_btn:pressed {
+    background: #D1E4FF;
+    border: 1px solid #7CAAFF;
+    color: #174EA6;
 }
 
 #right_panel, #right_stack, #empty_state {
@@ -1499,6 +1545,16 @@ QToolTip {
 
 #new_button:pressed {
     background: @accent_pressed;
+}
+
+#new_button[collapsed="true"] {
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+    padding: 0;
+    font-size: 18px;
+    border-radius: 6px;
 }
 
 #more_button {
@@ -1530,12 +1586,18 @@ QToolTip {
 #mode_btn_left, #view_btn_left {
     border-top-left-radius: 6px;
     border-bottom-left-radius: 6px;
-    border-right: none;
+    border-right: 1px solid #E5EBF5;
 }
 
 #mode_btn_right, #view_btn_right {
     border-top-right-radius: 6px;
     border-bottom-right-radius: 6px;
+    border-left: none;
+}
+
+#mode_btn_left:hover, #mode_btn_right:hover,
+#view_btn_left:hover, #view_btn_right:hover {
+    background: #FFFFFF;
 }
 
 #mode_btn_left:checked, #mode_btn_right:checked,
@@ -1551,7 +1613,7 @@ QToolTip {
 
 #search_box {
     background: rgba(0, 0, 0, 0.04);
-    border: none;
+    border: 1px solid transparent;
     border-radius: 6px;
     color: #27364A;
     min-height: 34px;
@@ -1596,6 +1658,14 @@ QToolTip {
     color: @accent;
 }
 
+#timeline_btn[collapsed="true"] {
+    min-height: 30px;
+    max-height: 30px;
+    padding: 0;
+    font-size: 13px;
+    border-radius: 6px;
+}
+
 #screenshot_grid, #screenshot_grid_inner {
     background: #FEFEFF;
 }
@@ -1634,6 +1704,7 @@ QToolTip {
     border: 1px solid @accent;
     border-radius: 6px;
     min-height: 34px;
+    padding: 0 16px;
 }
 
 #empty_secondary_btn {
@@ -1641,6 +1712,7 @@ QToolTip {
     border: 1px solid #E5EBF5;
     color: #52627A;
     min-height: 34px;
+    padding: 0 16px;
 }
 
 #empty_secondary_btn:hover {
@@ -1662,11 +1734,17 @@ QToolTip {
 }
 
 /* === Title Bar Elements === */
+#custom_title_bar {
+    background: transparent;
+}
+
 #win_min_btn, #win_max_btn, #win_close_btn {
     background: transparent;
     border: none;
     border-radius: 4px;
     padding: 4px;
+    color: #52627A;
+    font-size: 13px;
 }
 #win_min_btn:hover, #win_max_btn:hover {
     background: @btn_secondary_hover;
@@ -1674,6 +1752,713 @@ QToolTip {
 #win_close_btn:hover {
     background: #E81123;
     color: white;
+}
+
+/* === 状态栏（无边框窗口里不能露原生灰条和拉伸角标） === */
+QStatusBar {
+    background: transparent;
+    color: #8B98AA;
+    border: none;
+    font-size: 12px;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+#sidebar_collapsed_spacer {
+    background: transparent;
+}
+
+/* === Apple-inspired visual system ======================================== */
+/* Keep the blue as an interaction color; surfaces stay neutral and are
+   separated by soft contrast, generous radii and one-pixel hairlines. */
+#app_shell {
+    background: @bg_window;
+}
+
+#sidebar {
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 0, y2: 1,
+        stop: 0 #F4F4F8,
+        stop: 1 #EEEFF4
+    );
+    border: none;
+    border-right: 1px solid rgba(60, 60, 67, 24);
+}
+
+#sidebar[collapsed="true"] {
+    background: #F0F0F5;
+    border-right: 1px solid rgba(60, 60, 67, 24);
+}
+
+#right_panel, #right_stack, #empty_state {
+    background: #FFFFFF;
+}
+
+#custom_title_bar {
+    background: #FFFFFF;
+    border: none;
+    border-bottom: 1px solid rgba(60, 60, 67, 20);
+}
+
+#window_title {
+    background: transparent;
+    color: @text_tertiary;
+    font-size: 12px;
+    font-weight: 600;
+    padding-left: 102px;
+}
+
+#win_min_btn, #win_max_btn, #win_close_btn {
+    background: transparent;
+    color: #636366;
+    border: none;
+    border-radius: 8px;
+    padding: 0;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+#win_min_btn:hover, #win_max_btn:hover {
+    background: rgba(118, 118, 128, 24);
+    color: @text_primary;
+}
+
+#win_close_btn:hover {
+    background: #FF453A;
+    color: #FFFFFF;
+}
+
+#sidebar_toggle_btn, #more_button {
+    background: rgba(255, 255, 255, 176);
+    color: #5F636B;
+    border: 1px solid rgba(60, 60, 67, 28);
+    border-radius: 10px;
+    padding: 0;
+    font-weight: 600;
+}
+
+#sidebar_toggle_btn {
+    font-size: 17px;
+}
+
+#more_button {
+    font-size: 18px;
+    padding-bottom: 5px;
+}
+
+#sidebar_toggle_btn:hover, #more_button:hover {
+    background: #FFFFFF;
+    color: @text_primary;
+    border-color: rgba(60, 60, 67, 44);
+}
+
+#sidebar_toggle_btn:pressed, #more_button:pressed {
+    background: #E5E5EA;
+}
+
+#new_button {
+    background: @accent;
+    color: #FFFFFF;
+    border: 1px solid @accent;
+    border-radius: 10px;
+    min-height: 34px;
+    padding: 0 14px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+#new_button:hover {
+    background: @accent_hover;
+    border-color: @accent_hover;
+}
+
+#new_button:pressed {
+    background: @accent_pressed;
+    border-color: @accent_pressed;
+}
+
+#new_button[collapsed="true"] {
+    min-width: 30px;
+    max-width: 30px;
+    min-height: 30px;
+    max-height: 30px;
+    border-radius: 9px;
+    padding: 0;
+    font-size: 17px;
+}
+
+#mode_switch, #view_switch, #text_format_switch {
+    background: #E7E7EC;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 10px;
+}
+
+#mode_btn_left, #mode_btn_right,
+#view_btn_left, #view_btn_right {
+    background: transparent;
+    color: @text_secondary;
+    border: 1px solid transparent;
+    min-height: 28px;
+    padding: 2px 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+#mode_btn_left, #view_btn_left {
+    border-top-left-radius: 9px;
+    border-bottom-left-radius: 9px;
+    border-right: none;
+}
+
+#mode_btn_right, #view_btn_right {
+    border-top-right-radius: 9px;
+    border-bottom-right-radius: 9px;
+    border-left: none;
+}
+
+#mode_btn_left:hover, #mode_btn_right:hover,
+#view_btn_left:hover, #view_btn_right:hover {
+    background: rgba(255, 255, 255, 120);
+    color: @text_primary;
+}
+
+#mode_btn_left:checked, #mode_btn_right:checked,
+#view_btn_left:checked, #view_btn_right:checked {
+    background: #FFFFFF;
+    color: @text_primary;
+    border-color: rgba(60, 60, 67, 34);
+    font-weight: 600;
+}
+
+#mode_btn_left:checked, #view_btn_left:checked {
+    border-right: 1px solid rgba(60, 60, 67, 34);
+}
+
+#search_box {
+    background: rgba(118, 118, 128, 24);
+    color: @text_primary;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 13px;
+    selection-background-color: @accent;
+    selection-color: #FFFFFF;
+}
+
+#search_box:hover {
+    background: rgba(118, 118, 128, 31);
+}
+
+#search_box:focus {
+    background: #FFFFFF;
+    border: 1px solid rgba(0, 122, 255, 150);
+}
+
+#timeline_category_filter, #note_category_combo,
+#att_category_filter, #timeline_filter_combo, #timeline_date_edit {
+    background: rgba(255, 255, 255, 190);
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 28);
+    border-radius: 9px;
+    min-height: 28px;
+    padding: 1px 10px;
+}
+
+#timeline_category_filter:hover, #note_category_combo:hover,
+#att_category_filter:hover, #timeline_filter_combo:hover, #timeline_date_edit:hover {
+    background: #FFFFFF;
+    border-color: rgba(60, 60, 67, 48);
+}
+
+#note_list {
+    background: transparent;
+    border: none;
+    padding: 2px 0;
+}
+
+#timeline_btn {
+    background: rgba(255, 255, 255, 168);
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 28);
+    border-radius: 10px;
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+#timeline_btn:hover {
+    background: #FFFFFF;
+    border-color: rgba(60, 60, 67, 44);
+}
+
+#timeline_btn[collapsed="true"] {
+    min-height: 30px;
+    max-height: 30px;
+    border-radius: 9px;
+    padding: 0;
+}
+
+#title_input {
+    background: transparent;
+    color: @text_primary;
+    border: none;
+    padding: 0;
+    font-size: 30px;
+    font-weight: 600;
+    selection-background-color: @selection_bg;
+    selection-color: @text_primary;
+}
+
+#editor_time {
+    color: @text_tertiary;
+    font-size: 12px;
+}
+
+#divider {
+    background: rgba(60, 60, 67, 24);
+    border: none;
+}
+
+#content_edit {
+    background: transparent;
+    color: @text_primary;
+    border: none;
+    padding: 2px 0 0 0;
+    font-size: 15px;
+    selection-background-color: @selection_bg;
+    selection-color: @text_primary;
+}
+
+#format_btn {
+    background: #FFFFFF;
+    color: @text_secondary;
+    border: 1px solid rgba(60, 60, 67, 30);
+    border-radius: 8px;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+#format_btn:hover {
+    background: #F5F5F7;
+    color: @text_primary;
+    border-color: rgba(60, 60, 67, 46);
+}
+
+#format_btn:checked {
+    background: @selection_bg;
+    color: @accent;
+    border-color: rgba(0, 122, 255, 70);
+}
+
+#attachment_bar {
+    background: #F7F7FA;
+    border-top: 1px solid rgba(60, 60, 67, 22);
+}
+
+#att_section_title {
+    color: @text_primary;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+#att_hint, #att_empty {
+    color: @text_tertiary;
+}
+
+#att_add_btn {
+    background: @accent;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+#att_add_btn:hover {
+    background: @accent_hover;
+}
+
+#attachment_card, #thumb_attachment_chip {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 11px;
+}
+
+#attachment_card:hover, #thumb_attachment_chip:hover {
+    background: #FAFAFC;
+    border-color: rgba(60, 60, 67, 42);
+}
+
+#attachment_card[categorized="true"],
+#thumb_attachment_chip[categorized="true"] {
+    background: #F5FAFF;
+    border-color: rgba(0, 122, 255, 45);
+}
+
+#screenshot_grid, #screenshot_grid_inner {
+    background: #F7F7FA;
+}
+
+#screenshot_thumb {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 14px;
+    padding: 1px;
+}
+
+#screenshot_thumb:hover {
+    background: #FFFFFF;
+    border-color: rgba(60, 60, 67, 48);
+}
+
+#screenshot_thumb[selected="true"] {
+    background: #F7FBFF;
+    border: 2px solid @accent;
+    padding: 0;
+}
+
+#screenshot_thumb[archived="true"] {
+    background: #FFFFFF;
+    border: 1px solid rgba(52, 199, 89, 72);
+    padding: 1px;
+}
+
+#screenshot_thumb[archived="true"][selected="true"] {
+    background: #F7FBFF;
+    border: 2px solid @accent;
+    padding: 0;
+}
+
+#thumb_image, #thumb_memo {
+    border-radius: 10px;
+}
+
+#drop_hint_card, #empty_panel {
+    background: #F7F7FA;
+    border: 1px solid rgba(60, 60, 67, 22);
+    border-radius: 18px;
+}
+
+#drop_hint_icon, #empty_icon {
+    background: #EAEAEE;
+    color: @text_secondary;
+    border: none;
+    border-radius: 24px;
+}
+
+#drop_hint_title, #empty_title {
+    color: @text_primary;
+    font-size: 19px;
+    font-weight: 600;
+}
+
+#drop_hint_subtitle, #empty_message {
+    color: @text_secondary;
+    font-size: 13px;
+}
+
+#empty_primary_btn {
+    background: @accent;
+    color: #FFFFFF;
+    border: 1px solid @accent;
+    border-radius: 10px;
+    min-height: 36px;
+    padding: 0 16px;
+    font-weight: 600;
+}
+
+#empty_primary_btn:hover {
+    background: @accent_hover;
+    border-color: @accent_hover;
+}
+
+#empty_secondary_btn {
+    background: #FFFFFF;
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 30);
+    border-radius: 10px;
+    min-height: 36px;
+    padding: 0 16px;
+    font-weight: 500;
+}
+
+#empty_secondary_btn:hover {
+    background: #F1F1F5;
+    border-color: rgba(60, 60, 67, 46);
+}
+
+QMenu {
+    background: rgba(255, 255, 255, 248);
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 36);
+    border-radius: 12px;
+    padding: 6px;
+}
+
+QMenu::item {
+    border-radius: 7px;
+    padding: 7px 28px 7px 12px;
+}
+
+QMenu::item:selected {
+    background: @selection_bg;
+    color: @text_primary;
+}
+
+QMenu::separator {
+    background: rgba(60, 60, 67, 24);
+    height: 1px;
+    margin: 5px 8px;
+}
+
+QDialog QLineEdit, QDialog QTextEdit, QDialog QPlainTextEdit,
+QDialog QComboBox, QDialog QDateEdit, QDialog QListWidget,
+QDialog QTableWidget, QMessageBox {
+    background: #FFFFFF;
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 30);
+    border-radius: 10px;
+    selection-background-color: @selection_bg;
+    selection-color: @text_primary;
+}
+
+QDialog QLineEdit:focus, QDialog QTextEdit:focus,
+QDialog QPlainTextEdit:focus, QDialog QComboBox:focus,
+QDialog QDateEdit:focus {
+    border: 1px solid rgba(0, 122, 255, 150);
+}
+
+QDialog QPushButton, QMessageBox QPushButton {
+    background: #FFFFFF;
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 34);
+    border-radius: 9px;
+    min-height: 30px;
+    padding: 2px 14px;
+    font-weight: 500;
+}
+
+QDialog QPushButton:hover, QMessageBox QPushButton:hover {
+    background: #F1F1F5;
+    border-color: rgba(60, 60, 67, 50);
+}
+
+QDialog QPushButton:default, QMessageBox QPushButton:default {
+    background: @accent;
+    color: #FFFFFF;
+    border-color: @accent;
+    font-weight: 600;
+}
+
+QGroupBox {
+    background: #FFFFFF;
+    color: @text_primary;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 14px;
+    margin-top: 12px;
+    padding: 12px;
+    font-weight: 600;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 5px;
+}
+
+QTabWidget::pane {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 12px;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: @text_secondary;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+}
+
+QTabBar::tab:selected {
+    color: @text_primary;
+    border-bottom-color: @accent;
+    font-weight: 600;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(60, 60, 67, 66);
+    border-radius: 3px;
+    min-height: 28px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(60, 60, 67, 92);
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(60, 60, 67, 66);
+    border-radius: 3px;
+    min-width: 28px;
+    margin: 2px;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line,
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: transparent;
+    border: none;
+}
+
+QToolTip {
+    background: rgba(35, 35, 38, 245);
+    color: #FFFFFF;
+    border: none;
+    border-radius: 7px;
+    padding: 5px 8px;
+    font-size: 12px;
+}
+
+QStatusBar {
+    background: #FFFFFF;
+    color: @text_tertiary;
+    border: none;
+    border-top: 1px solid rgba(60, 60, 67, 18);
+    font-size: 12px;
+}
+
+/* === Retrospective timeline ============================================= */
+#timeline_header_box {
+    background: #F7F7FA;
+    border: none;
+    border-bottom: 1px solid rgba(60, 60, 67, 22);
+}
+
+#timeline_header {
+    color: @text_primary;
+    font-size: 24px;
+    font-weight: 600;
+}
+
+#timeline_subtitle {
+    color: @text_secondary;
+    font-size: 12px;
+}
+
+#timeline_reset_btn {
+    background: transparent;
+    color: @text_secondary;
+    border: 1px solid rgba(60, 60, 67, 28);
+    border-radius: 9px;
+    min-height: 28px;
+    padding: 1px 11px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+#timeline_reset_btn:hover {
+    background: #FFFFFF;
+    color: @text_primary;
+    border-color: rgba(60, 60, 67, 46);
+}
+
+#timeline_review_box {
+    background: #F7F7FA;
+    border: none;
+    border-bottom: 1px solid rgba(60, 60, 67, 20);
+}
+
+#timeline_stat_card, #timeline_streak_card {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 12px;
+}
+
+#timeline_streak_card {
+    border-left: 3px solid #FF9F0A;
+}
+
+#timeline_stat_value {
+    color: @text_primary;
+    font-size: 19px;
+    font-weight: 600;
+}
+
+#timeline_streak_value {
+    color: #E88700;
+    font-size: 19px;
+    font-weight: 600;
+}
+
+#timeline_stat_label, #timeline_stat_sub {
+    color: @text_tertiary;
+}
+
+#timeline_insight_strip {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 12px;
+}
+
+#timeline_insight_label {
+    color: @text_secondary;
+}
+
+#timeline_detail_title {
+    background: #F7F7FA;
+    color: @text_secondary;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 13px 24px 7px 24px;
+}
+
+#timeline_list {
+    background: #F7F7FA;
+}
+
+#timeline_date {
+    color: @text_tertiary;
+    font-weight: 600;
+}
+
+#timeline_item, #timeline_note_item {
+    background: #FFFFFF;
+    border: 1px solid rgba(60, 60, 67, 24);
+    border-radius: 12px;
+    margin: 4px 20px;
+}
+
+#timeline_item:hover, #timeline_note_item:hover {
+    background: #FBFBFD;
+    border-color: rgba(0, 122, 255, 70);
+}
+
+#timeline_note_icon {
+    background: #EAF7EE;
+    border: 1px solid rgba(52, 199, 89, 54);
+    border-radius: 12px;
+}
+
+#more_button {
+    padding: 0;
 }
 """
 

@@ -92,7 +92,9 @@ if _IS_WIN:
     _kernel32.SetFileAttributesW.restype = wintypes.BOOL
 
     INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+    FILE_ATTRIBUTE_READONLY = 0x01
     FILE_ATTRIBUTE_HIDDEN = 0x02
+    FILE_ATTRIBUTE_NORMAL = 0x80
 
 
 # ============ NTFS Alternate Data Stream ============
@@ -105,6 +107,27 @@ def write_tag(path, tag, stream=ADS_STREAM):
             f.write(tag)
         return True
     except OSError:
+        pass
+    # 只读文件上打开 ADS 写句柄同样报 PermissionError——临时摘掉只读位重试，
+    # 写完恢复原属性，否则只读附件（下载的 PDF、拷贝自光盘的文件很常见）
+    # 会静默拿不到追踪标签，整条 ADS 恢复链失效。
+    if not _IS_WIN:
+        return False
+    try:
+        attrs = _kernel32.GetFileAttributesW(str(path))
+        if attrs == INVALID_FILE_ATTRIBUTES or not (attrs & FILE_ATTRIBUTE_READONLY):
+            return False
+        if not _kernel32.SetFileAttributesW(str(path), attrs & ~FILE_ATTRIBUTE_READONLY):
+            return False
+        try:
+            with open(ads, 'w', encoding='utf-8') as f:
+                f.write(tag)
+            return True
+        except OSError:
+            return False
+        finally:
+            _kernel32.SetFileAttributesW(str(path), attrs)
+    except Exception:
         return False
 
 
@@ -115,6 +138,10 @@ def read_tag(path, stream=ADS_STREAM):
         with open(ads, 'r', encoding='utf-8') as f:
             return f.read().strip()
     except OSError:
+        return None
+    except ValueError:
+        # 同名流被其他程序写过非 UTF-8 内容：UnicodeDecodeError(ValueError 子类)
+        # 若不接住会把整个全盘扫描炸掉
         return None
 
 
@@ -161,6 +188,13 @@ def write_folder_marker(path, tag):
     if not marker or not tag:
         return False
     try:
+        # 已存在的 marker 是隐藏文件——Windows 上对隐藏文件用 'w' 重建
+        # 会报 PermissionError，必须先摘掉隐藏属性再写
+        if _IS_WIN and marker.exists():
+            try:
+                _kernel32.SetFileAttributesW(str(marker), FILE_ATTRIBUTE_NORMAL)
+            except Exception:
+                pass
         marker.write_text(f'{FOLDER_MARKER_PREFIX}{tag}\n', encoding='utf-8')
         _hide_marker_file(marker)
         return True
@@ -504,7 +538,30 @@ def scan_for_tag(tag, roots=None, progress=None, cancel=None, stream=ADS_STREAM,
     return None
 
 
-def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None, stream=ADS_STREAM, drive_hints=None):
+def scan_for_tag_candidates(tag, roots=None, progress=None, cancel=None,
+                            stream=ADS_STREAM, drive_hints=None):
+    """Return every distinct path carrying ``tag``.
+
+    Recovery UIs use this instead of the first-match helper so copied ADS tags
+    become an explicit choice rather than a silent misbinding.
+    """
+    matches = []
+    seen = set()
+    for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
+        if cancel and cancel():
+            break
+        if _read_tracking_tag_known_kind(path, stream, is_dir) != tag:
+            continue
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(path)
+    return matches
+
+
+def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None,
+                  stream=ADS_STREAM, drive_hints=None, unique_only=False):
     """一次遍历磁盘，查找带 tags 集合中任意 ADS 标记的文件/文件夹。
 
     tags:        待查 tracking_id 集合
@@ -516,16 +573,33 @@ def scan_for_tags(tags, roots=None, progress=None, cancel=None, on_found=None, s
         return {}
     remaining = set(tags)
     found = {}
+    groups = {} if unique_only else None
     for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
-        if not remaining:
+        if not unique_only and not remaining:
             break
         t = _read_tracking_tag_known_kind(path, stream, is_dir)
         if t and t in remaining:
+            if unique_only:
+                matches = groups.setdefault(t, [])
+                key = os.path.normcase(os.path.normpath(path))
+                if all(os.path.normcase(os.path.normpath(p)) != key for p in matches):
+                    matches.append(path)
+                continue
             found[t] = path
             remaining.discard(t)
             if on_found:
                 try:
                     on_found(t, path)
+                except Exception:
+                    pass
+    if unique_only:
+        for tag, paths in groups.items():
+            if len(paths) != 1:
+                continue
+            found[tag] = paths[0]
+            if on_found:
+                try:
+                    on_found(tag, paths[0])
                 except Exception:
                     pass
     return found
@@ -687,6 +761,7 @@ def scan_for_hash(tracking, roots=None, progress=None, cancel=None, limit=20, dr
         return []
 
     matches = []
+    seen_paths = set()
     max_bytes = _hash_max_bytes_for_tracking(tracking)
     for path, is_dir in _iter_disk(roots, drive_hints, progress, cancel, ntfs_only=False):
         if cancel and cancel():
@@ -699,6 +774,12 @@ def scan_for_hash(tracking, roots=None, progress=None, cancel=None, limit=20, dr
         except OSError:
             continue
         if compute_hash(path, max_bytes=max_bytes) == digest:
+            # roots 可能互相包含（配置了 C:\ 和 C:\Users\x），同一文件会被
+            # 遍历两遍；不去重会让"唯一命中才自动采纳"失效
+            key = os.path.normcase(os.path.normpath(path))
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
             matches.append(path)
             if len(matches) >= limit:
                 break
@@ -743,7 +824,14 @@ def scan_for_hashes(tag_to_tracking, roots=None, progress=None, cancel=None, on_
                 if max_bytes not in hash_cache:
                     hash_cache[max_bytes] = compute_hash(path, max_bytes=max_bytes)
                 if hash_cache[max_bytes] == digest:
-                    matches_by_key.setdefault(key, []).append(path)
+                    # roots 可能互相包含（用户配置根 + 无条件追加的盘符根），
+                    # 同一文件会被遍历两遍且字面形式不同（正/反斜杠）；
+                    # 不按 normcase 去重会把唯一命中误判成"多副本"而拒绝采纳，
+                    # 与 scan_for_hash 的去重(见上)行为不一致
+                    lst = matches_by_key.setdefault(key, [])
+                    norm = os.path.normcase(os.path.normpath(path))
+                    if all(os.path.normcase(os.path.normpath(p)) != norm for p in lst):
+                        lst.append(path)
 
         found = {}
         for size, by_hash in groups.items():
@@ -891,17 +979,31 @@ def everything_available(prefer_path=None):
     return find_es_exe(prefer_path) is not None
 
 
+# "启用 Everything 加速"总开关。之前只把 es_path 置 None，
+# IPC 直连路径完全不受影响，用户关了开关照样在查 Everything。
+EVERYTHING_ENABLED = True
+
+
+def set_everything_enabled(enabled):
+    global EVERYTHING_ENABLED
+    EVERYTHING_ENABLED = bool(enabled)
+
+
 def everything_mode(prefer_path=None):
     """返回当前 Everything 集成模式: 'ipc' / 'es' / None"""
+    if not EVERYTHING_ENABLED:
+        return None
     if everything_ipc and everything_ipc.is_everything_running():
         return 'ipc'
-    if find_es_exe(prefer_path):
-        return 'es'
+    # es.exe 只是 Everything 的 IPC 客户端，主程序不在时必然 Error 8——
+    # 不能因为磁盘上有 es.exe 就宣称"加速可用"，每次白起一个注定失败的子进程
     return None
 
 
 def everything_search(query, exact_name=False, drive_hint=None, limit=200, es_path=None, timeout=10):
     """通过 Everything 搜索：优先 IPC，回退 es.exe。"""
+    if not EVERYTHING_ENABLED:
+        return None
     # 1. IPC 优先（无需任何工具）
     if everything_ipc and everything_ipc.is_everything_running():
         try:
@@ -929,15 +1031,21 @@ def everything_search(query, exact_name=False, drive_hint=None, limit=200, es_pa
     if drive_hint:
         q = f'"{drive_hint}:\\" {q}'
 
-    args = [es, '-utf8', '-no-header', '-n', str(limit), q]
+    # 注意：ES 1.1.0.30 没有 '-utf8' 开关（只有导出文件用的 -utf8-bom），
+    # 传了会直接 Error 6 退出——之前 es.exe 兜底因此从未工作过
+    args = [es, '-no-header', '-n', str(limit), q]
     try:
         out = subprocess.run(
             args, capture_output=True, timeout=timeout,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
         )
         if out.returncode != 0:
-            return []
-        text = out.stdout.decode('utf-8', errors='replace')
+            # Error 6/8 等是"引擎失败"，必须与"没有结果"([]) 区分开，
+            # 否则调用方会跳过 os.walk 兜底
+            return None
+        # es.exe 管道输出用系统 ANSI 代码页（中文系统即 GBK/cp936）
+        encoding = 'mbcs' if _IS_WIN else 'utf-8'
+        text = out.stdout.decode(encoding, errors='replace')
         return [line.strip() for line in text.splitlines() if line.strip()]
     except Exception:
         return None
@@ -989,6 +1097,7 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
     if phase:
         phase('用 Everything 查找候选')
     found = {}
+    matches_by_tag = {}
     name_to_tags = {}
     for tag, name in tag_to_name.items():
         if not name:
@@ -1001,21 +1110,15 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
         for path in paths or []:
             if cancel and cancel():
                 break
+            if is_recycled_path(path):
+                continue
             key = os.path.normcase(os.path.normpath(path))
             if key in seen_paths:
                 continue
             seen_paths.add(key)
             t = read_tracking_tag(path, stream)
             if t and t in tags:
-                found[t] = path
-                tags.discard(t)
-                if on_found:
-                    try:
-                        on_found(t, path)
-                    except Exception:
-                        pass
-                if not tags:
-                    break
+                matches_by_tag.setdefault(t, []).append(path)
 
     for name, tags in list(name_to_tags.items()):
         if cancel and cancel():
@@ -1025,9 +1128,18 @@ def _scan_via_everything(tag_to_name, drive_hints, on_found, cancel, progress, p
         seen_paths = set()
         paths = everything_search(name, exact_name=True, drive_hint=drive, limit=500, es_path=es_path)
         process_paths(paths, tags, seen_paths)
-        if drive and tags and not (cancel and cancel()):
+        if drive and not (cancel and cancel()):
             paths = everything_search(name, exact_name=True, drive_hint=None, limit=500, es_path=es_path)
             process_paths(paths, tags, seen_paths)
+    for tag, paths in matches_by_tag.items():
+        if len(paths) != 1:
+            continue
+        found[tag] = paths[0]
+        if on_found:
+            try:
+                on_found(tag, paths[0])
+            except Exception:
+                pass
     return found
 
 
@@ -1065,7 +1177,9 @@ def find_candidates_by_name(name, drive_hint=None, size_hint=None, es_path=None,
             drive_hints=[drive_hint] if drive_hint else None,
             cancel=cancel, progress=progress, limit=200,
         )
-    paths = paths or []
+    # Everything 索引滞后时会给出已失效的旧路径；回收站同理。此函数只在
+    # 工作线程被调用，exists() 的开销可以接受，把死候选挡在采纳/弹窗之前。
+    paths = [p for p in (paths or []) if not is_recycled_path(p) and os.path.exists(p)]
 
     if size_hint and paths:
         def key(p):
@@ -1115,6 +1229,8 @@ def find_folders_by_marker(tags, drive_hints=None, es_path=None, on_found=None, 
         for marker_path in paths or []:
             if cancel and cancel():
                 break
+            if is_recycled_path(marker_path):
+                continue
             marker_key = os.path.normcase(os.path.normpath(marker_path))
             if marker_key in seen_markers:
                 continue
@@ -1145,8 +1261,14 @@ def find_folders_by_marker(tags, drive_hints=None, es_path=None, on_found=None, 
 
 # ============ 一站式工具 ============
 
-def build_tracking(path, tracking_id=None):
-    """为新加入的文件/文件夹生成完整的跟踪信息。返回 dict (可能为空)。"""
+def build_tracking(path, tracking_id=None, *, write_identity=True):
+    """为新加入的文件/文件夹生成完整的跟踪信息。返回 dict (可能为空)。
+
+    ``write_identity=False`` is used by background workers: it gathers File
+    ID/hash metadata without writing ADS or folder markers.  The caller can
+    then verify that the path still refers to the same object before applying
+    the result and writing the identity tag on the UI thread.
+    """
     info = {}
     p = Path(path)
     if not p.exists():
@@ -1154,10 +1276,16 @@ def build_tracking(path, tracking_id=None):
 
     import uuid
     tag = tracking_id or uuid.uuid4().hex
-    if write_tracking_tag(str(p), tag):
+    if write_identity:
+        if write_tracking_tag(str(p), tag):
+            info['tracking_id'] = tag
+        elif tracking_id:
+            info['tracking_id'] = tracking_id
+    else:
+        # Keep the proposed ID in the snapshot so the guarded apply phase can
+        # write it after re-validating the object.  If the final write fails for
+        # a newly generated ID, the caller removes it again.
         info['tracking_id'] = tag
-    elif tracking_id:
-        info['tracking_id'] = tracking_id
 
     fi = get_file_info(str(p))
     if fi:
@@ -1167,14 +1295,20 @@ def build_tracking(path, tracking_id=None):
         info['is_dir'] = fi['is_dir']
 
     try:
-        info['drive_hint'] = str(p.resolve()).split(':', 1)[0]
+        # splitdrive 才能正确处理 UNC：\\NAS\share\x.doc 没有冒号，
+        # 按 ':' 切会把整条路径当成"盘符"，生成垃圾 Everything 过滤条件
+        drv = os.path.splitdrive(str(p.resolve()))[0]
+        if len(drv) == 2 and drv[1] == ':':
+            info['drive_hint'] = drv[0]
     except Exception:
         pass
 
     if p.is_file():
         try:
-            size = p.stat().st_size
+            stat = p.stat()
+            size = stat.st_size
             info['size_snapshot'] = size
+            info['mtime_ns_snapshot'] = stat.st_mtime_ns
             # 小文件（<=64MB）整体哈希；大文件只哈希前 64MB，避免太慢
             h = compute_hash(str(p), max_bytes=None if size <= 64 * 1024 * 1024 else 64 * 1024 * 1024)
             if h:
@@ -1184,6 +1318,20 @@ def build_tracking(path, tracking_id=None):
         except OSError:
             pass
     return info
+
+
+def is_recycled_path(path):
+    """路径是否位于回收站/系统卷信息目录。
+
+    Windows 的"删除到回收站"就是一次同卷 RENAMEITEM——File ID 不变、ADS 不丢，
+    File-ID 恢复和 Shell 事件都会把附件"找回"到 $Recycle.Bin\\...\\$Rxxxx，
+    必须显式排除。
+    """
+    try:
+        low = str(path).lower()
+    except Exception:
+        return False
+    return '$recycle.bin' in low or 'system volume information' in low
 
 
 def try_recover(tracking, scan=False, progress=None, cancel=None):
@@ -1203,7 +1351,7 @@ def try_recover(tracking, scan=False, progress=None, cancel=None):
     if vs is not None and fh is not None and fl is not None:
         try:
             p = find_by_file_id(vs, fh, fl, drive_hint=hint)
-            if p and os.path.exists(p):
+            if p and os.path.exists(p) and not is_recycled_path(p):
                 return p
         except Exception:
             pass
@@ -1214,7 +1362,7 @@ def try_recover(tracking, scan=False, progress=None, cancel=None):
             try:
                 drive_hints = [hint] if hint else None
                 p = scan_for_tag(tag, progress=progress, cancel=cancel, drive_hints=drive_hints)
-                if p:
+                if p and not is_recycled_path(p):
                     return p
             except Exception:
                 pass
