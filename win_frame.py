@@ -61,6 +61,13 @@ HTBOTTOMRIGHT = 17
 SM_CXSIZEFRAME = 32
 SM_CXPADDEDBORDER = 92
 
+# Win11 圆角（DwmSetWindowAttribute），Win10 及更早版本调用会失败并被忽略
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_DEFAULT = 0
+DWMWCP_DONOTROUND = 1
+DWMWCP_ROUND = 2
+DWMWCP_ROUNDSMALL = 3
+
 
 class _MSG(ctypes.Structure):
     _fields_ = [
@@ -180,6 +187,28 @@ def apply_native_frame(hwnd):
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
         )
         return True
+    except Exception:
+        return False
+
+
+def apply_rounded_corners(hwnd, rounded=True):
+    """显式要求 DWM 圆化窗口四角。失败返回 False。
+
+    Qt 的 FramelessWindowHint 会给窗口挂上 WS_POPUP，而 Win11 只对
+    WS_OVERLAPPEDWINDOW 风格的窗口自动应用圆角，所以补回 WS_THICKFRAME
+    还不够，必须显式设置 DWMWA_WINDOW_CORNER_PREFERENCE。
+    """
+    if not IS_WIN or not hwnd or _dwmapi is None:
+        return False
+    try:
+        pref = ctypes.c_int(DWMWCP_ROUND if rounded else DWMWCP_DONOTROUND)
+        res = _dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(int(hwnd)),
+            ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+            ctypes.byref(pref),
+            ctypes.sizeof(pref),
+        )
+        return int(res) == 0
     except Exception:
         return False
 

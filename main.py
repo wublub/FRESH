@@ -2714,7 +2714,8 @@ class TimelineReviewChart(QWidget):
     SILVER = '#AEB8C6'; SILVER_LIGHT = '#C9D2DE'
     BRONZE = '#CD7F45'; BRONZE_LIGHT = '#E0A87E'
     TEXT = '#1D1D1F'; MUTED = '#6E6E73'; FAINT = '#8E8E93'
-    GRID = '#EFEFF4'; CARD_BORDER = '#E5E5EA'
+    GRID = '#F2F2F7'; AXIS = '#E5E5EA'; TRACK = '#F2F2F7'
+    CARD_BORDER = '#E5E5EA'
     DIM = '#C7C7CC'; DIM_LIGHT = '#D6DEEA'
     HOVER = '#F5F5F7'; BADGE_BG = '#E7F1FF'
     PEAK_BLUE = '#0068D9'; PEAK_GREEN = '#248A3D'
@@ -2848,7 +2849,7 @@ class TimelineReviewChart(QWidget):
         return card
 
     def _draw_empty(self, painter, rect):
-        painter.setPen(QColor('#9AA8BA'))
+        painter.setPen(QColor(self.FAINT))
         painter.drawText(rect, Qt.AlignCenter, '暂无完成记录')
 
     def _grad_vert(self, cx, top, bottom, c_top, c_bottom):
@@ -2862,6 +2863,22 @@ class TimelineReviewChart(QWidget):
         g.setColorAt(0.0, QColor(c_left))
         g.setColorAt(1.0, QColor(c_right))
         return QBrush(g)
+
+    def _bar_path(self, rect, radius):
+        """只圆化顶部两角的柱条路径；底边贴基线保持平直。"""
+        r = min(float(radius), rect.width() / 2, max(0.0, rect.height()))
+        path = QPainterPath()
+        if r <= 0.4:
+            path.addRect(rect)
+            return path
+        path.moveTo(rect.left(), rect.bottom())
+        path.lineTo(rect.left(), rect.top() + r)
+        path.quadTo(rect.left(), rect.top(), rect.left() + r, rect.top())
+        path.lineTo(rect.right() - r, rect.top())
+        path.quadTo(rect.right(), rect.top(), rect.right(), rect.top() + r)
+        path.lineTo(rect.right(), rect.bottom())
+        path.closeSubpath()
+        return path
 
     def _draw_trend(self, painter, rect):
         buckets = defaultdict(lambda: {'created': 0, 'done': 0, 'selected_created': 0, 'selected_done': 0})
@@ -2889,10 +2906,12 @@ class TimelineReviewChart(QWidget):
         chart_h = max(1, plot.height() - 4)
         grow = self._grow
 
-        painter.setPen(QPen(QColor(self.GRID), 1, Qt.DashLine))
-        for gi in range(1, 4):
+        painter.setPen(QPen(QColor(self.GRID), 1))
+        for gi in range(1, 5):
             gy = base_y - chart_h * gi / 4
             painter.drawLine(QPointF(plot.left(), gy), QPointF(plot.right(), gy))
+        painter.setPen(QPen(QColor(self.AXIS), 1))
+        painter.drawLine(QPointF(plot.left(), base_y), QPointF(plot.right(), base_y))
 
         group_w = plot.width() / max(1, len(keys))
         bar_w = max(4, min(13, group_w * 0.24))
@@ -2907,26 +2926,22 @@ class TimelineReviewChart(QWidget):
             cb = QRectF(x - bar_w - 1, base_y - created_h, bar_w, created_h)
             db = QRectF(x + 1, base_y - done_h, bar_w, done_h)
             painter.setPen(Qt.NoPen)
+            radius = bar_w / 2
             if self.selected_category:
                 painter.setBrush(QColor(self.DIM))
-                painter.drawRoundedRect(cb, 3, 3)
-                painter.drawRoundedRect(db, 3, 3)
+                painter.drawPath(self._bar_path(cb, radius))
+                painter.drawPath(self._bar_path(db, radius))
                 sc_h = chart_h * buckets[key]['selected_created'] / max_count * grow
                 sd_h = chart_h * buckets[key]['selected_done'] / max_count * grow
                 painter.setBrush(self._grad_vert(x, base_y - sc_h, base_y, self.BLUE_LIGHT, self.BLUE))
-                painter.drawRoundedRect(QRectF(x - bar_w - 1, base_y - sc_h, bar_w, sc_h), 3, 3)
+                painter.drawPath(self._bar_path(QRectF(x - bar_w - 1, base_y - sc_h, bar_w, sc_h), radius))
                 painter.setBrush(self._grad_vert(x, base_y - sd_h, base_y, self.GREEN_LIGHT, self.GREEN))
-                painter.drawRoundedRect(QRectF(x + 1, base_y - sd_h, bar_w, sd_h), 3, 3)
+                painter.drawPath(self._bar_path(QRectF(x + 1, base_y - sd_h, bar_w, sd_h), radius))
             else:
                 painter.setBrush(self._grad_vert(x, base_y - created_h, base_y, self.BLUE_LIGHT, self.BLUE))
-                painter.drawRoundedRect(cb, 3, 3)
+                painter.drawPath(self._bar_path(cb, radius))
                 painter.setBrush(self._grad_vert(x, base_y - done_h, base_y, self.GREEN_LIGHT, self.GREEN))
-                painter.drawRoundedRect(db, 3, 3)
-                painter.setBrush(QColor(255, 255, 255, 95))
-                if created_h > 3:
-                    painter.drawRoundedRect(QRectF(cb.left(), cb.top(), bar_w, 2.4), 2, 2)
-                if done_h > 3:
-                    painter.drawRoundedRect(QRectF(db.left(), db.top(), bar_w, 2.4), 2, 2)
+                painter.drawPath(self._bar_path(db, radius))
             if idx == peak_idx and len(keys) > 1 and grow > 0.82:
                 top_v = max(buckets[key]['created'], buckets[key]['done'])
                 if top_v > 0:
@@ -2988,7 +3003,7 @@ class TimelineReviewChart(QWidget):
             dim = bool(self.selected_category and category != self.selected_category)
             track = QRectF(rect.left() + label_w, y + 4, track_w, row_h - 8)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(47, 123, 255, 26))
+            painter.setBrush(QColor(self.TRACK))
             painter.drawRoundedRect(track, 5, 5)
             metric = data[metric_key]
             bw = max(2.0, track_w * metric / max_total * grow)
@@ -3076,6 +3091,8 @@ class TimelineReviewChart(QWidget):
             bw = max(2.0, track_w * duration / max_duration * grow)
             bar_rect = QRectF(track_left, y + (row_h - 9) / 2, bw, 9)
             painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(self.TRACK))
+            painter.drawRoundedRect(QRectF(track_left, bar_rect.top(), track_w, 9), 4.5, 4.5)
             if dim:
                 painter.setBrush(QColor(self.DIM))
             else:
@@ -7588,6 +7605,12 @@ class MainWindow(QMainWindow):
                 self._native_frame_applied = win_frame.apply_native_frame(int(self.winId()))
             except Exception:
                 self._native_frame_applied = False
+            # WS_POPUP（FramelessWindowHint 附带）不在 Win11 自动圆角范围内，
+            # 得显式向 DWM 要圆角；最大化时 DWM 自己会切回直角。
+            try:
+                win_frame.apply_rounded_corners(int(self.winId()), True)
+            except Exception:
+                pass
 
     def nativeEvent(self, eventType, message):
         if self._native_frame_applied and eventType in (b'windows_generic_MSG', 'windows_generic_MSG'):
